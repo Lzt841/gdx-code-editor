@@ -1,0 +1,41 @@
+apply plugin: 'maven-publish'
+
+[compileJava, compileTestJava]*.options*.encoding = 'UTF-8'
+eclipse.project.name = appName + '-core'
+
+java {
+  withSourcesJar()
+}
+
+sourceSets {
+  main {
+    java {
+      exclude 'com/lzt841/demo/**'
+    }
+  }
+}
+
+dependencies {
+  api "com.badlogicgames.gdx:gdx:$gdxVersion"
+
+  if(enableGraalNative == 'true') {
+    implementation "io.github.berstanio:gdx-svmhelper-annotations:$graalHelperVersion"
+  }
+}
+
+publishing {
+  publications {
+    release(MavenPublication) {
+      from components.java
+      groupId = "${System.getenv('GROUP') ?: 'com.github.lzt841'}.${rootProject.name}"
+      artifactId = project.name
+      version = project.version.toString()
+
+      pom {
+        name = 'gdx-code-editor'
+        description = 'A libGDX Scene2D code editor widget with syntax highlight, folding, search and touch/mouse interactions.'
+        url = 'https://github.com/lzt841/gdx-code-editor'
+      }
+    }
+  }
+}
