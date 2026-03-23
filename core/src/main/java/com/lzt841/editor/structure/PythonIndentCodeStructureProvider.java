@@ -1,46 +1,44 @@
 package com.lzt841.editor.structure;
 
-import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.List;
+import com.badlogic.gdx.utils.Array;
 
 /** Python-oriented structure provider based on indentation and ':' block starters. */
 public class PythonIndentCodeStructureProvider implements CodeStructureProvider {
     @Override
-    public CodeStructureInfo analyze(List<String> lines) {
-        int[] indentLevels = new int[lines.size()];
-        ArrayList<CodeFoldRegion> regions = new ArrayList<>();
-        ArrayDeque<IndentFrame> stack = new ArrayDeque<>();
+    public CodeStructureInfo analyze(Array<String> lines) {
+        int[] indentLevels = new int[lines.size];
+        Array<CodeFoldRegion> regions = new Array<>();
+        Array<IndentFrame> stack = new Array<>();
         PythonScanState state = new PythonScanState();
         int lastContentLine = -1;
 
-        for (int lineIndex = 0; lineIndex < lines.size(); lineIndex++) {
+        for (int lineIndex = 0; lineIndex < lines.size; lineIndex++) {
             String line = lines.get(lineIndex);
             int indentWidth = countIndentWidth(line);
             PythonLineInfo info = analyzeLine(line, state);
 
             if (info.meaningful) {
-                while (!stack.isEmpty() && indentWidth <= stack.peek().indentWidth) {
+                while (stack.size > 0 && indentWidth <= stack.peek().indentWidth) {
                     closeFrame(stack.pop(), lastContentLine, regions);
                 }
-                indentLevels[lineIndex] = stack.size();
+                indentLevels[lineIndex] = stack.size;
                 if (info.blockStart) {
-                    stack.push(new IndentFrame(lineIndex, indentWidth, stack.size()));
+                    stack.add(new IndentFrame(lineIndex, indentWidth, stack.size));
                 }
                 lastContentLine = lineIndex;
             } else {
-                indentLevels[lineIndex] = stack.size();
+                indentLevels[lineIndex] = stack.size;
             }
         }
 
-        while (!stack.isEmpty()) {
+        while (stack.size > 0) {
             closeFrame(stack.pop(), lastContentLine, regions);
         }
 
         return new CodeStructureInfo(indentLevels, regions);
     }
 
-    private void closeFrame(IndentFrame frame, int endLine, List<CodeFoldRegion> regions) {
+    private void closeFrame(IndentFrame frame, int endLine, Array<CodeFoldRegion> regions) {
         if (endLine > frame.startLine) {
             regions.add(new CodeFoldRegion(frame.startLine, endLine, frame.depth));
         }

@@ -1,58 +1,48 @@
 # gdx-code-editor
 
-`gdx-code-editor` 是一个基于 libGDX Scene2D 的代码编辑器组件，适合作为应用内嵌的代码输入、脚本编辑、配置编辑或轻量 IDE 编辑区使用。
+`gdx-code-editor` is a libGDX Scene2D code editor widget for large-text editing, syntax highlighting, code folding, search/replace, and touch or mouse interaction.
 
-它提供了一个可直接加入 Scene2D 布局系统的 `CodeEditor` Widget，重点支持：
+The library is designed for in-app script editors, config editors, lightweight IDE tools, and any Scene2D UI that needs an embeddable code editor.
 
-- 大文本高性能编辑
-- 语法高亮
-- 自动换行与横向滚动
-- 代码块结构分析
-- 代码折叠
-- 彩虹括号与彩虹引导线
-- 查找 / 上一个 / 下一个命中
-- 替换 / 全部替换
-- 撤销 / 重做
-- 鼠标与触摸双交互模式
+## Features
 
-项目仓库中包含桌面 Demo，但发布到依赖中的内容只包含编辑器库本身，不包含演示入口。
+- Scene2D `Widget`-based `CodeEditor`
+- Large-text line-based document model
+- Syntax highlighting
+- Code structure analysis and folding
+- Fixed or scrolling line numbers
+- Search highlight and current-match highlight
+- Find next / previous match
+- Replace current / replace all
+- Undo / redo with compound edits
+- Rainbow brackets and rainbow guides
+- Touch and mouse interaction modes
+- Touch handles, long press, inertial scrolling, pinch zoom
+- Right-click / long-press integration hooks
+- Read-only and disabled modes
+- Public extension points for:
+  - syntax highlighting
+  - code structure analysis
+  - interaction behavior
+  - content change observation
 
-## 演示效果
+## Screenshots
 
-### Java 编辑、查找与右键菜单
+### Java editing and context menu
 ![Java editor with context menu](images/img.png)
 
-### JSON 高亮与折叠区域
+### JSON highlighting
 ![JSON highlight](images/img_1.png)
 
-### Python 缩进结构、彩虹括号与引导线
+### Python indent structure
 ![Python indent structure](images/img_2.png)
 
-### Disabled 状态展示
+### Disabled state
 ![Disabled state](images/img_3.png)
 
-## 功能特性
+## Installation
 
-- `CodeEditor` 是标准 Scene2D `Widget`
-- 基于按行文档模型，适合大文本编辑
-- 支持固定行号和非固定行号
-- 默认关闭自动换行，可按需开启
-- 支持横向滚动与滚动条拖动
-- 支持代码折叠、折叠徽标、点击折叠内容自动展开
-- 支持括号匹配、高亮当前代码块、彩虹括号、彩虹引导线
-- 支持搜索结果背景高亮与当前命中单独高亮
-- 支持替换当前命中、全部替换，并接入撤销重做
-- 支持连续输入、连续删除、批量替换的复合历史记录
-- 支持 `readOnly` 和 `disabled` 两种状态
-- 支持触摸模式下的手柄选择、惯性滚动、长按菜单、双指缩放
-- 支持鼠标模式下的拖拽选择、双击选词、右键菜单、滚轮滚动
-- 支持自定义高亮器、结构提供器、交互监听器和样式
-
-## 安装
-
-### Gradle
-
-在项目仓库中添加 JitPack：
+Add JitPack:
 
 ```gradle
 repositories {
@@ -61,15 +51,15 @@ repositories {
 }
 ```
 
-添加依赖：
+Add the dependency:
 
 ```gradle
 dependencies {
-    implementation 'com.github.Lzt841:gdx-code-editor:v0.0.1'
+    implementation 'com.github.Lzt841:gdx-code-editor:v0.0.2'
 }
 ```
 
-### Kotlin DSL
+Kotlin DSL:
 
 ```kotlin
 repositories {
@@ -78,16 +68,16 @@ repositories {
 }
 
 dependencies {
-    implementation("com.github.Lzt841:gdx-code-editor:v0.0.1")
+    implementation("com.github.Lzt841:gdx-code-editor:v0.0.2")
 }
 ```
 
-## 快速开始
-
-最小使用示例：
+## Quick Start
 
 ```java
 import com.badlogic.gdx.graphics.g2d.BitmapFont;
+import com.badlogic.gdx.scenes.scene2d.Stage;
+import com.badlogic.gdx.scenes.scene2d.ui.Table;
 import com.lzt841.editor.CodeEditor;
 import com.lzt841.editor.highlight.BuiltinCodeHighlighters;
 import com.lzt841.editor.structure.BraceCodeStructureProvider;
@@ -103,20 +93,25 @@ editor.setHighlighter(BuiltinCodeHighlighters.java());
 editor.setStructureProvider(new BraceCodeStructureProvider());
 editor.setWrapEnabled(false);
 editor.setLineNumbersFixed(true);
-```
 
-加入 Scene2D：
-
-```java
 Table root = new Table();
 root.setFillParent(true);
 root.add(editor).expand().fill();
+
+Stage stage = new Stage();
 stage.addActor(root);
 ```
 
-## 常用能力
+## Public API Style
 
-### 1. 设置高亮器
+The extension-facing APIs now use libGDX collections instead of `java.util.List`.
+
+- `CodeHighlighter` works with `Array<String>` and returns `Array<Array<...>>`
+- `CodeStructureProvider` takes `Array<String>`
+- `CodeStructureInfo.foldRegions` is `Array<CodeFoldRegion>`
+- `CodeDocument.snapshotLines()` returns `Array<String>`
+
+## Built-in Highlighters
 
 ```java
 editor.setHighlighter(BuiltinCodeHighlighters.java());
@@ -128,80 +123,129 @@ editor.setHighlighter(BuiltinCodeHighlighters.xml());
 editor.setHighlighter(BuiltinCodeHighlighters.plainText());
 ```
 
-### 2. 设置结构分析器
+## Structure Providers
 
-大多数括号语言：
+Brace-based languages:
 
 ```java
 editor.setStructureProvider(new BraceCodeStructureProvider());
 ```
 
-Python 缩进结构：
+Python-style indent structure:
 
 ```java
 editor.setStructureProvider(new PythonIndentCodeStructureProvider());
 ```
 
-### 3. 搜索
+## Search and Replace
 
 ```java
 editor.setSearchText("value");
 editor.setSearchCaseSensitive(false);
 
-int count = editor.getSearchMatchCount();
+int matchCount = editor.getSearchMatchCount();
 boolean hasCurrent = editor.hasCurrentSearchMatch();
 int currentOrdinal = editor.getCurrentSearchMatchOrdinal();
 
 editor.findNextSearchMatch();
 editor.findPreviousSearchMatch();
-```
 
-### 4. 替换
-
-```java
 editor.replaceCurrentSearchMatch("result");
 editor.replaceAllSearchMatches("result");
 ```
 
-说明：
+Notes:
 
-- 当前命中有单独高亮
-- 单次替换支持撤销 / 重做
-- 全部替换会作为一次复合编辑进入历史记录
+- the current match has its own highlight
+- replace-all is grouped as one undo/redo step
+- typing over a selection replaces the selected text first
 
-### 5. 编辑状态
+## Content Change Listener
+
+You can observe editor content mutations for code completion, diagnostics, indexing, autosave, or other tooling.
 
 ```java
-editor.setReadOnly(true);
-editor.setDisabled(false);
+editor.addContentListener(new CodeEditorContentListener() {
+    @Override
+    public void onContentChanged(CodeEditor editor, CodeEditorContentChangeEvent event) {
+        if (event.type == CodeEditorContentChangeType.INSERT
+            || event.type == CodeEditorContentChangeType.PASTE) {
+            // trigger completion after typing or paste
+        }
+
+        String text = event.text;
+        int version = event.documentVersion;
+        int cursorLine = event.cursorLine;
+        int cursorColumn = event.cursorColumn;
+
+        // trigger linting, parsing, indexing, autosave, etc.
+    }
+});
 ```
 
-### 6. 交互模式
+The callback is triggered after actual content changes such as:
+
+- typing
+- delete / backspace
+- paste
+- replace current / replace all
+- undo / redo
+- `setText(...)`
+
+The event payload includes:
+
+- `type`: mutation kind such as `INSERT`, `DELETE`, `PASTE`, `UNDO`, `REDO`
+- `text`: full document text after the change
+- `documentVersion`: incremented editor document version
+- `cursorLine` and `cursorColumn`: caret position after the change
+
+## Interaction Hooks
 
 ```java
-import com.lzt841.editor.input.CodeEditorInteractionMode;
-
 editor.setInteractionMode(CodeEditorInteractionMode.AUTO);
 editor.setInteractionMode(CodeEditorInteractionMode.MOUSE);
 editor.setInteractionMode(CodeEditorInteractionMode.TOUCH);
 ```
 
-### 7. 缩放
+Optional interaction listener:
 
 ```java
+editor.setInteractionListener(new CodeEditorInteractionListener() {
+    @Override
+    public boolean onLongPress(CodeEditor editor, CodeEditorInteractionContext context) {
+        return false;
+    }
+
+    @Override
+    public boolean onSecondaryClick(CodeEditor editor, CodeEditorInteractionContext context) {
+        return false;
+    }
+
+    @Override
+    public boolean onDoubleClick(CodeEditor editor, CodeEditorInteractionContext context) {
+        return false;
+    }
+});
+```
+
+## States and View Control
+
+```java
+editor.setReadOnly(true);
+editor.setDisabled(false);
+
 editor.setZoomScale(1.25f);
 float zoom = editor.getZoomScale();
 ```
 
-触摸模式下还支持双指缩放。
+Touch mode also supports pinch zoom.
 
-## 样式
+## Style
 
-`CodeEditorStyle` 的设计方式接近 libGDX 的 `TextFieldStyle`，可以统一配置编辑器的颜色、背景、图标和布局尺寸。
+`CodeEditorStyle` is similar in spirit to libGDX `TextFieldStyle`. It lets you control drawables, colors, and layout sizing.
 
-常见可配置项包括：
+Common drawable fields:
 
-- `font`
 - `background`
 - `focusedBackground`
 - `disabledBackground`
@@ -221,7 +265,7 @@ float zoom = editor.getZoomScale();
 - `scrollbarTrack`
 - `scrollbarKnob`
 
-还支持一批尺寸参数，例如：
+Common sizing fields:
 
 - `textLeftPadding`
 - `textRightPadding`
@@ -234,9 +278,10 @@ float zoom = editor.getZoomScale();
 - `scrollbarHitWidth`
 - `scrollbarGap`
 - `guideSpacing`
+- `guideOffsetX`
 - `selectionHandleRadius`
 
-示例：
+Example:
 
 ```java
 CodeEditor.CodeEditorStyle style = new CodeEditor.CodeEditorStyle();
@@ -249,73 +294,55 @@ style.scrollbarWidth = 8f;
 style.guideSpacing = 18f;
 ```
 
-## 可扩展能力
+## Extending the Library
 
-### 自定义语法高亮
+### Custom Highlighter
 
-实现 `CodeHighlighter` 即可扩展自己的语言高亮逻辑。
+Implement `CodeHighlighter`:
 
-可用于：
+```java
+public class MyHighlighter implements CodeHighlighter {
+    @Override
+    public Array<Array<CodeHighlightSpan>> highlight(Array<String> lines, CodeEditor.CodeEditorStyle style) {
+        return new Array<>();
+    }
+}
+```
 
-- 输出语法高亮 span
-- 标记括号忽略区域
-- 控制不同语言下的高亮策略
+### Custom Structure Provider
 
-### 自定义结构分析
+Implement `CodeStructureProvider`:
 
-实现 `CodeStructureProvider` 即可扩展：
+```java
+public class MyStructureProvider implements CodeStructureProvider {
+    @Override
+    public CodeStructureInfo analyze(Array<String> lines) {
+        return new CodeStructureInfo(new int[lines.size], new Array<CodeFoldRegion>());
+    }
+}
+```
 
-- 代码块结构
-- 折叠区域
-- 缩进层级
-- 当前块信息
+## Local Demo
 
-### 自定义交互菜单
-
-实现 `CodeEditorInteractionListener` 可以接入：
-
-- 触摸长按菜单
-- 鼠标右键菜单
-- 双击行为扩展
-
-## 仓库结构
-
-- `core`
-  编辑器核心库
-- `core/src/main/java/com/lzt841/editor`
-  编辑器主体实现
-- `core/src/main/java/com/lzt841/editor/highlight`
-  高亮相关接口与内置实现
-- `core/src/main/java/com/lzt841/editor/structure`
-  结构分析、代码块与折叠相关接口
-- `core/src/main/java/com/lzt841/editor/input`
-  鼠标与触摸交互抽象
-- `core/src/main/java/com/lzt841/demo`
-  本地调试 Demo
-- `lwjgl3`
-  桌面启动模块
-- `android`
-  Android 示例工程
-
-## 运行仓库内 Demo
+Run the desktop demo from the repository:
 
 ```bash
 ./gradlew lwjgl3:run
 ```
 
-Windows：
+Windows:
 
 ```powershell
 ./gradlew.bat lwjgl3:run
 ```
 
-## 注意事项
+## Notes
 
-- `CodeEditorStyle.font` 不能为空
-- 默认结构分析器适合大多数括号语言
-- Python 建议使用 `PythonIndentCodeStructureProvider`
-- 查找当前是纯文本匹配，不区分 token 类型
-- 发布依赖中不包含 `com.lzt841.demo.Main`
+- `CodeEditorStyle.font` must not be `null`
+- published artifacts do not include the local demo entrypoint
+- the default structure provider is brace-based
+- Python is best paired with `PythonIndentCodeStructureProvider`
 
 ## License
-- Apache-2.0
+
+This repository should include a `LICENSE` file for distribution and reuse.

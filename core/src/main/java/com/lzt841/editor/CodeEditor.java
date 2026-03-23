@@ -14,8 +14,11 @@ import com.badlogic.gdx.scenes.scene2d.ui.Skin;
 import com.badlogic.gdx.scenes.scene2d.ui.Widget;
 import com.badlogic.gdx.scenes.scene2d.utils.Drawable;
 import com.badlogic.gdx.utils.Align;
+import com.badlogic.gdx.utils.Array;
+import com.badlogic.gdx.utils.IntMap;
 import com.badlogic.gdx.utils.IntFloatMap;
 import com.badlogic.gdx.utils.IntArray;
+import com.badlogic.gdx.utils.ObjectSet;
 import com.badlogic.gdx.utils.TimeUtils;
 import com.lzt841.editor.highlight.CodeHighlighter;
 import com.lzt841.editor.highlight.CodeBracketIgnoreSpan;
@@ -30,10 +33,6 @@ import com.lzt841.editor.structure.CodeFoldRegion;
 import com.lzt841.editor.structure.CodeStructureInfo;
 import com.lzt841.editor.structure.CodeStructureProvider;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
 
 /** A scene2d widget for large-text code editing. */
 public class CodeEditor extends Widget {
@@ -72,6 +71,8 @@ public class CodeEditor extends Widget {
     private static final float TOUCH_SLOP = 18f;
     private static final long LONG_PRESS_NS = 450_000_000L;
     private static final long DOUBLE_TAP_NS = 300_000_000L;
+    private static final float KEY_REPEAT_INITIAL_DELAY = 0.42f;
+    private static final float KEY_REPEAT_INTERVAL = 0.045f;
     private static final float MIN_ZOOM_SCALE = 0.75f;
     private static final float MAX_ZOOM_SCALE = 2.5f;
     private static final int MAX_TOUCH_POINTERS = 20;
@@ -94,11 +95,13 @@ public class CodeEditor extends Widget {
 
     private final GlyphLayout glyphLayout = new GlyphLayout();
     private final CodeDocument document = new CodeDocument();
-    private final ArrayList<LineLayout> lineLayouts = new ArrayList<>();
-    private final ArrayList<FoldRegion> foldRegions = new ArrayList<>();
-    private final HashMap<Integer, FoldRegion> foldRegionsByStart = new HashMap<>();
-    private final HashSet<String> collapsedRegionKeys = new HashSet<>();
+    private final Array<CodeEditorContentListener> contentListeners = new Array<>();
+    private final Array<LineLayout> lineLayouts = new Array<>();
+    private final Array<FoldRegion> foldRegions = new Array<>();
+    private final IntMap<FoldRegion> foldRegionsByStart = new IntMap<>();
+    private final ObjectSet<String> collapsedRegionKeys = new ObjectSet<>();
     private final IntFloatMap glyphWidthCache = new IntFloatMap();
+    private final IntFloatMap glyphAdvanceCache = new IntFloatMap();
     private final boolean[] touchPointersDown = new boolean[MAX_TOUCH_POINTERS];
     private final float[] touchPointerX = new float[MAX_TOUCH_POINTERS];
     private final float[] touchPointerY = new float[MAX_TOUCH_POINTERS];
@@ -113,7 +116,7 @@ public class CodeEditor extends Widget {
     private int[] visualRowsPerLine = new int[0];
     private int[] visualRowStart = new int[0];
     private int totalVisualRows = 1;
-    private List<List<CodeBracketIgnoreSpan>> bracketIgnoreLines = new ArrayList<>();
+    private Array<Array<CodeBracketIgnoreSpan>> bracketIgnoreLines = new Array<>();
 
     private float lineHeight;
     private float scrollX;
@@ -145,6 +148,8 @@ public class CodeEditor extends Widget {
     private boolean draggingTouchScroll;
     private boolean draggingStartHandle;
     private boolean draggingEndHandle;
+    private boolean pendingSelectionMove;
+    private boolean draggingSelectedText;
     private boolean pendingTouchPress;
     private boolean longPressTriggered;
     private float scrollbarDragOffsetX;
@@ -165,15 +170,27 @@ public class CodeEditor extends Widget {
     private float lastMouseTapY = Float.NaN;
     private int handleDragFixedLine = -1;
     private int handleDragFixedColumn = -1;
+    private int draggedSelectionStartLine = -1;
+    private int draggedSelectionStartColumn = -1;
+    private int draggedSelectionEndLine = -1;
+    private int draggedSelectionEndColumn = -1;
+    private int draggedSelectionDropLine = -1;
+    private int draggedSelectionDropColumn = -1;
+    private int repeatingDeleteKey = -1;
+    private float repeatDeleteDelayRemaining;
+    private float repeatDeleteIntervalRemaining;
     private boolean pinchZooming;
     private float pinchInitialDistance;
     private float pinchInitialScale = 1f;
     private int searchMatchCount;
-    private List<List<SearchMatch>> searchMatches = new ArrayList<>();
-    private final ArrayList<SearchMatchRef> flatSearchMatches = new ArrayList<>();
+    private Array<Array<SearchMatch>> searchMatches = new Array<>();
+    private final Array<SearchMatchRef> flatSearchMatches = new Array<>();
     private int currentSearchMatchLine = -1;
     private int currentSearchMatchStart = -1;
     private int currentSearchMatchEnd = -1;
+    private CodeEditorContentChangeType pendingContentChangeType = CodeEditorContentChangeType.UNKNOWN;
+    private String draggedSelectionText = "";
+    private boolean deferredMutationProcessingPending;
 
     public CodeEditor(CodeEditorStyle style) {
         setStyle(style);
@@ -199,6 +216,7 @@ public class CodeEditor extends Widget {
         this.baseFontLineHeight = style.font.getLineHeight() / Math.max(0.0001f, baseFontScaleY);
         updateFontMetrics();
         glyphWidthCache.clear();
+        glyphAdvanceCache.clear();
         invalidateLayout();
         invalidateHierarchy();
     }
@@ -253,6 +271,24 @@ public class CodeEditor extends Widget {
 
     public void setInteractionListener(CodeEditorInteractionListener interactionListener) {
         this.interactionListener = interactionListener;
+    }
+
+    public void addContentListener(CodeEditorContentListener listener) {
+        if (listener == null || contentListeners.contains(listener, true)) {
+            return;
+        }
+        contentListeners.add(listener);
+    }
+
+    public void removeContentListener(CodeEditorContentListener listener) {
+        if (listener == null) {
+            return;
+        }
+        contentListeners.removeValue(listener, true);
+    }
+
+    public void clearContentListeners() {
+        contentListeners.clear();
     }
 
     public CodeEditorOnscreenKeyboard getOnscreenKeyboard() {
@@ -335,7 +371,7 @@ public class CodeEditor extends Widget {
 
     public boolean findNextSearchMatch() {
         ensureLayout();
-        if (flatSearchMatches.isEmpty()) {
+        if (flatSearchMatches.size == 0) {
             clearCurrentSearchMatch();
             return false;
         }
@@ -343,7 +379,7 @@ public class CodeEditor extends Widget {
         int currentIndex = findCurrentSearchMatchIndex();
         int targetIndex;
         if (currentIndex >= 0) {
-            targetIndex = (currentIndex + 1) % flatSearchMatches.size();
+            targetIndex = (currentIndex + 1) % flatSearchMatches.size;
         } else {
             targetIndex = findSearchMatchIndexFromCursor(true);
         }
@@ -353,7 +389,7 @@ public class CodeEditor extends Widget {
 
     public boolean findPreviousSearchMatch() {
         ensureLayout();
-        if (flatSearchMatches.isEmpty()) {
+        if (flatSearchMatches.size == 0) {
             clearCurrentSearchMatch();
             return false;
         }
@@ -361,7 +397,7 @@ public class CodeEditor extends Widget {
         int currentIndex = findCurrentSearchMatchIndex();
         int targetIndex;
         if (currentIndex >= 0) {
-            targetIndex = (currentIndex - 1 + flatSearchMatches.size()) % flatSearchMatches.size();
+            targetIndex = (currentIndex - 1 + flatSearchMatches.size) % flatSearchMatches.size;
         } else {
             targetIndex = findSearchMatchIndexFromCursor(false);
         }
@@ -374,7 +410,7 @@ public class CodeEditor extends Widget {
             return false;
         }
         ensureLayout();
-        if (flatSearchMatches.isEmpty()) {
+        if (flatSearchMatches.size == 0) {
             clearCurrentSearchMatch();
             return false;
         }
@@ -386,6 +422,7 @@ public class CodeEditor extends Widget {
 
         String safeReplacement = replacement == null ? "" : replacement;
         clearSelection();
+        markPendingContentChange(CodeEditorContentChangeType.REPLACE_CURRENT);
         document.beginCompoundEdit();
         try {
             replaceSearchMatch(target, safeReplacement);
@@ -394,7 +431,7 @@ public class CodeEditor extends Widget {
         }
         clearCurrentSearchMatch();
         onDocumentMutated();
-        if (!searchText.isEmpty() && !flatSearchMatches.isEmpty()) {
+        if (!searchText.isEmpty() && flatSearchMatches.size > 0) {
             findNextSearchMatch();
         }
         return true;
@@ -405,25 +442,26 @@ public class CodeEditor extends Widget {
             return 0;
         }
         ensureLayout();
-        if (flatSearchMatches.isEmpty()) {
+        if (flatSearchMatches.size == 0) {
             clearCurrentSearchMatch();
             return 0;
         }
 
         String safeReplacement = replacement == null ? "" : replacement;
-        ArrayList<SearchMatchRef> matchesToReplace = new ArrayList<>(flatSearchMatches);
+        Array<SearchMatchRef> matchesToReplace = new Array<>(flatSearchMatches);
         expandCollapsedRegionsForSearchMatches(matchesToReplace);
         ensureLayout();
-        matchesToReplace = new ArrayList<>(flatSearchMatches);
-        if (matchesToReplace.isEmpty()) {
+        matchesToReplace = new Array<>(flatSearchMatches);
+        if (matchesToReplace.size == 0) {
             clearCurrentSearchMatch();
             return 0;
         }
 
         clearSelection();
+        markPendingContentChange(CodeEditorContentChangeType.REPLACE_ALL);
         document.beginCompoundEdit();
         try {
-            for (int i = matchesToReplace.size() - 1; i >= 0; i--) {
+            for (int i = matchesToReplace.size - 1; i >= 0; i--) {
                 replaceSearchMatch(matchesToReplace.get(i), safeReplacement);
             }
         } finally {
@@ -432,7 +470,7 @@ public class CodeEditor extends Widget {
 
         clearCurrentSearchMatch();
         onDocumentMutated();
-        return matchesToReplace.size();
+        return matchesToReplace.size;
     }
 
     public boolean isLineNumbersFixed() {
@@ -486,15 +524,25 @@ public class CodeEditor extends Widget {
     }
 
     public void setText(String text) {
+        markPendingContentChange(CodeEditorContentChangeType.SET_TEXT);
         document.setText(text);
         clearSelection();
         invalidateLayout();
         ensureLayout();
         ensureCursorVisible();
+        notifyContentChanged();
     }
 
     public int getLineCount() {
         return document.getLineCount();
+    }
+
+    public String getText() {
+        return document.getText();
+    }
+
+    public int getDocumentVersion() {
+        return document.getVersion();
     }
 
     public int getCursorLine() {
@@ -516,8 +564,10 @@ public class CodeEditor extends Widget {
 
     @Override
     public void act(float delta) {
+        flushDeferredMutationProcessing();
         super.act(delta);
         ensureStageScrollFocus();
+        updateKeyRepeat(delta);
         if (pendingTouchPress && !longPressTriggered && TimeUtils.nanoTime() - touchDownTimeNanos >= LONG_PRESS_NS) {
             longPressTriggered = true;
             pendingTouchPress = false;
@@ -526,7 +576,7 @@ public class CodeEditor extends Widget {
             }
             notifyLongPress(touchDownX, touchDownY);
         }
-        if (draggingSelection || draggingStartHandle || draggingEndHandle) {
+        if (draggingSelection || draggingStartHandle || draggingEndHandle || draggingSelectedText) {
             applySelectionAutoScroll(delta);
         }
         if (!draggingTouchScroll && !draggingScrollbar
@@ -540,6 +590,7 @@ public class CodeEditor extends Widget {
 
     @Override
     public void draw(Batch batch, float parentAlpha) {
+        flushDeferredMutationProcessing();
         ensureLayout();
         float originalScaleX = style.font.getData().scaleX;
         float originalScaleY = style.font.getData().scaleY;
@@ -555,18 +606,13 @@ public class CodeEditor extends Widget {
             if (background != null) {
                 background.draw(batch, getX(), getY(), getWidth(), getHeight());
             }
-            if (style.gutterBackground != null) {
-                style.gutterBackground.draw(
-                    batch,
-                    getX() + getGutterRenderX(),
-                    getY() + style.statusBarHeight,
-                    getGutterWidth(),
-                    getContentHeight()
-                );
-            }
 
             drawRows(batch);
-            drawCaret(batch);
+            if (draggingSelectedText) {
+                drawDraggedSelectionDropCaret(batch);
+            } else {
+                drawCaret(batch);
+            }
             drawSelectionHandles(batch);
         } finally {
             style.font.getData().setScale(originalScaleX, originalScaleY);
@@ -605,8 +651,8 @@ public class CodeEditor extends Widget {
             return;
         }
 
-        List<String> lines = document.snapshotLines();
-        int lineCount = lines.size();
+        Array<String> lines = document.snapshotLines();
+        int lineCount = lines.size;
 
         lineLayouts.clear();
         foldRegions.clear();
@@ -614,9 +660,9 @@ public class CodeEditor extends Widget {
 
         CodeStructureInfo structureInfo = structureProvider.analyze(lines);
         int[] indentLevels = structureInfo.indentLevels;
-        List<List<CodeHighlightSpan>> highlightLines = highlighter.highlight(lines, style);
-        bracketIgnoreLines = normalizeBracketIgnoreLines(highlighter.getBracketIgnoreSpans(lines), lines.size());
-        List<List<CodeHighlightSpan>> rainbowBracketLines = buildRainbowBracketSpans(lines, bracketIgnoreLines);
+        Array<Array<CodeHighlightSpan>> highlightLines = highlighter.highlight(lines, style);
+        bracketIgnoreLines = normalizeBracketIgnoreLines(highlighter.getBracketIgnoreSpans(lines), lines.size);
+        Array<Array<CodeHighlightSpan>> rainbowBracketLines = buildRainbowBracketSpans(lines, bracketIgnoreLines);
         searchMatches = buildSearchMatches(lines);
         hiddenLines = new boolean[lineCount];
         visualRowsPerLine = new int[lineCount];
@@ -625,10 +671,10 @@ public class CodeEditor extends Widget {
 
         for (int i = 0; i < lineCount; i++) {
             String line = lines.get(i);
-            List<CodeHighlightSpan> highlight = i < highlightLines.size() ? highlightLines.get(i) : new ArrayList<CodeHighlightSpan>();
-            List<CodeHighlightSpan> rainbowBrackets = i < rainbowBracketLines.size()
+            Array<CodeHighlightSpan> highlight = i < highlightLines.size ? highlightLines.get(i) : new Array<>(0);
+            Array<CodeHighlightSpan> rainbowBrackets = i < rainbowBracketLines.size
                 ? rainbowBracketLines.get(i)
-                : new ArrayList<CodeHighlightSpan>();
+                : new Array<>(0);
             LineLayout layout = new LineLayout(line, safeIndentLevel(indentLevels, i), buildHighlightTokens(line, highlight, rainbowBrackets));
             layout.ensurePrefixWidths(this);
             maxLineWidth = Math.max(maxLineWidth, layout.measureRange(0, line.length()));
@@ -738,24 +784,24 @@ public class CodeEditor extends Widget {
         }
     }
 
-    private ArrayList<HighlightToken> buildHighlightTokens(
+    private Array<HighlightToken> buildHighlightTokens(
         String text,
-        List<CodeHighlightSpan> syntaxSpans,
-        List<CodeHighlightSpan> overlaySpans
+        Array<CodeHighlightSpan> syntaxSpans,
+        Array<CodeHighlightSpan> overlaySpans
     ) {
         int length = text.length();
         if (length == 0) {
-            return new ArrayList<>(0);
+            return new Array<>(0);
         }
 
-        ArrayList<ColorSpan> spans = new ArrayList<>();
+        Array<ColorSpan> spans = new Array<>();
         collectColorSpans(spans, syntaxSpans, length, 0);
         collectColorSpans(spans, overlaySpans, length, 1);
-        if (spans.isEmpty()) {
-            return new ArrayList<>(0);
+        if (spans.size == 0) {
+            return new Array<>(0);
         }
 
-        IntArray boundaries = new IntArray(spans.size() * 2 + 2);
+        IntArray boundaries = new IntArray(spans.size * 2 + 2);
         boundaries.add(0);
         boundaries.add(length);
         for (ColorSpan span : spans) {
@@ -772,7 +818,7 @@ public class CodeEditor extends Widget {
             }
         }
 
-        ArrayList<HighlightToken> tokens = new ArrayList<>();
+        Array<HighlightToken> tokens = new Array<>();
         for (int i = 0; i < uniqueBoundaries.size - 1; i++) {
             int start = uniqueBoundaries.get(i);
             int end = uniqueBoundaries.get(i + 1);
@@ -793,9 +839,9 @@ public class CodeEditor extends Widget {
                 continue;
             }
 
-            HighlightToken previous = tokens.isEmpty() ? null : tokens.get(tokens.size() - 1);
+            HighlightToken previous = tokens.size == 0 ? null : tokens.peek();
             if (previous != null && previous.end == start && sameColor(previous.color, selectedColor)) {
-                tokens.set(tokens.size() - 1, new HighlightToken(previous.start, end, previous.color));
+                tokens.set(tokens.size - 1, new HighlightToken(previous.start, end, previous.color));
             } else {
                 tokens.add(new HighlightToken(start, end, selectedColor));
             }
@@ -803,7 +849,7 @@ public class CodeEditor extends Widget {
         return tokens;
     }
 
-    private void collectColorSpans(ArrayList<ColorSpan> target, List<CodeHighlightSpan> source, int lineLength, int priority) {
+    private void collectColorSpans(Array<ColorSpan> target, Array<CodeHighlightSpan> source, int lineLength, int priority) {
         if (source == null) {
             return;
         }
@@ -819,29 +865,29 @@ public class CodeEditor extends Widget {
         }
     }
 
-    private List<List<CodeHighlightSpan>> buildRainbowBracketSpans(
-        List<String> lines,
-        List<List<CodeBracketIgnoreSpan>> ignoredLines
+    private Array<Array<CodeHighlightSpan>> buildRainbowBracketSpans(
+        Array<String> lines,
+        Array<Array<CodeBracketIgnoreSpan>> ignoredLines
     ) {
-        ArrayList<List<CodeHighlightSpan>> result = new ArrayList<>(lines.size());
-        for (int i = 0; i < lines.size(); i++) {
-            result.add(new ArrayList<CodeHighlightSpan>());
+        Array<Array<CodeHighlightSpan>> result = new Array<>(lines.size);
+        for (int i = 0; i < lines.size; i++) {
+            result.add(new Array<CodeHighlightSpan>());
         }
         if (!rainbowBracketsEnabled) {
             return result;
         }
 
-        ArrayList<BracketFrame> stack = new ArrayList<>();
+        Array<BracketFrame> stack = new Array<>();
         ScanState state = new ScanState();
         String brackets = "()[]{}";
 
-        for (int lineIndex = 0; lineIndex < lines.size(); lineIndex++) {
+        for (int lineIndex = 0; lineIndex < lines.size; lineIndex++) {
             state.inLineComment = false;
             String line = lines.get(lineIndex);
-            List<CodeHighlightSpan> spans = result.get(lineIndex);
-            List<CodeBracketIgnoreSpan> ignored = lineIndex < ignoredLines.size()
+            Array<CodeHighlightSpan> spans = result.get(lineIndex);
+            Array<CodeBracketIgnoreSpan> ignored = lineIndex < ignoredLines.size
                 ? ignoredLines.get(lineIndex)
-                : new ArrayList<CodeBracketIgnoreSpan>(0);
+                : new Array<CodeBracketIgnoreSpan>(0);
             for (int column = 0; column < line.length(); column++) {
                 if (isIgnoredBracketPosition(ignored, column)) {
                     continue;
@@ -858,7 +904,7 @@ public class CodeEditor extends Widget {
                 }
 
                 if (bracketIndex % 2 == 0) {
-                    int depth = stack.size();
+                    int depth = stack.size;
                     spans.add(new CodeHighlightSpan(column, column + 1, getRainbowBracketColor(depth)));
                     stack.add(new BracketFrame(current, depth));
                     continue;
@@ -866,11 +912,11 @@ public class CodeEditor extends Widget {
 
                 char expectedOpen = brackets.charAt(bracketIndex - 1);
                 int matchIndex = findMatchingOpenBracketIndex(stack, expectedOpen);
-                int depth = matchIndex >= 0 ? stack.get(matchIndex).depth : Math.max(0, stack.size() - 1);
+                int depth = matchIndex >= 0 ? stack.get(matchIndex).depth : Math.max(0, stack.size - 1);
                 spans.add(new CodeHighlightSpan(column, column + 1, getRainbowBracketColor(depth)));
                 if (matchIndex >= 0) {
-                    while (stack.size() > matchIndex) {
-                        stack.remove(stack.size() - 1);
+                    while (stack.size > matchIndex) {
+                        stack.pop();
                     }
                 }
             }
@@ -879,22 +925,22 @@ public class CodeEditor extends Widget {
         return result;
     }
 
-    private List<List<CodeBracketIgnoreSpan>> normalizeBracketIgnoreLines(
-        List<List<CodeBracketIgnoreSpan>> source,
+    private Array<Array<CodeBracketIgnoreSpan>> normalizeBracketIgnoreLines(
+        Array<Array<CodeBracketIgnoreSpan>> source,
         int lineCount
     ) {
-        ArrayList<List<CodeBracketIgnoreSpan>> normalized = new ArrayList<>(lineCount);
+        Array<Array<CodeBracketIgnoreSpan>> normalized = new Array<>(lineCount);
         for (int i = 0; i < lineCount; i++) {
-            List<CodeBracketIgnoreSpan> spans = source != null && i < source.size() && source.get(i) != null
+            Array<CodeBracketIgnoreSpan> spans = source != null && i < source.size && source.get(i) != null
                 ? source.get(i)
-                : new ArrayList<CodeBracketIgnoreSpan>(0);
+                : new Array<CodeBracketIgnoreSpan>(0);
             normalized.add(spans);
         }
         return normalized;
     }
 
-    private List<List<SearchMatch>> buildSearchMatches(List<String> lines) {
-        ArrayList<List<SearchMatch>> result = new ArrayList<>(lines.size());
+    private Array<Array<SearchMatch>> buildSearchMatches(Array<String> lines) {
+        Array<Array<SearchMatch>> result = new Array<>(lines.size);
         int previousCurrentLine = currentSearchMatchLine;
         int previousCurrentStart = currentSearchMatchStart;
         int previousCurrentEnd = currentSearchMatchEnd;
@@ -902,16 +948,16 @@ public class CodeEditor extends Widget {
         flatSearchMatches.clear();
         if (searchText == null || searchText.isEmpty()) {
             clearCurrentSearchMatch();
-            for (int i = 0; i < lines.size(); i++) {
-                result.add(new ArrayList<SearchMatch>(0));
+            for (int i = 0; i < lines.size; i++) {
+                result.add(new Array<SearchMatch>(0));
             }
             return result;
         }
 
         String needle = searchCaseSensitive ? searchText : searchText.toLowerCase();
-        for (int lineIndex = 0; lineIndex < lines.size(); lineIndex++) {
+        for (int lineIndex = 0; lineIndex < lines.size; lineIndex++) {
             String line = lines.get(lineIndex);
-            ArrayList<SearchMatch> lineMatches = new ArrayList<>();
+            Array<SearchMatch> lineMatches = new Array<>();
             String haystack = searchCaseSensitive ? line : line.toLowerCase();
             int index = 0;
             while (index <= haystack.length() - needle.length()) {
@@ -931,8 +977,8 @@ public class CodeEditor extends Widget {
         return result;
     }
 
-    private int findMatchingOpenBracketIndex(List<BracketFrame> stack, char expectedOpen) {
-        for (int i = stack.size() - 1; i >= 0; i--) {
+    private int findMatchingOpenBracketIndex(Array<BracketFrame> stack, char expectedOpen) {
+        for (int i = stack.size - 1; i >= 0; i--) {
             if (stack.get(i).open == expectedOpen) {
                 return i;
             }
@@ -953,6 +999,47 @@ public class CodeEditor extends Widget {
         ensureCursorVisible();
         resetPreferredColumn();
         refreshBlink();
+        notifyContentChanged();
+    }
+
+    private void onDocumentMutatedDeferred() {
+        invalidateLayout();
+        resetPreferredColumn();
+        refreshBlink();
+        deferredMutationProcessingPending = true;
+    }
+
+    private void flushDeferredMutationProcessing() {
+        if (!deferredMutationProcessingPending) {
+            return;
+        }
+        deferredMutationProcessingPending = false;
+        ensureLayout();
+        ensureCursorVisible();
+        notifyContentChanged();
+    }
+
+    private void notifyContentChanged() {
+        if (contentListeners.size == 0) {
+            pendingContentChangeType = CodeEditorContentChangeType.UNKNOWN;
+            return;
+        }
+        CodeEditorContentChangeType type = pendingContentChangeType;
+        pendingContentChangeType = CodeEditorContentChangeType.UNKNOWN;
+        CodeEditorContentChangeEvent event = new CodeEditorContentChangeEvent(
+            type,
+            document.getText(),
+            document.getVersion(),
+            document.getCursorLine(),
+            document.getCursorColumn()
+        );
+        for (CodeEditorContentListener listener : contentListeners) {
+            listener.onContentChanged(this, event);
+        }
+    }
+
+    private void markPendingContentChange(CodeEditorContentChangeType type) {
+        pendingContentChangeType = type == null ? CodeEditorContentChangeType.UNKNOWN : type;
     }
 
     private void deleteSelectionIfPresent() {
@@ -965,7 +1052,7 @@ public class CodeEditor extends Widget {
         clearSelection();
     }
 
-    private void selectAll() {
+    public void selectAllText() {
         selectionAnchorLine = 0;
         selectionAnchorColumn = 0;
         document.moveCursorTo(document.getLineCount() - 1, document.getLineLength(document.getLineCount() - 1));
@@ -979,6 +1066,7 @@ public class CodeEditor extends Widget {
         draggingSelection = false;
         handleDragFixedLine = -1;
         handleDragFixedColumn = -1;
+        clearSelectedTextDragState();
     }
 
     private void clearCurrentSearchMatch() {
@@ -988,7 +1076,7 @@ public class CodeEditor extends Widget {
     }
 
     private int findCurrentSearchMatchIndex() {
-        for (int i = 0; i < flatSearchMatches.size(); i++) {
+        for (int i = 0; i < flatSearchMatches.size; i++) {
             SearchMatchRef ref = flatSearchMatches.get(i);
             if (ref.line == currentSearchMatchLine
                 && ref.match.start == currentSearchMatchStart
@@ -1019,7 +1107,7 @@ public class CodeEditor extends Widget {
         int cursorLine = document.getCursorLine();
         int cursorColumn = document.getCursorColumn();
         if (forward) {
-            for (int i = 0; i < flatSearchMatches.size(); i++) {
+            for (int i = 0; i < flatSearchMatches.size; i++) {
                 SearchMatchRef ref = flatSearchMatches.get(i);
                 if (ref.line > cursorLine || (ref.line == cursorLine && ref.match.start >= cursorColumn)) {
                     return i;
@@ -1028,17 +1116,17 @@ public class CodeEditor extends Widget {
             return 0;
         }
 
-        for (int i = flatSearchMatches.size() - 1; i >= 0; i--) {
+        for (int i = flatSearchMatches.size - 1; i >= 0; i--) {
             SearchMatchRef ref = flatSearchMatches.get(i);
             if (ref.line < cursorLine || (ref.line == cursorLine && ref.match.end <= cursorColumn)) {
                 return i;
             }
         }
-        return flatSearchMatches.size() - 1;
+        return flatSearchMatches.size - 1;
     }
 
     private void activateSearchMatch(int index) {
-        if (index < 0 || index >= flatSearchMatches.size()) {
+        if (index < 0 || index >= flatSearchMatches.size) {
             clearCurrentSearchMatch();
             return;
         }
@@ -1055,14 +1143,14 @@ public class CodeEditor extends Widget {
 
     private SearchMatchRef resolveSearchMatchForReplace() {
         int currentIndex = findCurrentSearchMatchIndex();
-        if (currentIndex >= 0 && currentIndex < flatSearchMatches.size()) {
+        if (currentIndex >= 0 && currentIndex < flatSearchMatches.size) {
             return flatSearchMatches.get(currentIndex);
         }
-        if (flatSearchMatches.isEmpty()) {
+        if (flatSearchMatches.size == 0) {
             return null;
         }
         int fallbackIndex = findSearchMatchIndexFromCursor(true);
-        if (fallbackIndex < 0 || fallbackIndex >= flatSearchMatches.size()) {
+        if (fallbackIndex < 0 || fallbackIndex >= flatSearchMatches.size) {
             return null;
         }
         return flatSearchMatches.get(fallbackIndex);
@@ -1082,12 +1170,12 @@ public class CodeEditor extends Widget {
         document.insertText(replacement);
     }
 
-    private void expandCollapsedRegionsForSearchMatches(List<SearchMatchRef> matches) {
-        if (matches == null || matches.isEmpty()) {
+    private void expandCollapsedRegionsForSearchMatches(Iterable<SearchMatchRef> matches) {
+        if (matches == null) {
             return;
         }
 
-        HashSet<String> keysToExpand = new HashSet<>();
+        ObjectSet<String> keysToExpand = new ObjectSet<>();
         for (SearchMatchRef match : matches) {
             if (match == null) {
                 continue;
@@ -1104,14 +1192,14 @@ public class CodeEditor extends Widget {
         }
 
         float previousScroll = scrollY;
-        collapsedRegionKeys.removeAll(keysToExpand);
+        removeCollapsedRegionKeys(keysToExpand);
         invalidateLayout();
         ensureLayout();
         scrollY = Math.max(getMinScroll(), Math.min(previousScroll, getMaxScroll()));
     }
 
     private boolean expandCollapsedRegionContainingLine(int line) {
-        HashSet<String> keysToExpand = new HashSet<>();
+        ObjectSet<String> keysToExpand = new ObjectSet<>();
         for (FoldRegion region : foldRegions) {
             if (region.collapsed && region.startLine < line && line <= region.endLine) {
                 keysToExpand.add(region.key);
@@ -1122,11 +1210,17 @@ public class CodeEditor extends Widget {
         }
 
         float previousScroll = scrollY;
-        collapsedRegionKeys.removeAll(keysToExpand);
+        removeCollapsedRegionKeys(keysToExpand);
         invalidateLayout();
         ensureLayout();
         scrollY = Math.max(getMinScroll(), Math.min(previousScroll, getMaxScroll()));
         return true;
+    }
+
+    private void removeCollapsedRegionKeys(ObjectSet<String> keys) {
+        for (String key : keys) {
+            collapsedRegionKeys.remove(key);
+        }
     }
 
     private void beginSelectionIfNeeded(boolean selecting) {
@@ -1261,25 +1355,53 @@ public class CodeEditor extends Widget {
         return Character.isLetterOrDigit(c) || c == '_';
     }
 
-    private void copySelectionToClipboard() {
-        String selected = getSelectedText();
-        if (!selected.isEmpty()) {
-            Gdx.app.getClipboard().setContents(selected);
-        }
-    }
-
-    private void cutSelectionToClipboard() {
+    public boolean copySelection() {
         String selected = getSelectedText();
         if (selected.isEmpty()) {
-            return;
+            return false;
+        }
+        Gdx.app.getClipboard().setContents(selected);
+        return true;
+    }
+
+    public boolean cutSelection() {
+        if (disabled || readOnly) {
+            return false;
+        }
+        String selected = getSelectedText();
+        if (selected.isEmpty()) {
+            return false;
         }
         Gdx.app.getClipboard().setContents(selected);
         expandCollapsedRegionsForEdit(EditIntent.DELETE);
+        markPendingContentChange(CodeEditorContentChangeType.CUT);
         deleteSelectionIfPresent();
         onDocumentMutated();
+        return true;
+    }
+
+    public boolean pasteClipboard() {
+        if (disabled || readOnly) {
+            return false;
+        }
+        markPendingContentChange(CodeEditorContentChangeType.PASTE);
+        replaceSelectionWith(Gdx.app.getClipboard().getContents(), true);
+        return true;
+    }
+
+    public boolean canUndo() {
+        return document.canUndo();
+    }
+
+    public boolean canRedo() {
+        return document.canRedo();
     }
 
     private void replaceSelectionWith(String text) {
+        replaceSelectionWith(text, false);
+    }
+
+    private void replaceSelectionWith(String text, boolean deferPostMutationProcessing) {
         expandCollapsedRegionsForEdit(EditIntent.INSERT);
         document.beginCompoundEdit();
         try {
@@ -1288,21 +1410,285 @@ public class CodeEditor extends Widget {
         } finally {
             document.endCompoundEdit();
         }
+        if (deferPostMutationProcessing) {
+            onDocumentMutatedDeferred();
+        } else {
+            onDocumentMutated();
+        }
+    }
+
+    public boolean undo() {
+        if (!canUndo() || disabled || readOnly) {
+            return false;
+        }
+        if (!document.undo()) {
+            return false;
+        }
+        clearSelection();
+        markPendingContentChange(CodeEditorContentChangeType.UNDO);
         onDocumentMutated();
+        return true;
     }
 
-    private void undo() {
-        if (document.undo()) {
-            clearSelection();
-            onDocumentMutated();
+    public boolean redo() {
+        if (!canRedo() || disabled || readOnly) {
+            return false;
+        }
+        if (!document.redo()) {
+            return false;
+        }
+        clearSelection();
+        markPendingContentChange(CodeEditorContentChangeType.REDO);
+        onDocumentMutated();
+        return true;
+    }
+
+    private void startDeleteKeyRepeat(int keycode) {
+        repeatingDeleteKey = keycode;
+        repeatDeleteDelayRemaining = KEY_REPEAT_INITIAL_DELAY;
+        repeatDeleteIntervalRemaining = KEY_REPEAT_INTERVAL;
+    }
+
+    private void stopDeleteKeyRepeat(int keycode) {
+        if (repeatingDeleteKey == keycode) {
+            repeatingDeleteKey = -1;
         }
     }
 
-    private void redo() {
-        if (document.redo()) {
-            clearSelection();
-            onDocumentMutated();
+    private void updateKeyRepeat(float delta) {
+        if (repeatingDeleteKey == -1) {
+            return;
         }
+        if (disabled || readOnly || !isFocused()) {
+            repeatingDeleteKey = -1;
+            return;
+        }
+
+        if (repeatDeleteDelayRemaining > 0f) {
+            repeatDeleteDelayRemaining -= delta;
+            if (repeatDeleteDelayRemaining > 0f) {
+                return;
+            }
+        }
+
+        repeatDeleteIntervalRemaining -= delta;
+        while (repeatDeleteIntervalRemaining <= 0f) {
+            if (!performDeleteKey(repeatingDeleteKey)) {
+                repeatingDeleteKey = -1;
+                return;
+            }
+            repeatDeleteIntervalRemaining += KEY_REPEAT_INTERVAL;
+        }
+    }
+
+    private boolean performDeleteKey(int keycode) {
+        if (keycode == Input.Keys.BACKSPACE) {
+            expandCollapsedRegionsForEdit(EditIntent.BACKSPACE);
+            markPendingContentChange(CodeEditorContentChangeType.DELETE);
+            if (getSelectionRange() != null) {
+                deleteSelectionIfPresent();
+                onDocumentMutated();
+                return true;
+            }
+
+            int lineBefore = document.getCursorLine();
+            int columnBefore = document.getCursorColumn();
+            document.backspace();
+            if (lineBefore == document.getCursorLine() && columnBefore == document.getCursorColumn()) {
+                return false;
+            }
+            onDocumentMutated();
+            return true;
+        }
+
+        if (keycode == Input.Keys.FORWARD_DEL) {
+            expandCollapsedRegionsForEdit(EditIntent.DELETE);
+            markPendingContentChange(CodeEditorContentChangeType.DELETE);
+            if (getSelectionRange() != null) {
+                deleteSelectionIfPresent();
+                onDocumentMutated();
+                return true;
+            }
+
+            int versionBefore = document.getVersion();
+            document.deleteForward();
+            if (versionBefore == document.getVersion()) {
+                return false;
+            }
+            onDocumentMutated();
+            return true;
+        }
+
+        return false;
+    }
+
+    private void clearSelectedTextDragState() {
+        pendingSelectionMove = false;
+        draggingSelectedText = false;
+        draggedSelectionText = "";
+        draggedSelectionStartLine = -1;
+        draggedSelectionStartColumn = -1;
+        draggedSelectionEndLine = -1;
+        draggedSelectionEndColumn = -1;
+        draggedSelectionDropLine = -1;
+        draggedSelectionDropColumn = -1;
+    }
+
+    private boolean beginSelectedTextDrag(float x, float y) {
+        if (useTouchInteractions() || readOnly) {
+            return false;
+        }
+        SelectionRange selection = getSelectionRange();
+        if (selection == null) {
+            return false;
+        }
+        CodePoint point = getCodePointAt(x, y, false);
+        if (!isPointInsideSelection(selection, point)) {
+            return false;
+        }
+        pendingSelectionMove = true;
+        draggingSelectedText = false;
+        draggedSelectionText = getSelectedText();
+        draggedSelectionStartLine = selection.startLine;
+        draggedSelectionStartColumn = selection.startColumn;
+        draggedSelectionEndLine = selection.endLine;
+        draggedSelectionEndColumn = selection.endColumn;
+        draggedSelectionDropLine = point.line;
+        draggedSelectionDropColumn = point.column;
+        return true;
+    }
+
+    private void updateSelectedTextDrag(float x, float y) {
+        CodePoint point = getCodePointAt(x, y, true);
+        if (point == null) {
+            return;
+        }
+        draggedSelectionDropLine = point.line;
+        draggedSelectionDropColumn = point.column;
+        refreshBlink();
+    }
+
+    private boolean finishSelectedTextDrag(float x, float y) {
+        SelectionRange selection = getDraggedSelectionRange();
+        if (selection == null || draggedSelectionText.isEmpty()) {
+            clearSelectedTextDragState();
+            return false;
+        }
+
+        CodePoint dropPoint = getCodePointAt(x, y, true);
+        if (dropPoint == null) {
+            clearSelectedTextDragState();
+            return false;
+        }
+        if (isPointWithinSelectionBounds(selection, dropPoint)) {
+            clearSelectedTextDragState();
+            refreshBlink();
+            return true;
+        }
+
+        CodePoint adjustedDropPoint = adjustPointAfterSelectionDeletion(dropPoint, selection);
+        expandCollapsedRegionsForEdit(EditIntent.DELETE);
+        document.beginCompoundEdit();
+        try {
+            document.deleteRange(selection.startLine, selection.startColumn, selection.endLine, selection.endColumn);
+            document.moveCursorTo(adjustedDropPoint.line, adjustedDropPoint.column);
+            selectionAnchorLine = adjustedDropPoint.line;
+            selectionAnchorColumn = adjustedDropPoint.column;
+            markPendingContentChange(CodeEditorContentChangeType.UNKNOWN);
+            document.insertText(draggedSelectionText);
+        } finally {
+            document.endCompoundEdit();
+        }
+        clearSelectedTextDragState();
+        onDocumentMutated();
+        return true;
+    }
+
+    private SelectionRange getDraggedSelectionRange() {
+        if (draggedSelectionStartLine < 0 || draggedSelectionEndLine < 0) {
+            return null;
+        }
+        return new SelectionRange(
+            draggedSelectionStartLine,
+            draggedSelectionStartColumn,
+            draggedSelectionEndLine,
+            draggedSelectionEndColumn
+        );
+    }
+
+    private boolean isPointInsideSelection(SelectionRange selection, CodePoint point) {
+        if (selection == null || point == null) {
+            return false;
+        }
+        return compareCodePointToSelectionStart(point, selection) >= 0
+            && compareCodePointToSelectionEnd(point, selection) < 0;
+    }
+
+    private boolean isPointWithinSelectionBounds(SelectionRange selection, CodePoint point) {
+        if (selection == null || point == null) {
+            return false;
+        }
+        return compareCodePointToSelectionStart(point, selection) >= 0
+            && compareCodePointToSelectionEnd(point, selection) <= 0;
+    }
+
+    private int compareCodePointToSelectionStart(CodePoint point, SelectionRange selection) {
+        return comparePosition(point.line, point.column, selection.startLine, selection.startColumn);
+    }
+
+    private int compareCodePointToSelectionEnd(CodePoint point, SelectionRange selection) {
+        return comparePosition(point.line, point.column, selection.endLine, selection.endColumn);
+    }
+
+    private int comparePosition(int lineA, int columnA, int lineB, int columnB) {
+        if (lineA != lineB) {
+            return lineA < lineB ? -1 : 1;
+        }
+        if (columnA == columnB) {
+            return 0;
+        }
+        return columnA < columnB ? -1 : 1;
+    }
+
+    private CodePoint adjustPointAfterSelectionDeletion(CodePoint point, SelectionRange selection) {
+        if (comparePosition(point.line, point.column, selection.endLine, selection.endColumn) <= 0) {
+            return point;
+        }
+        if (selection.startLine == selection.endLine) {
+            if (point.line != selection.startLine) {
+                return point;
+            }
+            return new CodePoint(point.line, Math.max(selection.startColumn, point.column - (selection.endColumn - selection.startColumn)));
+        }
+
+        int removedLineCount = selection.endLine - selection.startLine;
+        if (point.line == selection.endLine) {
+            return new CodePoint(selection.startLine, selection.startColumn + Math.max(0, point.column - selection.endColumn));
+        }
+        if (point.line > selection.endLine) {
+            return new CodePoint(point.line - removedLineCount, point.column);
+        }
+        return point;
+    }
+
+    private void drawDraggedSelectionDropCaret(Batch batch) {
+        if (!draggingSelectedText || style.cursor == null || draggedSelectionDropLine < 0) {
+            return;
+        }
+        SelectionRange selection = getDraggedSelectionRange();
+        if (selection == null) {
+            return;
+        }
+        CodePoint point = new CodePoint(draggedSelectionDropLine, draggedSelectionDropColumn);
+        if (isPointWithinSelectionBounds(selection, point)) {
+            return;
+        }
+        CursorPlacement placement = getCursorPlacement(draggedSelectionDropLine, draggedSelectionDropColumn);
+        if (placement == null) {
+            return;
+        }
+        float rowBottom = rowBottom(placement.row);
+        style.cursor.draw(batch, getX() + placement.x, getY() + rowBottom + 3f, 1.5f, lineHeight - 6f);
     }
 
     private void drawRows(Batch batch) {
@@ -1314,7 +1700,7 @@ public class CodeEditor extends Widget {
 
         if (document.getLineCount() == 1 && document.getLineLength(0) == 0 && !isFocused() && !messageText.isEmpty()) {
             style.font.setColor(style.messageFontColor);
-            style.font.draw(batch, messageText, getX() + getTextRenderX(), getY() + contentTopY() - 6f);
+            style.font.draw(batch, messageText, getX() + getTextRenderX(), getTextBaseline(getY() + rowBottom(0)));
         }
 
         drawVisibleRowBackgrounds(batch, startRow, endRow, activeBlock);
@@ -1322,7 +1708,7 @@ public class CodeEditor extends Widget {
 
         for (int row = startRow; row <= endRow; row++) {
             int line = findLineByVisualRow(row);
-            if (line < 0 || line >= lineLayouts.size()) {
+            if (line < 0 || line >= lineLayouts.size) {
                 continue;
             }
 
@@ -1331,34 +1717,11 @@ public class CodeEditor extends Widget {
             int start = layout.segmentStarts.get(segment);
             int end = layout.segmentEnds.get(segment);
             float rowBottom = getY() + rowBottom(row);
-            float baseline = rowBottom + lineHeight - 6f;
+            float baseline = getTextBaseline(rowBottom);
 
             drawSearchHighlights(batch, layout, line, start, end, rowBottom);
             drawSelection(batch, selection, layout, line, segment, start, end, rowBottom);
             drawBracketHighlight(batch, bracketMatch, layout, line, segment, start, end, rowBottom);
-
-            style.font.setColor(style.gutterFontColor);
-            if (segment == 0) {
-                drawFoldIndicator(batch, line, rowBottom, baseline);
-
-                String lineNumber = Integer.toString(line + 1);
-                float numberWidth = measureText(lineNumber);
-                float lineNumberRight = getGutterLineNumberRightX();
-                style.font.draw(
-                    batch,
-                    lineNumber,
-                    getX() + getGutterRenderX() + lineNumberRight - numberWidth,
-                    baseline
-                );
-            } else {
-                float continuationWidth = measureText(".");
-                style.font.draw(
-                    batch,
-                    ".",
-                    getX() + getGutterRenderX() + getGutterLineNumberRightX() - continuationWidth,
-                    baseline
-                );
-            }
 
             drawStyledRange(batch, layout, start, end, getX() + getTextRenderX(), baseline);
 
@@ -1382,13 +1745,59 @@ public class CodeEditor extends Widget {
             }
         }
 
+        drawGutterOverlay(batch, startRow, endRow);
         drawScrollbar(batch);
+    }
+
+    private void drawGutterOverlay(Batch batch, int startRow, int endRow) {
+        if (style.gutterBackground != null) {
+            style.gutterBackground.draw(
+                batch,
+                getX() + getGutterRenderX(),
+                getY() + style.statusBarHeight,
+                getGutterWidth(),
+                getContentHeight()
+            );
+        }
+
+        for (int row = startRow; row <= endRow; row++) {
+            int line = findLineByVisualRow(row);
+            if (line < 0 || line >= lineLayouts.size) {
+                continue;
+            }
+
+            int segment = row - visualRowStart[line];
+            float rowBottom = getY() + rowBottom(row);
+            float baseline = getTextBaseline(rowBottom);
+            style.font.setColor(style.gutterFontColor);
+            if (segment == 0) {
+                drawFoldIndicator(batch, line, rowBottom, baseline);
+
+                String lineNumber = Integer.toString(line + 1);
+                float numberWidth = measureText(lineNumber);
+                float lineNumberRight = getGutterLineNumberRightX();
+                style.font.draw(
+                    batch,
+                    lineNumber,
+                    getX() + getGutterRenderX() + lineNumberRight - numberWidth,
+                    baseline
+                );
+            } else {
+                float continuationWidth = measureText(".");
+                style.font.draw(
+                    batch,
+                    ".",
+                    getX() + getGutterRenderX() + getGutterLineNumberRightX() - continuationWidth,
+                    baseline
+                );
+            }
+        }
     }
 
     private void drawVisibleRowBackgrounds(Batch batch, int startRow, int endRow, FoldRegion activeBlock) {
         for (int row = startRow; row <= endRow; row++) {
             int line = findLineByVisualRow(row);
-            if (line < 0 || line >= lineLayouts.size()) {
+            if (line < 0 || line >= lineLayouts.size) {
                 continue;
             }
 
@@ -1415,12 +1824,15 @@ public class CodeEditor extends Widget {
             }
 
             if (cursor < token.start) {
-                x = drawText(batch, layout.text, cursor, Math.min(token.start, end), x, baseline, baseColor);
+                int plainEnd = Math.min(token.start, end);
+                drawText(batch, layout.text, cursor, plainEnd, x, baseline, baseColor);
+                x += layout.measureRange(cursor, plainEnd);
             }
 
             int tokenStart = Math.max(token.start, start);
             int tokenEnd = Math.min(token.end, end);
-            x = drawText(batch, layout.text, tokenStart, tokenEnd, x, baseline, disabled ? baseColor : token.color);
+            drawText(batch, layout.text, tokenStart, tokenEnd, x, baseline, disabled ? baseColor : token.color);
+            x += layout.measureRange(tokenStart, tokenEnd);
             cursor = tokenEnd;
         }
 
@@ -1429,13 +1841,16 @@ public class CodeEditor extends Widget {
         }
     }
 
-    private float drawText(Batch batch, String text, int start, int end, float x, float y, Color color) {
+    private void drawText(Batch batch, String text, int start, int end, float x, float y, Color color) {
         if (start >= end) {
-            return x;
+            return;
         }
         style.font.setColor(color);
-        GlyphLayout drawn = style.font.draw(batch, text, x, y, start, end, 0f, Align.left, false);
-        return x + drawn.width;
+        style.font.draw(batch, text, x, y, start, end, 0f, Align.left, false);
+    }
+
+    private float getTextBaseline(float rowBottom) {
+        return rowBottom + lineHeight + style.textBaselineOffset;
     }
 
     private void drawCaret(Batch batch) {
@@ -1503,11 +1918,11 @@ public class CodeEditor extends Widget {
         int end,
         float rowBottom
     ) {
-        if (style.searchHighlight == null || line < 0 || line >= searchMatches.size()) {
+        if (style.searchHighlight == null || line < 0 || line >= searchMatches.size) {
             return;
         }
-        List<SearchMatch> lineMatches = searchMatches.get(line);
-        if (lineMatches == null || lineMatches.isEmpty()) {
+        Array<SearchMatch> lineMatches = searchMatches.get(line);
+        if (lineMatches == null || lineMatches.size == 0) {
             return;
         }
         for (SearchMatch match : lineMatches) {
@@ -1577,7 +1992,7 @@ public class CodeEditor extends Widget {
         int maxVisibleIndent = 0;
         for (int row = startRow; row <= endRow; row++) {
             int line = findLineByVisualRow(row);
-            if (line >= 0 && line < lineLayouts.size()) {
+            if (line >= 0 && line < lineLayouts.size) {
                 maxVisibleIndent = Math.max(maxVisibleIndent, lineLayouts.get(line).indentLevel);
             }
         }
@@ -1593,7 +2008,7 @@ public class CodeEditor extends Widget {
                 boolean emphasized = false;
                 if (row <= endRow) {
                     int line = findLineByVisualRow(row);
-                    if (line >= 0 && line < lineLayouts.size()) {
+                    if (line >= 0 && line < lineLayouts.size) {
                         active = shouldDrawGuideForLineDepth(line, depth);
                         emphasized = active && isGuideEmphasized(activeBlock, line, depth);
                     }
@@ -1623,7 +2038,7 @@ public class CodeEditor extends Widget {
     }
 
     private boolean shouldDrawGuideForLineDepth(int line, int depth) {
-        if (line < 0 || line >= lineLayouts.size()) {
+        if (line < 0 || line >= lineLayouts.size) {
             return false;
         }
         if (lineLayouts.get(line).indentLevel <= depth) {
@@ -1648,7 +2063,7 @@ public class CodeEditor extends Widget {
         if (endRow < startRow) {
             return;
         }
-        float guideX = getX() + getTextRenderX() + depth * style.guideSpacing + style.guideOffsetX;
+        float guideX = getX() + getTextRenderX() + depth * getEffectiveGuideSpacing() + getEffectiveGuideOffsetX();
         float y = getY() + rowBottom(endRow);
         float height = (endRow - startRow + 1) * lineHeight;
         Color guideColor = rainbowGuidesEnabled ? getRainbowGuideColor(depth, emphasized) : null;
@@ -1673,6 +2088,14 @@ public class CodeEditor extends Widget {
         batch.draw(style.whitePixelTexture, x, y, width, height);
         batch.setColor(previousR, previousG, previousB, previousA);
         return true;
+    }
+
+    private float getEffectiveGuideSpacing() {
+        return style.guideSpacing * zoomScale;
+    }
+
+    private float getEffectiveGuideOffsetX() {
+        return style.guideOffsetX * zoomScale;
     }
 
     private void drawFoldIndicator(Batch batch, int line, float rowBottom, float baseline) {
@@ -1818,7 +2241,7 @@ public class CodeEditor extends Widget {
         }
 
         int line = findLineByVisualRow(row);
-        if (line < 0 || line >= lineLayouts.size()) {
+        if (line < 0 || line >= lineLayouts.size) {
             return;
         }
 
@@ -1840,7 +2263,7 @@ public class CodeEditor extends Widget {
         }
 
         int line = findLineByVisualRow(row);
-        if (line < 0 || line >= lineLayouts.size()) {
+        if (line < 0 || line >= lineLayouts.size) {
             return null;
         }
 
@@ -1948,7 +2371,7 @@ public class CodeEditor extends Widget {
 
     private CursorPlacement getCursorPlacement(int line, int column) {
         ensureLayout();
-        if (line < 0 || line >= lineLayouts.size()) {
+        if (line < 0 || line >= lineLayouts.size) {
             return null;
         }
         if (line < hiddenLines.length && hiddenLines[line]) {
@@ -2089,7 +2512,9 @@ public class CodeEditor extends Widget {
         scrollY += deltaScrollY;
         clampScroll();
         if (scrollX != previousScrollX || scrollY != previousScrollY) {
-            if (draggingStartHandle || draggingEndHandle) {
+            if (draggingSelectedText) {
+                updateSelectedTextDrag(lastDragX, lastDragY);
+            } else if (draggingStartHandle || draggingEndHandle) {
                 updateSelectionHandleDrag(lastDragX, lastDragY);
             } else {
                 placeCursorForDrag(lastDragX, lastDragY);
@@ -2106,6 +2531,7 @@ public class CodeEditor extends Widget {
         }
 
         applyTouchScrollDelta(touchScrollVelocityX * delta, touchScrollVelocityY * delta);
+        suppressOutwardFlingAtBounds();
 
         float damping = Math.max(0f, 1f - TOUCH_FLING_DAMPING * delta);
         touchScrollVelocityX *= damping;
@@ -2114,6 +2540,24 @@ public class CodeEditor extends Widget {
             touchScrollVelocityX = 0f;
         }
         if (Math.abs(touchScrollVelocityY) < TOUCH_FLING_MIN_SPEED) {
+            touchScrollVelocityY = 0f;
+        }
+    }
+
+    private void suppressOutwardFlingAtBounds() {
+        float minScrollX = getMinScrollX();
+        float maxScrollX = getMaxScrollX();
+        if (scrollX <= minScrollX + 0.5f && touchScrollVelocityX < 0f) {
+            touchScrollVelocityX = 0f;
+        } else if (scrollX >= maxScrollX - 0.5f && touchScrollVelocityX > 0f) {
+            touchScrollVelocityX = 0f;
+        }
+
+        float minScrollY = getMinScroll();
+        float maxScrollY = getMaxScroll();
+        if (scrollY <= minScrollY + 0.5f && touchScrollVelocityY < 0f) {
+            touchScrollVelocityY = 0f;
+        } else if (scrollY >= maxScrollY - 0.5f && touchScrollVelocityY > 0f) {
             touchScrollVelocityY = 0f;
         }
     }
@@ -2153,27 +2597,31 @@ public class CodeEditor extends Widget {
     }
 
     private void applyTouchScrollDelta(float deltaX, float deltaY) {
-        float nextX = scrollX + deltaX;
-        float minScrollX = getMinScrollX();
-        float maxScrollX = getMaxScrollX();
-        if (nextX < minScrollX) {
-            nextX = minScrollX - Math.min(TOUCH_OVERSCROLL_LIMIT, (minScrollX - nextX) * TOUCH_OVERSCROLL_DAMPING);
-        } else if (nextX > maxScrollX) {
-            nextX = maxScrollX + Math.min(TOUCH_OVERSCROLL_LIMIT, (nextX - maxScrollX) * TOUCH_OVERSCROLL_DAMPING);
+        scrollX = applyTouchScrollAxis(scrollX, deltaX, getMinScrollX(), getMaxScrollX());
+        scrollY = applyTouchScrollAxis(scrollY, deltaY, getMinScroll(), getMaxScroll());
+    }
+
+    private float applyTouchScrollAxis(float current, float delta, float min, float max) {
+        float next = current + delta;
+        if (current < min) {
+            if (delta < 0f) {
+                next = current + delta * TOUCH_OVERSCROLL_DAMPING;
+            }
+            return Math.max(min - TOUCH_OVERSCROLL_LIMIT, Math.min(max + TOUCH_OVERSCROLL_LIMIT, next));
         }
-        scrollX = nextX;
-
-        float next = scrollY + deltaY;
-        float minScroll = getMinScroll();
-        float maxScroll = getMaxScroll();
-
-        if (next < minScroll) {
-            next = minScroll - Math.min(TOUCH_OVERSCROLL_LIMIT, (minScroll - next) * TOUCH_OVERSCROLL_DAMPING);
-        } else if (next > maxScroll) {
-            next = maxScroll + Math.min(TOUCH_OVERSCROLL_LIMIT, (next - maxScroll) * TOUCH_OVERSCROLL_DAMPING);
+        if (current > max) {
+            if (delta > 0f) {
+                next = current + delta * TOUCH_OVERSCROLL_DAMPING;
+            }
+            return Math.max(min - TOUCH_OVERSCROLL_LIMIT, Math.min(max + TOUCH_OVERSCROLL_LIMIT, next));
         }
-
-        scrollY = next;
+        if (next < min) {
+            return Math.max(min - TOUCH_OVERSCROLL_LIMIT, min + (next - min) * TOUCH_OVERSCROLL_DAMPING);
+        }
+        if (next > max) {
+            return Math.min(max + TOUCH_OVERSCROLL_LIMIT, max + (next - max) * TOUCH_OVERSCROLL_DAMPING);
+        }
+        return next;
     }
 
     private boolean isInVerticalScrollbarHitArea(float x, float y) {
@@ -2420,7 +2868,7 @@ public class CodeEditor extends Widget {
     }
 
     private BracketMatch searchBackwardForBracket(int line, int column, char open, char close) {
-        ArrayList<CodePosition> positions = new ArrayList<>();
+        Array<CodePosition> positions = new Array<>();
         ScanState state = new ScanState();
 
         for (int currentLine = 0; currentLine <= line; currentLine++) {
@@ -2443,7 +2891,7 @@ public class CodeEditor extends Widget {
         }
 
         int depth = 0;
-        for (int i = positions.size() - 1; i >= 0; i--) {
+        for (int i = positions.size - 1; i >= 0; i--) {
             CodePosition position = positions.get(i);
             if (position.line == line && position.column == column) {
                 depth = 1;
@@ -2575,7 +3023,7 @@ public class CodeEditor extends Widget {
 
     private void moveCursorToVisualRow(int row, float targetX) {
         int line = findLineByVisualRow(row);
-        if (line < 0 || line >= lineLayouts.size()) {
+        if (line < 0 || line >= lineLayouts.size) {
             return;
         }
 
@@ -2631,6 +3079,37 @@ public class CodeEditor extends Widget {
         }
         glyphWidthCache.put(character, width);
         return width;
+    }
+
+    private float glyphAdvance(String text, int index) {
+        if (text == null || index < 0 || index >= text.length()) {
+            return 0f;
+        }
+
+        char current = text.charAt(index);
+        if (current == '\t') {
+            return glyphWidth(' ') * CodeDocument.INDENT_SIZE;
+        }
+
+        char next = index + 1 < text.length() ? text.charAt(index + 1) : 0;
+        int cacheKey = (current << 16) | next;
+        if (glyphAdvanceCache.containsKey(cacheKey)) {
+            return glyphAdvanceCache.get(cacheKey, 0f);
+        }
+
+        BitmapFont.Glyph glyph = style.font.getData().getGlyph(current);
+        float advance;
+        if (glyph == null) {
+            advance = Math.max(6f, style.font.getSpaceXadvance() * getEffectiveFontScaleX());
+        } else {
+            advance = glyph.xadvance * getEffectiveFontScaleX();
+            if (next != 0) {
+                advance += glyph.getKerning(next) * getEffectiveFontScaleX();
+            }
+            advance = Math.max(1f, advance);
+        }
+        glyphAdvanceCache.put(cacheKey, advance);
+        return advance;
     }
 
     private float getEffectiveFontScaleX() {
@@ -2753,6 +3232,7 @@ public class CodeEditor extends Widget {
         zoomScale = clampedScale;
         updateFontMetrics();
         glyphWidthCache.clear();
+        glyphAdvanceCache.clear();
         invalidateLayout();
         ensureLayout();
 
@@ -2918,14 +3398,14 @@ public class CodeEditor extends Widget {
     }
 
     private boolean isIgnoredBracketPosition(int line, int column) {
-        if (line < 0 || line >= bracketIgnoreLines.size()) {
+        if (line < 0 || line >= bracketIgnoreLines.size) {
             return false;
         }
         return isIgnoredBracketPosition(bracketIgnoreLines.get(line), column);
     }
 
-    private boolean isIgnoredBracketPosition(List<CodeBracketIgnoreSpan> spans, int column) {
-        if (spans == null || spans.isEmpty()) {
+    private boolean isIgnoredBracketPosition(Array<CodeBracketIgnoreSpan> spans, int column) {
+        if (spans == null || spans.size == 0) {
             return false;
         }
         for (CodeBracketIgnoreSpan span : spans) {
@@ -2961,7 +3441,7 @@ public class CodeEditor extends Widget {
         final String key;
         boolean collapsed;
 
-        FoldRegion(int startLine, int endLine, int depth, List<String> lines) {
+        FoldRegion(int startLine, int endLine, int depth, Array<String> lines) {
             this.startLine = startLine;
             this.endLine = endLine;
             this.depth = depth;
@@ -2987,12 +3467,12 @@ public class CodeEditor extends Widget {
     private static final class LineLayout {
         final String text;
         final int indentLevel;
-        final ArrayList<HighlightToken> tokens;
+        final Array<HighlightToken> tokens;
         final IntArray segmentStarts = new IntArray();
         final IntArray segmentEnds = new IntArray();
         float[] prefixWidths;
 
-        LineLayout(String text, int indentLevel, ArrayList<HighlightToken> tokens) {
+        LineLayout(String text, int indentLevel, Array<HighlightToken> tokens) {
             this.text = text;
             this.indentLevel = indentLevel;
             this.tokens = tokens;
@@ -3018,7 +3498,7 @@ public class CodeEditor extends Widget {
             }
             prefixWidths = new float[text.length() + 1];
             for (int i = 0; i < text.length(); i++) {
-                prefixWidths[i + 1] = prefixWidths[i] + editor.glyphWidth(text.charAt(i));
+                prefixWidths[i + 1] = prefixWidths[i] + editor.glyphAdvance(text, i);
             }
         }
 
@@ -3190,6 +3670,7 @@ public class CodeEditor extends Widget {
         public float topBarHeight = DEFAULT_TOP_BAR_HEIGHT;
         public float statusBarHeight = DEFAULT_STATUS_BAR_HEIGHT;
         public float rowPadding = DEFAULT_ROW_PADDING;
+        public float textBaselineOffset = -6f;
         public float textLeftPadding = DEFAULT_LEFT_PADDING;
         public float textRightPadding = DEFAULT_RIGHT_PADDING;
         public float gutterMinWidth = DEFAULT_GUTTER_MIN_WIDTH;
@@ -3251,6 +3732,7 @@ public class CodeEditor extends Widget {
             this.topBarHeight = style.topBarHeight;
             this.statusBarHeight = style.statusBarHeight;
             this.rowPadding = style.rowPadding;
+            this.textBaselineOffset = style.textBaselineOffset;
             this.textLeftPadding = style.textLeftPadding;
             this.textRightPadding = style.textRightPadding;
             this.gutterMinWidth = style.gutterMinWidth;
@@ -3307,6 +3789,8 @@ public class CodeEditor extends Widget {
             touchDownTimeNanos = lastTouchDragTimeNanos;
             pendingTouchPress = false;
             longPressTriggered = false;
+            pendingSelectionMove = false;
+            draggingSelectedText = false;
             draggingStartHandle = false;
             draggingEndHandle = false;
             draggingHorizontalScrollbar = false;
@@ -3363,6 +3847,13 @@ public class CodeEditor extends Widget {
                 return true;
             }
 
+            if (button == Input.Buttons.LEFT && beginSelectedTextDrag(x, y)) {
+                draggingSelection = false;
+                draggingTouchScroll = false;
+                refreshBlink();
+                return true;
+            }
+
             clearSelection();
             draggingSelection = true;
             draggingTouchScroll = false;
@@ -3414,12 +3905,12 @@ public class CodeEditor extends Widget {
                     return true;
                 }
                 if (keycode == Input.Keys.A) {
-                    selectAll();
+                    selectAllText();
                     return true;
                 }
                 if (keycode == Input.Keys.C) {
                     if (getSelectionRange() != null) {
-                        copySelectionToClipboard();
+                        copySelection();
                     } else {
                         Gdx.app.getClipboard().setContents(document.getLine(document.getCursorLine()));
                     }
@@ -3430,7 +3921,7 @@ public class CodeEditor extends Widget {
                         return true;
                     }
                     if (getSelectionRange() != null) {
-                        cutSelectionToClipboard();
+                        cutSelection();
                     }
                     return true;
                 }
@@ -3438,7 +3929,7 @@ public class CodeEditor extends Widget {
                     if (readOnly) {
                         return true;
                     }
-                    replaceSelectionWith(Gdx.app.getClipboard().getContents());
+                    pasteClipboard();
                     return true;
                 }
             }
@@ -3476,33 +3967,26 @@ public class CodeEditor extends Widget {
                     if (readOnly) {
                         return true;
                     }
-                    expandCollapsedRegionsForEdit(EditIntent.BACKSPACE);
-                    if (getSelectionRange() != null) {
-                        deleteSelectionIfPresent();
-                        onDocumentMutated();
-                        return true;
+                    startDeleteKeyRepeat(keycode);
+                    if (!performDeleteKey(keycode)) {
+                        stopDeleteKeyRepeat(keycode);
                     }
-                    document.backspace();
-                    onDocumentMutated();
                     return true;
                 case Input.Keys.FORWARD_DEL:
                     if (readOnly) {
                         return true;
                     }
-                    expandCollapsedRegionsForEdit(EditIntent.DELETE);
-                    if (getSelectionRange() != null) {
-                        deleteSelectionIfPresent();
-                        onDocumentMutated();
-                        return true;
+                    startDeleteKeyRepeat(keycode);
+                    if (!performDeleteKey(keycode)) {
+                        stopDeleteKeyRepeat(keycode);
                     }
-                    document.deleteForward();
-                    onDocumentMutated();
                     return true;
                 case Input.Keys.ENTER:
                     if (readOnly) {
                         return true;
                     }
                     expandCollapsedRegionsForEdit(EditIntent.ENTER);
+                    markPendingContentChange(CodeEditorContentChangeType.INSERT);
                     document.beginCompoundEdit();
                     try {
                         deleteSelectionIfPresent();
@@ -3517,6 +4001,7 @@ public class CodeEditor extends Widget {
                         return true;
                     }
                     expandCollapsedRegionsForEdit(EditIntent.TAB);
+                    markPendingContentChange(CodeEditorContentChangeType.INSERT);
                     document.beginCompoundEdit();
                     try {
                         deleteSelectionIfPresent();
@@ -3530,9 +4015,6 @@ public class CodeEditor extends Widget {
                     toggleFold(findRelevantRegion(document.getCursorLine()));
                     return true;
                 default:
-                    if (!shift && !ctrl) {
-                        clearSelection();
-                    }
                     return false;
             }
 
@@ -3543,6 +4025,14 @@ public class CodeEditor extends Widget {
             ensureCursorVisible();
             refreshBlink();
             return true;
+        }
+
+        @Override
+        public boolean keyUp(InputEvent event, int keycode) {
+            if (keycode == Input.Keys.BACKSPACE || keycode == Input.Keys.FORWARD_DEL) {
+                stopDeleteKeyRepeat(keycode);
+            }
+            return false;
         }
 
         @Override
@@ -3562,6 +4052,7 @@ public class CodeEditor extends Widget {
 
             if (!Character.isISOControl(character)) {
                 expandCollapsedRegionsForEdit(EditIntent.TYPE);
+                markPendingContentChange(CodeEditorContentChangeType.INSERT);
                 document.beginCompoundEdit();
                 try {
                     if (character == '}') {
@@ -3572,7 +4063,7 @@ public class CodeEditor extends Widget {
                 } finally {
                     document.endCompoundEdit();
                 }
-                onDocumentMutated();
+                onDocumentMutatedDeferred();
                 return true;
             }
 
@@ -3614,6 +4105,21 @@ public class CodeEditor extends Widget {
                 updateSelectionHandleDrag(x, y);
                 return;
             }
+            if (pendingSelectionMove) {
+                float dx = x - touchDownX;
+                float dy = y - touchDownY;
+                if (dx * dx + dy * dy > TOUCH_SLOP * TOUCH_SLOP) {
+                    pendingSelectionMove = false;
+                    draggingSelectedText = true;
+                }
+                if (!draggingSelectedText) {
+                    return;
+                }
+            }
+            if (draggingSelectedText) {
+                updateSelectedTextDrag(x, y);
+                return;
+            }
             if (pendingTouchPress) {
                 float dx = x - touchDownX;
                 float dy = y - touchDownY;
@@ -3627,10 +4133,12 @@ public class CodeEditor extends Widget {
             if (draggingTouchScroll) {
                 float scrollDeltaX = -(x - previousDragX);
                 float scrollDeltaY = y - previousDragY;
+                float scrollBeforeX = scrollX;
+                float scrollBeforeY = scrollY;
                 applyTouchScrollDelta(scrollDeltaX, scrollDeltaY);
                 float elapsedSeconds = Math.max(0.001f, (nowNanos - previousTimeNanos) / 1_000_000_000f);
-                float sampledVelocityX = scrollDeltaX / elapsedSeconds;
-                float sampledVelocityY = scrollDeltaY / elapsedSeconds;
+                float sampledVelocityX = (scrollX - scrollBeforeX) / elapsedSeconds;
+                float sampledVelocityY = (scrollY - scrollBeforeY) / elapsedSeconds;
                 touchScrollVelocityX = touchScrollVelocityX * 0.25f + sampledVelocityX * 0.75f;
                 touchScrollVelocityY = touchScrollVelocityY * 0.25f + sampledVelocityY * 0.75f;
                 return;
@@ -3657,6 +4165,7 @@ public class CodeEditor extends Widget {
                 draggingSelection = false;
                 draggingStartHandle = false;
                 draggingEndHandle = false;
+                clearSelectedTextDragState();
                 draggingScrollbar = false;
                 draggingHorizontalScrollbar = false;
                 touchScrollVelocityX = 0f;
@@ -3664,6 +4173,8 @@ public class CodeEditor extends Widget {
                 return;
             }
             boolean handleDrag = draggingStartHandle || draggingEndHandle;
+            boolean selectedTextDrag = draggingSelectedText;
+            boolean pendingSelectionMoveTap = pendingSelectionMove;
             boolean shouldFling = draggingTouchScroll
                 && (Math.abs(touchScrollVelocityX) >= TOUCH_FLING_MIN_SPEED
                 || Math.abs(touchScrollVelocityY) >= TOUCH_FLING_MIN_SPEED);
@@ -3673,7 +4184,7 @@ public class CodeEditor extends Widget {
                 && button == Input.Buttons.LEFT
                 && Math.abs(x - touchDownX) <= TOUCH_SLOP
                 && Math.abs(y - touchDownY) <= TOUCH_SLOP
-                && getSelectionRange() == null;
+                && !selectedTextDrag;
             draggingScrollbar = false;
             draggingHorizontalScrollbar = false;
             draggingTouchScroll = false;
@@ -3684,6 +4195,7 @@ public class CodeEditor extends Widget {
             handleDragFixedColumn = -1;
             pendingTouchPress = false;
             longPressTriggered = false;
+            pendingSelectionMove = false;
             if (!shouldFling) {
                 touchScrollVelocityX = 0f;
                 touchScrollVelocityY = 0f;
@@ -3691,6 +4203,21 @@ public class CodeEditor extends Widget {
             if (disabled) {
                 return;
             }
+            if (selectedTextDrag) {
+                finishSelectedTextDrag(x, y);
+            } else if (pendingSelectionMoveTap) {
+                if (isMouseDoubleClick(x, y, nowNanos)) {
+                    selectWordAt(x, y);
+                    notifyDoubleClick(x, y, false);
+                    lastMouseTapTimeNanos = 0L;
+                } else {
+                    clearSelection();
+                    placeCursor(x, y);
+                    lastMouseTapTimeNanos = nowNanos;
+                    lastMouseTapX = x;
+                    lastMouseTapY = y;
+                }
+            } else
             if (wasPendingTap && touchInteraction) {
                 if (isPotentialDoubleTap(x, y, nowNanos)) {
                     selectWordAt(x, y);
@@ -3719,7 +4246,7 @@ public class CodeEditor extends Widget {
                     lastMouseTapY = y;
                 }
             }
-            if (handleDrag) {
+            if (handleDrag || selectedTextDrag) {
                 refreshBlink();
             }
             if (selectionAnchorLine >= 0 && getSelectionRange() == null) {

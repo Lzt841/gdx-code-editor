@@ -1,8 +1,8 @@
 package com.lzt841.editor;
 
+import com.badlogic.gdx.utils.Array;
+
 import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.List;
 
 /** Mutable line-based document optimized for editor style operations. */
 public class CodeDocument {
@@ -10,7 +10,7 @@ public class CodeDocument {
     private static final int MAX_HISTORY_SIZE = 200;
     private static final long MERGE_WINDOW_NANOS = 1_000_000_000L;
 
-    private final ArrayList<StringBuilder> lines = new ArrayList<>();
+    private final Array<StringBuilder> lines = new Array<>();
     private final ArrayDeque<DocumentState> undoStack = new ArrayDeque<>();
     private final ArrayDeque<DocumentState> redoStack = new ArrayDeque<>();
     private int cursorLine;
@@ -45,7 +45,7 @@ public class CodeDocument {
             return false;
         }
 
-        resetMergeState();
+        resetEditState();
         redoStack.push(captureState());
         restoreState(undoStack.pop());
         return true;
@@ -56,7 +56,7 @@ public class CodeDocument {
             return false;
         }
 
-        resetMergeState();
+        resetEditState();
         undoStack.push(captureState());
         restoreState(redoStack.pop());
         return true;
@@ -89,7 +89,7 @@ public class CodeDocument {
         if (lines.isEmpty()) {
             lines.add(new StringBuilder());
         }
-        cursorLine = clamp(targetCursorLine, 0, lines.size() - 1);
+        cursorLine = clamp(targetCursorLine, 0, lines.size - 1);
         cursorColumn = clamp(targetCursorColumn, 0, lines.get(cursorLine).length());
         touch();
     }
@@ -99,11 +99,22 @@ public class CodeDocument {
     }
 
     public int getLineCount() {
-        return lines.size();
+        return lines.size;
     }
 
     public String getLine(int line) {
         return lines.get(line).toString();
+    }
+
+    public String getText() {
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < lines.size; i++) {
+            if (i > 0) {
+                builder.append('\n');
+            }
+            builder.append(lines.get(i));
+        }
+        return builder.toString();
     }
 
     public int getLineLength(int line) {
@@ -119,7 +130,7 @@ public class CodeDocument {
     }
 
     public void moveCursorTo(int line, int column) {
-        cursorLine = clamp(line, 0, lines.size() - 1);
+        cursorLine = clamp(line, 0, lines.size - 1);
         cursorColumn = clamp(column, 0, lines.get(cursorLine).length());
         resetMergeState();
     }
@@ -143,7 +154,7 @@ public class CodeDocument {
             resetMergeState();
             return;
         }
-        if (cursorLine < lines.size() - 1) {
+        if (cursorLine < lines.size - 1) {
             cursorLine++;
             cursorColumn = 0;
             resetMergeState();
@@ -187,7 +198,7 @@ public class CodeDocument {
 
         for (int i = 1; i < parts.length; i++) {
             lineIndex++;
-            lines.add(lineIndex, new StringBuilder(parts[i]));
+            lines.insert(lineIndex, new StringBuilder(parts[i]));
         }
 
         cursorLine = lineIndex;
@@ -207,8 +218,8 @@ public class CodeDocument {
             endColumn = tempColumn;
         }
 
-        startLine = clamp(startLine, 0, lines.size() - 1);
-        endLine = clamp(endLine, 0, lines.size() - 1);
+        startLine = clamp(startLine, 0, lines.size - 1);
+        endLine = clamp(endLine, 0, lines.size - 1);
         startColumn = clamp(startColumn, 0, lines.get(startLine).length());
         endColumn = clamp(endColumn, 0, lines.get(endLine).length());
         if (startLine == endLine && startColumn == endColumn) {
@@ -225,7 +236,7 @@ public class CodeDocument {
             lines.get(startLine).append(prefix).append(suffix);
 
             for (int line = endLine; line > startLine; line--) {
-                lines.remove(line);
+                lines.removeIndex(line);
             }
         }
 
@@ -245,8 +256,8 @@ public class CodeDocument {
             endColumn = tempColumn;
         }
 
-        startLine = clamp(startLine, 0, lines.size() - 1);
-        endLine = clamp(endLine, 0, lines.size() - 1);
+        startLine = clamp(startLine, 0, lines.size - 1);
+        endLine = clamp(endLine, 0, lines.size - 1);
         startColumn = clamp(startColumn, 0, lines.get(startLine).length());
         endColumn = clamp(endColumn, 0, lines.get(endLine).length());
 
@@ -275,7 +286,7 @@ public class CodeDocument {
         }
 
         currentLine.setLength(cursorColumn);
-        lines.add(cursorLine + 1, new StringBuilder(spaces(indent)).append(right));
+        lines.insert(cursorLine + 1, new StringBuilder(spaces(indent)).append(right));
         cursorLine++;
         cursorColumn = indent;
         touch();
@@ -299,7 +310,7 @@ public class CodeDocument {
         recordUndoState(EditKind.BACKSPACE);
         int previousLength = lines.get(cursorLine - 1).length();
         lines.get(cursorLine - 1).append(lines.get(cursorLine));
-        lines.remove(cursorLine);
+        lines.removeIndex(cursorLine);
         cursorLine--;
         cursorColumn = previousLength;
         touch();
@@ -316,13 +327,13 @@ public class CodeDocument {
             return;
         }
 
-        if (cursorLine >= lines.size() - 1) {
+        if (cursorLine >= lines.size - 1) {
             return;
         }
 
         recordUndoState(EditKind.DELETE_FORWARD);
         current.append(lines.get(cursorLine + 1));
-        lines.remove(cursorLine + 1);
+        lines.removeIndex(cursorLine + 1);
         touch();
         finishEdit(EditKind.DELETE_FORWARD);
     }
@@ -352,8 +363,8 @@ public class CodeDocument {
         finishEdit(EditKind.AUTO_DEDENT);
     }
 
-    public List<String> snapshotLines() {
-        ArrayList<String> copy = new ArrayList<>(lines.size());
+    public Array<String> snapshotLines() {
+        Array<String> copy = new Array<>(lines.size);
         for (StringBuilder line : lines) {
             copy.add(line.toString());
         }
@@ -383,7 +394,7 @@ public class CodeDocument {
     private void clearHistory() {
         undoStack.clear();
         redoStack.clear();
-        resetMergeState();
+        resetEditState();
     }
 
     private void recordUndoState(EditKind kind) {
@@ -434,18 +445,7 @@ public class CodeDocument {
 
     private void restoreState(DocumentState state) {
         applyText(state.text, state.cursorLine, state.cursorColumn);
-        resetMergeState();
-    }
-
-    private String getText() {
-        StringBuilder builder = new StringBuilder();
-        for (int i = 0; i < lines.size(); i++) {
-            if (i > 0) {
-                builder.append('\n');
-            }
-            builder.append(lines.get(i));
-        }
-        return builder.toString();
+        resetEditState();
     }
 
     private void touch() {
@@ -461,6 +461,10 @@ public class CodeDocument {
         lastEditCursorLine = -1;
         lastEditCursorColumn = -1;
         lastEditTimestampNanos = 0L;
+    }
+
+    private void resetEditState() {
+        resetMergeState();
         compoundEditDepth = 0;
         compoundEditRecorded = false;
     }

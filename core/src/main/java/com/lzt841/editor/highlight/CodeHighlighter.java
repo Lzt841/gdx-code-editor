@@ -1,14 +1,13 @@
 package com.lzt841.editor.highlight;
 
+import com.badlogic.gdx.utils.Array;
 import com.lzt841.editor.CodeEditor;
-
-import java.util.List;
 
 /** Generates syntax highlight spans for a document snapshot. */
 public interface CodeHighlighter {
-    List<List<CodeHighlightSpan>> highlight(List<String> lines, CodeEditor.CodeEditorStyle style);
+    Array<Array<CodeHighlightSpan>> highlight(Array<String> lines, CodeEditor.CodeEditorStyle style);
 
-    default List<List<CodeBracketIgnoreSpan>> getBracketIgnoreSpans(List<String> lines) {
-        return HighlighterSupport.emptyIgnoreSpans(lines.size());
+    default Array<Array<CodeBracketIgnoreSpan>> getBracketIgnoreSpans(Array<String> lines) {
+        return HighlighterSupport.emptyIgnoreSpans(lines.size);
     }
 }

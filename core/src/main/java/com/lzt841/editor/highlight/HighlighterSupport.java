@@ -1,33 +1,31 @@
 package com.lzt841.editor.highlight;
 
 import com.badlogic.gdx.graphics.Color;
-
-import java.util.ArrayList;
-import java.util.List;
+import com.badlogic.gdx.utils.Array;
 
 /** Shared helpers for built-in syntax highlighters. */
 final class HighlighterSupport {
     private HighlighterSupport() {
     }
 
-    static void addSpan(List<CodeHighlightSpan> spans, int start, int end, Color color) {
+    static void addSpan(Array<CodeHighlightSpan> spans, int start, int end, Color color) {
         if (spans == null || color == null || end <= start) {
             return;
         }
         spans.add(new CodeHighlightSpan(start, end, color));
     }
 
-    static void addIgnoreSpan(List<CodeBracketIgnoreSpan> spans, int start, int end) {
+    static void addIgnoreSpan(Array<CodeBracketIgnoreSpan> spans, int start, int end) {
         if (spans == null || end <= start) {
             return;
         }
         spans.add(new CodeBracketIgnoreSpan(start, end));
     }
 
-    static List<List<CodeBracketIgnoreSpan>> emptyIgnoreSpans(int lineCount) {
-        ArrayList<List<CodeBracketIgnoreSpan>> result = new ArrayList<>(lineCount);
+    static Array<Array<CodeBracketIgnoreSpan>> emptyIgnoreSpans(int lineCount) {
+        Array<Array<CodeBracketIgnoreSpan>> result = new Array<>(lineCount);
         for (int i = 0; i < lineCount; i++) {
-            result.add(new ArrayList<CodeBracketIgnoreSpan>(0));
+            result.add(new Array<CodeBracketIgnoreSpan>(0));
         }
         return result;
     }

@@ -1,16 +1,12 @@
 package com.lzt841.editor.highlight;
 
+import com.badlogic.gdx.utils.ObjectSet;
+import com.badlogic.gdx.utils.Array;
 import com.lzt841.editor.CodeEditor;
-
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
 
 /** Default Java-like syntax highlighter. */
 public class JavaCodeHighlighter implements CodeHighlighter {
-    private static final Set<String> KEYWORDS = new HashSet<>(Arrays.asList(
+    private static final ObjectSet<String> KEYWORDS = ObjectSet.with(
         "abstract", "assert", "break", "case", "catch", "class", "const", "continue",
         "default", "do", "else", "enum", "extends", "final", "finally", "for", "goto",
         "if", "implements", "import", "instanceof", "interface", "native", "new", "package",
@@ -18,20 +14,20 @@ public class JavaCodeHighlighter implements CodeHighlighter {
         "synchronized", "this", "throw", "throws", "transient", "try", "volatile", "while",
         "module", "open", "opens", "exports", "requires", "uses", "provides", "to", "with",
         "record", "sealed", "permits", "yield"
-    ));
+    );
 
-    private static final Set<String> TYPES = new HashSet<>(Arrays.asList(
+    private static final ObjectSet<String> TYPES = ObjectSet.with(
         "boolean", "byte", "char", "double", "float", "int", "long", "short", "void", "String", "var"
-    ));
+    );
 
-    private static final Set<String> LITERALS = new HashSet<>(Arrays.asList("true", "false", "null"));
+    private static final ObjectSet<String> LITERALS = ObjectSet.with("true", "false", "null");
 
     @Override
-    public List<List<CodeHighlightSpan>> highlight(List<String> lines, CodeEditor.CodeEditorStyle style) {
-        ArrayList<List<CodeHighlightSpan>> result = new ArrayList<>(lines.size());
+    public Array<Array<CodeHighlightSpan>> highlight(Array<String> lines, CodeEditor.CodeEditorStyle style) {
+        Array<Array<CodeHighlightSpan>> result = new Array<>(lines.size);
         boolean inBlockComment = false;
         for (String line : lines) {
-            ArrayList<CodeHighlightSpan> spans = new ArrayList<>();
+            Array<CodeHighlightSpan> spans = new Array<>();
             int index = 0;
 
             while (index < line.length()) {

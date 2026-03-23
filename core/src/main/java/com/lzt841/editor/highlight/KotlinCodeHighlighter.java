@@ -1,16 +1,12 @@
 package com.lzt841.editor.highlight;
 
+import com.badlogic.gdx.utils.ObjectSet;
+import com.badlogic.gdx.utils.Array;
 import com.lzt841.editor.CodeEditor;
-
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
 
 /** Built-in highlighter for Kotlin source files. */
 public class KotlinCodeHighlighter implements CodeHighlighter {
-    private static final Set<String> KEYWORDS = new HashSet<>(Arrays.asList(
+    private static final ObjectSet<String> KEYWORDS = ObjectSet.with(
         "as", "break", "class", "continue", "do", "else", "false", "for", "fun", "if",
         "in", "interface", "is", "null", "object", "package", "return", "super", "this",
         "throw", "true", "try", "typealias", "typeof", "val", "var", "when", "while",
@@ -21,23 +17,23 @@ public class KotlinCodeHighlighter implements CodeHighlighter {
         "internal", "lateinit", "noinline", "open", "operator", "out", "override",
         "private", "protected", "public", "reified", "sealed", "suspend", "tailrec",
         "value", "vararg"
-    ));
+    );
 
-    private static final Set<String> TYPES = new HashSet<>(Arrays.asList(
+    private static final ObjectSet<String> TYPES = ObjectSet.with(
         "Any", "Array", "Boolean", "Byte", "Char", "Double", "Float", "Int", "Long",
         "Nothing", "Short", "String", "Unit", "List", "MutableList", "Map", "Set"
-    ));
+    );
 
-    private static final Set<String> LITERALS = new HashSet<>(Arrays.asList("true", "false", "null"));
+    private static final ObjectSet<String> LITERALS = ObjectSet.with("true", "false", "null");
 
     @Override
-    public List<List<CodeHighlightSpan>> highlight(List<String> lines, CodeEditor.CodeEditorStyle style) {
-        ArrayList<List<CodeHighlightSpan>> result = new ArrayList<>(lines.size());
+    public Array<Array<CodeHighlightSpan>> highlight(Array<String> lines, CodeEditor.CodeEditorStyle style) {
+        Array<Array<CodeHighlightSpan>> result = new Array<>(lines.size);
         boolean inBlockComment = false;
         boolean inRawString = false;
 
         for (String line : lines) {
-            ArrayList<CodeHighlightSpan> spans = new ArrayList<>();
+            Array<CodeHighlightSpan> spans = new Array<>();
             int index = 0;
 
             while (index < line.length()) {
@@ -133,12 +129,12 @@ public class KotlinCodeHighlighter implements CodeHighlighter {
     }
 
     @Override
-    public List<List<CodeBracketIgnoreSpan>> getBracketIgnoreSpans(List<String> lines) {
-        ArrayList<List<CodeBracketIgnoreSpan>> result = new ArrayList<>(lines.size());
+    public Array<Array<CodeBracketIgnoreSpan>> getBracketIgnoreSpans(Array<String> lines) {
+        Array<Array<CodeBracketIgnoreSpan>> result = new Array<>(lines.size);
         boolean inRawString = false;
 
         for (String line : lines) {
-            ArrayList<CodeBracketIgnoreSpan> spans = new ArrayList<>();
+            Array<CodeBracketIgnoreSpan> spans = new Array<>();
             int index = 0;
             while (index < line.length()) {
                 if (inRawString) {

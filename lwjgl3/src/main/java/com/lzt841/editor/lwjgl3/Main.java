@@ -1,13 +1,17 @@
-package com.lzt841.demo;
+package com.lzt841.editor.lwjgl3;
 
 import com.badlogic.gdx.ApplicationAdapter;
+import com.badlogic.gdx.Files;
 import com.badlogic.gdx.Gdx;
+import com.badlogic.gdx.files.FileHandle;
 import com.badlogic.gdx.graphics.Color;
 import com.badlogic.gdx.graphics.Pixmap;
 import com.badlogic.gdx.graphics.Texture;
 import com.badlogic.gdx.graphics.g2d.BitmapFont;
 import com.badlogic.gdx.graphics.g2d.Batch;
+import com.badlogic.gdx.graphics.g2d.PixmapPacker;
 import com.badlogic.gdx.graphics.g2d.TextureRegion;
+import com.badlogic.gdx.graphics.g2d.freetype.FreeTypeFontGenerator;
 import com.badlogic.gdx.math.Vector2;
 import com.badlogic.gdx.scenes.scene2d.Actor;
 import com.badlogic.gdx.scenes.scene2d.InputEvent;
@@ -25,6 +29,8 @@ import com.badlogic.gdx.scenes.scene2d.utils.TextureRegionDrawable;
 import com.badlogic.gdx.utils.ScreenUtils;
 import com.badlogic.gdx.utils.viewport.ScreenViewport;
 import com.lzt841.editor.CodeEditor;
+import com.lzt841.editor.CodeEditorContentChangeEvent;
+import com.lzt841.editor.CodeEditorContentListener;
 import com.lzt841.editor.highlight.BuiltinCodeHighlighters;
 import com.lzt841.editor.highlight.CodeHighlighter;
 import com.lzt841.editor.input.CodeEditorInteractionContext;
@@ -71,6 +77,16 @@ public class Main extends ApplicationAdapter {
     private TextButton applySearchButton;
     private TextButton replaceCurrentButton;
     private TextButton replaceAllButton;
+    private TextButton undoButton;
+    private TextButton redoButton;
+    private TextButton selectAllButton;
+    private TextButton copyButton;
+    private TextButton cutButton;
+    private TextButton pasteButton;
+    private TextButton searchCaseButton;
+    private TextButton zoomInButton;
+    private TextButton zoomOutButton;
+    private TextButton zoomResetButton;
     private TextButton readOnlyButton;
     private TextButton disabledButton;
     private TextButton popupCopyButton;
@@ -87,7 +103,7 @@ public class Main extends ApplicationAdapter {
 
     @Override
     public void create() {
-        font = new BitmapFont();
+        font = createUiFont();
         font.setUseIntegerPositions(false);
         whitePixel = createWhitePixel();
 
@@ -112,10 +128,19 @@ public class Main extends ApplicationAdapter {
         editor.setDisabled(false);
         editor.setInteractionMode(CodeEditorInteractionMode.AUTO);
         editor.setInteractionListener(new DebugInteractionListener());
+        editor.addContentListener(new CodeEditorContentListener() {
+            @Override
+            public void onContentChanged(CodeEditor editor, CodeEditorContentChangeEvent event) {
+                lastEventText = "Content: " + event.type.name()
+                    + "  v" + event.documentVersion
+                    + "  @" + (event.cursorLine + 1) + ":" + (event.cursorColumn + 1)
+                    + "  len=" + event.text.length();
+            }
+        });
         applyProfile(0);
 
         ScrollPane sidebar = createSidebar();
-        root.add(sidebar).width(320f).top().fillY();
+        root.add(sidebar).minWidth(320f).top().fillY();
 
         Table body = new Table();
         body.setClip(true);
@@ -327,6 +352,86 @@ public class Main extends ApplicationAdapter {
                 lastEventText = "Replace all: " + replaced + " matches updated";
             }
         });
+        undoButton = createActionButton("", new Runnable() {
+            @Override
+            public void run() {
+                if (!editor.undo()) {
+                    lastEventText = "Undo: nothing to revert";
+                }
+            }
+        });
+        redoButton = createActionButton("", new Runnable() {
+            @Override
+            public void run() {
+                if (!editor.redo()) {
+                    lastEventText = "Redo: nothing to reapply";
+                }
+            }
+        });
+        selectAllButton = createActionButton("", new Runnable() {
+            @Override
+            public void run() {
+                editor.selectAllText();
+                lastEventText = "Selection: selected all text";
+            }
+        });
+        copyButton = createActionButton("", new Runnable() {
+            @Override
+            public void run() {
+                if (!editor.copySelection()) {
+                    lastEventText = "Copy: no selection";
+                } else {
+                    lastEventText = "Copy: selection copied";
+                }
+            }
+        });
+        cutButton = createActionButton("", new Runnable() {
+            @Override
+            public void run() {
+                if (!editor.cutSelection()) {
+                    lastEventText = editor.isReadOnly() || editor.isDisabled()
+                        ? "Cut: editor is not editable"
+                        : "Cut: no selection";
+                }
+            }
+        });
+        pasteButton = createActionButton("", new Runnable() {
+            @Override
+            public void run() {
+                if (!editor.pasteClipboard()) {
+                    lastEventText = "Paste: editor is not editable";
+                }
+            }
+        });
+        searchCaseButton = createActionButton("", new Runnable() {
+            @Override
+            public void run() {
+                editor.setSearchCaseSensitive(!editor.isSearchCaseSensitive());
+                editor.setSearchText(searchField.getText());
+                lastEventText = "Search case: " + (editor.isSearchCaseSensitive() ? "Sensitive" : "Ignore case");
+            }
+        });
+        zoomInButton = createActionButton("", new Runnable() {
+            @Override
+            public void run() {
+                editor.setZoomScale(editor.getZoomScale() + 0.1f);
+                lastEventText = "Zoom: " + formatZoom(editor.getZoomScale());
+            }
+        });
+        zoomOutButton = createActionButton("", new Runnable() {
+            @Override
+            public void run() {
+                editor.setZoomScale(editor.getZoomScale() - 0.1f);
+                lastEventText = "Zoom: " + formatZoom(editor.getZoomScale());
+            }
+        });
+        zoomResetButton = createActionButton("", new Runnable() {
+            @Override
+            public void run() {
+                editor.setZoomScale(1f);
+                lastEventText = "Zoom: reset to 1.00x";
+            }
+        });
         readOnlyButton = createActionButton("", new Runnable() {
             @Override
             public void run() {
@@ -379,6 +484,8 @@ public class Main extends ApplicationAdapter {
         sidebar.row();
         sidebar.add(applySearchButton);
         sidebar.row();
+        sidebar.add(searchCaseButton);
+        sidebar.row();
         sidebar.add(previousMatchButton);
         sidebar.row();
         sidebar.add(nextMatchButton);
@@ -390,6 +497,28 @@ public class Main extends ApplicationAdapter {
         sidebar.add(replaceCurrentButton);
         sidebar.row();
         sidebar.add(replaceAllButton);
+        sidebar.row();
+        sidebar.add(new Label("Edit Actions", debugTitleStyle)).padBottom(2f);
+        sidebar.row();
+        sidebar.add(undoButton);
+        sidebar.row();
+        sidebar.add(redoButton);
+        sidebar.row();
+        sidebar.add(selectAllButton);
+        sidebar.row();
+        sidebar.add(copyButton);
+        sidebar.row();
+        sidebar.add(cutButton);
+        sidebar.row();
+        sidebar.add(pasteButton);
+        sidebar.row();
+        sidebar.add(new Label("View", debugTitleStyle)).padBottom(2f);
+        sidebar.row();
+        sidebar.add(zoomInButton);
+        sidebar.row();
+        sidebar.add(zoomOutButton);
+        sidebar.row();
+        sidebar.add(zoomResetButton);
         sidebar.row();
         sidebar.add(readOnlyButton);
         sidebar.row();
@@ -580,8 +709,18 @@ public class Main extends ApplicationAdapter {
         applySearchButton.setText("Apply Search");
         previousMatchButton.setText("Previous Match");
         nextMatchButton.setText("Next Match");
+        searchCaseButton.setText("Search Case: " + (editor.isSearchCaseSensitive() ? "Sensitive" : "Ignore Case"));
         replaceCurrentButton.setText("Replace Current");
         replaceAllButton.setText("Replace All");
+        undoButton.setText("Undo: " + onOff(editor.canUndo()));
+        redoButton.setText("Redo: " + onOff(editor.canRedo()));
+        selectAllButton.setText("Select All");
+        copyButton.setText("Copy Selection");
+        cutButton.setText("Cut Selection");
+        pasteButton.setText("Paste Clipboard");
+        zoomInButton.setText("Zoom In");
+        zoomOutButton.setText("Zoom Out");
+        zoomResetButton.setText("Zoom Reset");
         readOnlyButton.setText("Read Only: " + onOff(editor.isReadOnly()));
         disabledButton.setText("Disabled: " + onOff(editor.isDisabled()));
 
@@ -592,6 +731,7 @@ public class Main extends ApplicationAdapter {
                 + "Wrap: " + onOff(editor.isWrapEnabled()) + "   Fixed line numbers: " + onOff(editor.isLineNumbersFixed()) + "\n"
                 + "Rainbow brackets: " + onOff(editor.isRainbowBracketsEnabled())
                 + "   Rainbow guides: " + onOff(editor.isRainbowGuidesEnabled()) + "\n"
+                + "Search case: " + (editor.isSearchCaseSensitive() ? "Sensitive" : "Ignore case") + "\n"
                 + "Search: " + (editor.getSearchText().isEmpty() ? "(none)" : editor.getSearchText()) + "\n"
                 + "Current match: " + (editor.hasCurrentSearchMatch() ? editor.getCurrentSearchMatchOrdinal() : 0)
                 + "/" + editor.getSearchMatchCount() + "\n"
@@ -602,8 +742,9 @@ public class Main extends ApplicationAdapter {
             "Lines: " + editor.getLineCount() + "\n"
                 + "Cursor: " + (editor.getCursorLine() + 1) + ":" + (editor.getCursorColumn() + 1) + "\n"
                 + "Selection: " + onOff(editor.hasSelection()) + "\n"
+                + "Undo/Redo: " + onOff(editor.canUndo()) + "/" + onOff(editor.canRedo()) + "\n"
                 + "Matches: " + editor.getSearchMatchCount() + "\n"
-                + "Tips: Shift + wheel for horizontal scroll, pinch in touch mode to zoom, use Previous/Next Match to navigate."
+                + "Tips: Shift + wheel for horizontal scroll, pinch in touch mode to zoom, and drag selected text in mouse mode to move it."
         );
         eventLabel.setText(lastEventText);
     }
@@ -662,7 +803,7 @@ public class Main extends ApplicationAdapter {
         style.background = new TextureRegionDrawable(region).tint(new Color(0.051f, 0.074f, 0.102f, 1f));
         style.focusedBackground = new TextureRegionDrawable(region).tint(new Color(0.066f, 0.094f, 0.129f, 1f));
         style.disabledBackground = new TextureRegionDrawable(region).tint(new Color(0.043f, 0.059f, 0.078f, 1f));
-        style.gutterBackground = new TextureRegionDrawable(region).tint(new Color(0.074f, 0.102f, 0.137f, 1f));
+        style.gutterBackground = new TextureRegionDrawable(region).tint(new Color(0.060f, 0.086f, 0.115f, 1f));
         style.currentBlock = new TextureRegionDrawable(region).tint(new Color(0.071f, 0.106f, 0.145f, 0.72f));
         style.currentLine = new TextureRegionDrawable(region).tint(new Color(0.094f, 0.133f, 0.184f, 1f));
         style.cursor = new TextureRegionDrawable(region).tint(new Color(0.984f, 0.824f, 0.43f, 1f));
@@ -765,6 +906,51 @@ public class Main extends ApplicationAdapter {
         Texture texture = new Texture(pixmap);
         pixmap.dispose();
         return texture;
+    }
+
+    private BitmapFont createUiFont() {
+        FileHandle fontFile = resolveDesktopFontFile();
+        if (fontFile == null) {
+            BitmapFont fallback = new BitmapFont();
+            fallback.getData().setScale(1.15f);
+            return fallback;
+        }
+
+        FreeTypeFontGenerator generator = new FreeTypeFontGenerator(fontFile);
+        try {
+            FreeTypeFontGenerator.FreeTypeFontParameter parameter = new FreeTypeFontGenerator.FreeTypeFontParameter();
+            parameter.size = 21;
+            parameter.minFilter = Texture.TextureFilter.Linear;
+            parameter.magFilter = Texture.TextureFilter.Linear;
+            parameter.characters = FreeTypeFontGenerator.DEFAULT_CHARS
+                + "代码编辑器调试搜索替换撤销重做高亮折叠";
+            parameter.incremental=true;
+            parameter.packer = new PixmapPacker(512, 512, Pixmap.Format.RGBA8888, 2, false);
+            BitmapFont generated = generator.generateFont(parameter);
+
+            return generated;
+        } finally {
+            //generator.dispose();
+        }
+    }
+
+    private FileHandle resolveDesktopFontFile() {
+        String[] candidates = {
+            "C:/Windows/Fonts/msyh.ttc",
+            "C:/Windows/Fonts/consola.ttf",
+            "C:/Windows/Fonts/msyh.ttc",
+            "/System/Library/Fonts/Supplemental/Menlo.ttc",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
+        };
+        for (String path : candidates) {
+            FileHandle handle = Gdx.files.getFileHandle(path, Files.FileType.Absolute);
+            if (handle.exists()) {
+                return handle;
+            }
+        }
+        return null;
     }
 
     private String createJavaDemo() {

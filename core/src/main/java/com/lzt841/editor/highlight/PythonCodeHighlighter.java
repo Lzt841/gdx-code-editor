@@ -1,37 +1,33 @@
 package com.lzt841.editor.highlight;
 
+import com.badlogic.gdx.utils.ObjectSet;
+import com.badlogic.gdx.utils.Array;
 import com.lzt841.editor.CodeEditor;
-
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
 
 /** Built-in highlighter for Python source files. */
 public class PythonCodeHighlighter implements CodeHighlighter {
-    private static final Set<String> KEYWORDS = new HashSet<>(Arrays.asList(
+    private static final ObjectSet<String> KEYWORDS = ObjectSet.with(
         "and", "as", "assert", "async", "await", "break", "class", "continue", "def",
         "del", "elif", "else", "except", "finally", "for", "from", "global", "if",
         "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise",
         "return", "try", "while", "with", "yield", "match", "case"
-    ));
+    );
 
-    private static final Set<String> TYPES = new HashSet<>(Arrays.asList(
+    private static final ObjectSet<String> TYPES = ObjectSet.with(
         "bool", "bytes", "dict", "float", "frozenset", "int", "list", "object", "set",
         "str", "tuple"
-    ));
+    );
 
-    private static final Set<String> LITERALS = new HashSet<>(Arrays.asList("True", "False", "None"));
+    private static final ObjectSet<String> LITERALS = ObjectSet.with("True", "False", "None");
 
     @Override
-    public List<List<CodeHighlightSpan>> highlight(List<String> lines, CodeEditor.CodeEditorStyle style) {
-        ArrayList<List<CodeHighlightSpan>> result = new ArrayList<>(lines.size());
+    public Array<Array<CodeHighlightSpan>> highlight(Array<String> lines, CodeEditor.CodeEditorStyle style) {
+        Array<Array<CodeHighlightSpan>> result = new Array<>(lines.size);
         boolean inTripleString = false;
         String tripleDelimiter = null;
 
         for (String line : lines) {
-            ArrayList<CodeHighlightSpan> spans = new ArrayList<>();
+            Array<CodeHighlightSpan> spans = new Array<>();
             int index = 0;
 
             while (index < line.length()) {
@@ -113,13 +109,13 @@ public class PythonCodeHighlighter implements CodeHighlighter {
     }
 
     @Override
-    public List<List<CodeBracketIgnoreSpan>> getBracketIgnoreSpans(List<String> lines) {
-        ArrayList<List<CodeBracketIgnoreSpan>> result = new ArrayList<>(lines.size());
+    public Array<Array<CodeBracketIgnoreSpan>> getBracketIgnoreSpans(Array<String> lines) {
+        Array<Array<CodeBracketIgnoreSpan>> result = new Array<>(lines.size);
         boolean inTripleString = false;
         String tripleDelimiter = null;
 
         for (String line : lines) {
-            ArrayList<CodeBracketIgnoreSpan> spans = new ArrayList<>();
+            Array<CodeBracketIgnoreSpan> spans = new Array<>();
             int index = 0;
             while (index < line.length()) {
                 if (inTripleString) {

@@ -1,21 +1,19 @@
 package com.lzt841.editor.structure;
 
-import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.List;
+import com.badlogic.gdx.utils.Array;
 
 /** Default brace-based structure provider. */
 public class BraceCodeStructureProvider implements CodeStructureProvider {
     @Override
-    public CodeStructureInfo analyze(List<String> lines) {
-        int[] indentLevels = new int[lines.size()];
-        ArrayList<CodeFoldRegion> regions = new ArrayList<>();
-        ArrayDeque<BraceFrame> stack = new ArrayDeque<>();
+    public CodeStructureInfo analyze(Array<String> lines) {
+        int[] indentLevels = new int[lines.size];
+        Array<CodeFoldRegion> regions = new Array<>();
+        Array<BraceFrame> stack = new Array<>();
         boolean inBlockComment = false;
 
-        for (int lineIndex = 0; lineIndex < lines.size(); lineIndex++) {
+        for (int lineIndex = 0; lineIndex < lines.size; lineIndex++) {
             String line = lines.get(lineIndex);
-            indentLevels[lineIndex] = stack.size();
+            indentLevels[lineIndex] = stack.size;
 
             boolean inString = false;
             char stringQuote = 0;
@@ -57,10 +55,10 @@ public class BraceCodeStructureProvider implements CodeStructureProvider {
                     continue;
                 }
                 if (c == '{') {
-                    stack.push(new BraceFrame(lineIndex, stack.size()));
+                    stack.add(new BraceFrame(lineIndex, stack.size));
                     continue;
                 }
-                if (c == '}' && !stack.isEmpty()) {
+                if (c == '}' && stack.size > 0) {
                     BraceFrame frame = stack.pop();
                     if (lineIndex > frame.startLine) {
                         regions.add(new CodeFoldRegion(frame.startLine, lineIndex, frame.depth));

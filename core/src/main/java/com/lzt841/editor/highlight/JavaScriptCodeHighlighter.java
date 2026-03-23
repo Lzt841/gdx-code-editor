@@ -1,40 +1,36 @@
 package com.lzt841.editor.highlight;
 
+import com.badlogic.gdx.utils.ObjectSet;
+import com.badlogic.gdx.utils.Array;
 import com.lzt841.editor.CodeEditor;
-
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
 
 /** Built-in highlighter for JavaScript and TypeScript-like code. */
 public class JavaScriptCodeHighlighter implements CodeHighlighter {
-    private static final Set<String> KEYWORDS = new HashSet<>(Arrays.asList(
+    private static final ObjectSet<String> KEYWORDS = ObjectSet.with(
         "await", "break", "case", "catch", "class", "const", "continue", "debugger",
         "default", "delete", "do", "else", "export", "extends", "finally", "for",
         "function", "if", "import", "in", "instanceof", "let", "new", "of", "return",
         "super", "switch", "this", "throw", "try", "typeof", "var", "void", "while",
         "with", "yield", "as", "from", "async"
-    ));
+    );
 
-    private static final Set<String> TYPES = new HashSet<>(Arrays.asList(
+    private static final ObjectSet<String> TYPES = ObjectSet.with(
         "Array", "Boolean", "Date", "Error", "Map", "Number", "Object", "Promise",
         "RegExp", "Set", "String", "Symbol"
-    ));
+    );
 
-    private static final Set<String> LITERALS = new HashSet<>(Arrays.asList(
+    private static final ObjectSet<String> LITERALS = ObjectSet.with(
         "false", "null", "true", "undefined", "NaN", "Infinity"
-    ));
+    );
 
     @Override
-    public List<List<CodeHighlightSpan>> highlight(List<String> lines, CodeEditor.CodeEditorStyle style) {
-        ArrayList<List<CodeHighlightSpan>> result = new ArrayList<>(lines.size());
+    public Array<Array<CodeHighlightSpan>> highlight(Array<String> lines, CodeEditor.CodeEditorStyle style) {
+        Array<Array<CodeHighlightSpan>> result = new Array<>(lines.size);
         boolean inBlockComment = false;
         boolean inTemplateString = false;
 
         for (String line : lines) {
-            ArrayList<CodeHighlightSpan> spans = new ArrayList<>();
+            Array<CodeHighlightSpan> spans = new Array<>();
             int index = 0;
 
             while (index < line.length()) {
@@ -116,12 +112,12 @@ public class JavaScriptCodeHighlighter implements CodeHighlighter {
     }
 
     @Override
-    public List<List<CodeBracketIgnoreSpan>> getBracketIgnoreSpans(List<String> lines) {
-        ArrayList<List<CodeBracketIgnoreSpan>> result = new ArrayList<>(lines.size());
+    public Array<Array<CodeBracketIgnoreSpan>> getBracketIgnoreSpans(Array<String> lines) {
+        Array<Array<CodeBracketIgnoreSpan>> result = new Array<>(lines.size);
         boolean inTemplateString = false;
 
         for (String line : lines) {
-            ArrayList<CodeBracketIgnoreSpan> spans = new ArrayList<>();
+            Array<CodeBracketIgnoreSpan> spans = new Array<>();
             int index = 0;
             while (index < line.length()) {
                 if (inTemplateString) {

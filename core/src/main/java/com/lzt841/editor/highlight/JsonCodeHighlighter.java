@@ -1,17 +1,15 @@
 package com.lzt841.editor.highlight;
 
+import com.badlogic.gdx.utils.Array;
 import com.lzt841.editor.CodeEditor;
-
-import java.util.ArrayList;
-import java.util.List;
 
 /** Built-in highlighter for JSON documents. */
 public class JsonCodeHighlighter implements CodeHighlighter {
     @Override
-    public List<List<CodeHighlightSpan>> highlight(List<String> lines, CodeEditor.CodeEditorStyle style) {
-        ArrayList<List<CodeHighlightSpan>> result = new ArrayList<>(lines.size());
+    public Array<Array<CodeHighlightSpan>> highlight(Array<String> lines, CodeEditor.CodeEditorStyle style) {
+        Array<Array<CodeHighlightSpan>> result = new Array<>(lines.size);
         for (String line : lines) {
-            ArrayList<CodeHighlightSpan> spans = new ArrayList<>();
+            Array<CodeHighlightSpan> spans = new Array<>();
             int index = 0;
 
             while (index < line.length()) {
