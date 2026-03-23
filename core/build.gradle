@@ -10,7 +10,7 @@ java {
 sourceSets {
   main {
     java {
-      exclude 'com/lzt841/demo/**'
+      //exclude 'com/lzt841/demo/**'
     }
   }
 }
@@ -34,7 +34,7 @@ publishing {
       pom {
         name = 'gdx-code-editor'
         description = 'A libGDX Scene2D code editor widget with syntax highlight, folding, search and touch/mouse interactions.'
-        url = 'https://github.com/lzt841/gdx-code-editor'
+        url = 'https://github.com/Lzt841/gdx-code-editor'
       }
     }
   }

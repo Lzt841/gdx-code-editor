@@ -1,64 +1,122 @@
 # gdx-code-editor
 
-一个基于 [libGDX](https://libgdx.com/) Scene2D 的代码编辑器 `Widget`，面向大文本编辑、代码高亮、代码块结构分析、折叠、查找替换，以及触摸屏和鼠标双操作模式。
+`gdx-code-editor` 是一个基于 libGDX Scene2D 的代码编辑器组件，适合作为应用内嵌的代码输入、脚本编辑、配置编辑或轻量 IDE 编辑区使用。
 
-项目当前同时包含：
+它提供了一个可直接加入 Scene2D 布局系统的 `CodeEditor` Widget，重点支持：
 
-- 可直接复用的编辑器核心组件 `CodeEditor`
-- 行式文档模型 `CodeDocument`
-- 多种内置语法高亮器
-- 可扩展的代码结构提供器
-- 一个桌面调试 Demo，方便验证交互、样式和功能
+- 大文本高性能编辑
+- 语法高亮
+- 自动换行与横向滚动
+- 代码块结构分析
+- 代码折叠
+- 彩虹括号与彩虹引导线
+- 查找 / 上一个 / 下一个命中
+- 替换 / 全部替换
+- 撤销 / 重做
+- 鼠标与触摸双交互模式
 
-## 演示截图
+项目仓库中包含桌面 Demo，但发布到依赖中的内容只包含编辑器库本身，不包含演示入口。
 
-### Java 编辑与右键菜单
+## 演示效果
 
+### Java 编辑、查找与右键菜单
 ![Java editor with context menu](images/img.png)
 
-### JSON 高亮与行号/折叠区域
-
+### JSON 高亮与折叠区域
 ![JSON highlight](images/img_1.png)
 
-### Python 缩进结构与彩虹括号
-
+### Python 缩进结构、彩虹括号与引导线
 ![Python indent structure](images/img_2.png)
 
 ### Disabled 状态展示
-
 ![Disabled state](images/img_3.png)
 
-## 主要特性
+## 功能特性
 
-- `CodeEditor` 以 Scene2D `Widget` 形式提供，可直接放入 `Table`、`Container`、`Stack` 等布局中
-- 面向大文本的按行文档模型与可见区域布局计算
-- 支持自动换行和横向滚动，默认关闭自动换行
-- 支持固定/非固定行号区域
-- 支持代码折叠、折叠徽标、点击已折叠内容自动展开
-- 支持括号匹配、彩虹括号、彩虹代码块引导线
-- 支持查找高亮、当前命中单独高亮、上一个/下一个命中导航
-- 支持替换当前命中、全部替换，并支持撤销/重做
-- 支持连续输入、连续删除、批量替换的复合撤销/重做
-- 支持鼠标与触摸两套交互模式
-- 触摸模式支持惯性滚动、选择手柄、长按菜单、双指缩放
-- 鼠标模式支持拖拽选择、双击选词、右键菜单、滚轮滚动、Shift+滚轮横向滚动
-- 支持 `disabled` 和 `readOnly` 两种状态
-- 支持自定义语法高亮器、结构分析器、交互监听器、软键盘桥接
-- 编辑器的大部分布局常量已经进入 `CodeEditorStyle`，例如边距、滚动条宽度、折叠图标大小、手柄大小、引导线间距等
+- `CodeEditor` 是标准 Scene2D `Widget`
+- 基于按行文档模型，适合大文本编辑
+- 支持固定行号和非固定行号
+- 默认关闭自动换行，可按需开启
+- 支持横向滚动与滚动条拖动
+- 支持代码折叠、折叠徽标、点击折叠内容自动展开
+- 支持括号匹配、高亮当前代码块、彩虹括号、彩虹引导线
+- 支持搜索结果背景高亮与当前命中单独高亮
+- 支持替换当前命中、全部替换，并接入撤销重做
+- 支持连续输入、连续删除、批量替换的复合历史记录
+- 支持 `readOnly` 和 `disabled` 两种状态
+- 支持触摸模式下的手柄选择、惯性滚动、长按菜单、双指缩放
+- 支持鼠标模式下的拖拽选择、双击选词、右键菜单、滚轮滚动
+- 支持自定义高亮器、结构提供器、交互监听器和样式
 
-## 内置高亮
+## 安装
 
-当前内置高亮器包括：
+### Gradle
 
-- Java
-- Kotlin
-- JavaScript / TypeScript 风格
-- Python
-- JSON
-- XML / HTML 风格
-- Plain Text
+在项目仓库中添加 JitPack：
 
-入口类：
+```gradle
+repositories {
+    mavenCentral()
+    maven { url 'https://jitpack.io' }
+}
+```
+
+添加依赖：
+
+```gradle
+dependencies {
+    implementation 'com.github.Lzt841:gdx-code-editor:v0.0.1'
+}
+```
+
+### Kotlin DSL
+
+```kotlin
+repositories {
+    mavenCentral()
+    maven("https://jitpack.io")
+}
+
+dependencies {
+    implementation("com.github.Lzt841:gdx-code-editor:v0.0.1")
+}
+```
+
+## 快速开始
+
+最小使用示例：
+
+```java
+import com.badlogic.gdx.graphics.g2d.BitmapFont;
+import com.lzt841.editor.CodeEditor;
+import com.lzt841.editor.highlight.BuiltinCodeHighlighters;
+import com.lzt841.editor.structure.BraceCodeStructureProvider;
+
+BitmapFont font = new BitmapFont();
+
+CodeEditor.CodeEditorStyle style = new CodeEditor.CodeEditorStyle();
+style.font = font;
+
+CodeEditor editor = new CodeEditor(style);
+editor.setText("public class Demo {\n    void test() {}\n}");
+editor.setHighlighter(BuiltinCodeHighlighters.java());
+editor.setStructureProvider(new BraceCodeStructureProvider());
+editor.setWrapEnabled(false);
+editor.setLineNumbersFixed(true);
+```
+
+加入 Scene2D：
+
+```java
+Table root = new Table();
+root.setFillParent(true);
+root.add(editor).expand().fill();
+stage.addActor(root);
+```
+
+## 常用能力
+
+### 1. 设置高亮器
 
 ```java
 editor.setHighlighter(BuiltinCodeHighlighters.java());
@@ -70,137 +128,27 @@ editor.setHighlighter(BuiltinCodeHighlighters.xml());
 editor.setHighlighter(BuiltinCodeHighlighters.plainText());
 ```
 
-## 代码结构与折叠
+### 2. 设置结构分析器
 
-当前提供两种结构分析器：
-
-- `BraceCodeStructureProvider`
-  适合 Java、Kotlin、JavaScript、JSON、XML 等基于括号或标签层级的文本
-- `PythonIndentCodeStructureProvider`
-  适合 Python 这类基于缩进的结构分析
-
-可用于：
-
-- 代码块高亮
-- 折叠区域生成
-- 彩虹引导线层级计算
-
-## 快速运行
-
-运行桌面 Demo：
-
-```bash
-./gradlew lwjgl3:run
-```
-
-Windows：
-
-```powershell
-./gradlew.bat lwjgl3:run
-```
-
-编译核心模块与桌面模块：
-
-```powershell
-./gradlew.bat core:compileJava lwjgl3:compileJava
-```
-
-打包桌面 Jar：
-
-```powershell
-./gradlew.bat lwjgl3:jar
-```
-
-## 通过 JitPack 使用
-
-这个仓库已经按“只发布 `core` 模块”的方式准备好 JitPack。
-
-### 发布方需要做什么
-
-1. 把仓库推到 GitHub
-2. 确保仓库名就是你希望暴露的名字，例如 `gdx-code-editor`
-3. 创建并推送一个 tag，例如 `v1.0.0`
-4. 打开 JitPack 页面触发构建：
-   `https://jitpack.io/#<GitHub用户名>/gdx-code-editor/v1.0.0`
-
-仓库中已经包含：
-
-- `core` 模块的 `maven-publish` 配置
-- `jitpack.yml`
-- JDK 17 构建配置
-
-JitPack 会只构建并发布 `core` 模块，不会把桌面 Demo 和 Android app 当成依赖产物。
-同时，`core` 发布产物里会排除 `com.lzt841.demo` 下的演示代码。
-
-### 使用方如何接入
-
-在项目仓库中添加 JitPack：
-
-```gradle
-repositories {
-    mavenCentral()
-    maven { url 'https://jitpack.io' }
-}
-```
-
-Gradle 依赖示例：
-
-```gradle
-dependencies {
-    implementation 'com.github.lzt841.gdx-code-editor:core:v1.0.0'
-}
-```
-
-如果你发布的是分支快照，也可以直接依赖分支名：
-
-```gradle
-dependencies {
-    implementation 'com.github.lzt841.gdx-code-editor:core:main-SNAPSHOT'
-}
-```
-
-说明：
-
-- `groupId` 形式是 `com.github.<GitHub用户名>.<仓库名>`
-- `artifactId` 当前是 `core`
-- `version` 使用 Git tag、commit hash 或分支快照名
-
-## 基本接入
-
-最小示例：
+大多数括号语言：
 
 ```java
-BitmapFont font = new BitmapFont();
-
-CodeEditor.CodeEditorStyle style = new CodeEditor.CodeEditorStyle();
-style.font = font;
-
-CodeEditor editor = new CodeEditor(style);
-editor.setText("public class Demo {\n    void test() {}\n}");
-editor.setWrapEnabled(false);
-editor.setLineNumbersFixed(true);
-editor.setHighlighter(BuiltinCodeHighlighters.java());
 editor.setStructureProvider(new BraceCodeStructureProvider());
 ```
 
-放入 Scene2D：
+Python 缩进结构：
 
 ```java
-Table root = new Table();
-root.setFillParent(true);
-root.add(editor).expand().fill();
-stage.addActor(root);
+editor.setStructureProvider(new PythonIndentCodeStructureProvider());
 ```
 
-## 查找与替换
-
-查找：
+### 3. 搜索
 
 ```java
 editor.setSearchText("value");
 editor.setSearchCaseSensitive(false);
 
-int matchCount = editor.getSearchMatchCount();
+int count = editor.getSearchMatchCount();
 boolean hasCurrent = editor.hasCurrentSearchMatch();
 int currentOrdinal = editor.getCurrentSearchMatchOrdinal();
 
@@ -208,7 +156,7 @@ editor.findNextSearchMatch();
 editor.findPreviousSearchMatch();
 ```
 
-替换：
+### 4. 替换
 
 ```java
 editor.replaceCurrentSearchMatch("result");
@@ -217,40 +165,43 @@ editor.replaceAllSearchMatches("result");
 
 说明：
 
-- 当前命中会使用单独背景高亮
-- 替换当前命中和全部替换都接入了撤销/重做历史
-- 全部替换会作为一次复合编辑进入撤销栈
+- 当前命中有单独高亮
+- 单次替换支持撤销 / 重做
+- 全部替换会作为一次复合编辑进入历史记录
 
-## 交互模式
-
-```java
-editor.setInteractionMode(CodeEditorInteractionMode.AUTO);
-editor.setInteractionMode(CodeEditorInteractionMode.MOUSE);
-editor.setInteractionMode(CodeEditorInteractionMode.TOUCH);
-```
-
-状态切换：
+### 5. 编辑状态
 
 ```java
 editor.setReadOnly(true);
 editor.setDisabled(false);
 ```
 
-缩放：
+### 6. 交互模式
+
+```java
+import com.lzt841.editor.input.CodeEditorInteractionMode;
+
+editor.setInteractionMode(CodeEditorInteractionMode.AUTO);
+editor.setInteractionMode(CodeEditorInteractionMode.MOUSE);
+editor.setInteractionMode(CodeEditorInteractionMode.TOUCH);
+```
+
+### 7. 缩放
 
 ```java
 editor.setZoomScale(1.25f);
 float zoom = editor.getZoomScale();
 ```
 
-触摸模式下还支持双指捏合缩放。
+触摸模式下还支持双指缩放。
 
-## 样式配置
+## 样式
 
-`CodeEditorStyle` 参考 `TextFieldStyle` 的使用方式，除背景、光标、选区等 `Drawable` 之外，也支持配置一批布局参数。
+`CodeEditorStyle` 的设计方式接近 libGDX 的 `TextFieldStyle`，可以统一配置编辑器的颜色、背景、图标和布局尺寸。
 
 常见可配置项包括：
 
+- `font`
 - `background`
 - `focusedBackground`
 - `disabledBackground`
@@ -270,7 +221,7 @@ float zoom = editor.getZoomScale();
 - `scrollbarTrack`
 - `scrollbarKnob`
 
-部分尺寸类配置：
+还支持一批尺寸参数，例如：
 
 - `textLeftPadding`
 - `textRightPadding`
@@ -290,86 +241,81 @@ float zoom = editor.getZoomScale();
 ```java
 CodeEditor.CodeEditorStyle style = new CodeEditor.CodeEditorStyle();
 style.font = font;
-style.foldExpanded = myExpandedDrawable;
-style.foldCollapsed = myCollapsedDrawable;
+style.foldExpanded = expandedDrawable;
+style.foldCollapsed = collapsedDrawable;
 style.foldIndicatorSize = 10f;
 style.selectionHandleRadius = 12f;
 style.scrollbarWidth = 8f;
 style.guideSpacing = 18f;
 ```
 
-## 自定义扩展
+## 可扩展能力
 
 ### 自定义语法高亮
 
-实现 `CodeHighlighter`：
+实现 `CodeHighlighter` 即可扩展自己的语言高亮逻辑。
 
-- 返回语法高亮 spans
-- 可选返回括号忽略区间，避免彩虹括号误判字符串、注释等语言特定区域
+可用于：
+
+- 输出语法高亮 span
+- 标记括号忽略区域
+- 控制不同语言下的高亮策略
 
 ### 自定义结构分析
 
-实现 `CodeStructureProvider`：
+实现 `CodeStructureProvider` 即可扩展：
 
-- 返回缩进层级
-- 返回折叠区域
-- 返回代码块结构信息
+- 代码块结构
+- 折叠区域
+- 缩进层级
+- 当前块信息
 
 ### 自定义交互菜单
 
-实现 `CodeEditorInteractionListener`：
+实现 `CodeEditorInteractionListener` 可以接入：
 
-- 长按回调
-- 右键回调
-- 双击回调
+- 触摸长按菜单
+- 鼠标右键菜单
+- 双击行为扩展
 
-Demo 里已经给出了“鼠标右键 / 触摸长按弹出菜单”的用法示例。
-
-## 项目结构
+## 仓库结构
 
 - `core`
-  核心模块，包含编辑器实现和 Demo 主逻辑
-- `lwjgl3`
-  桌面启动入口
-- `android`
-  Android 工程
-
-核心源码目录：
-
+  编辑器核心库
 - `core/src/main/java/com/lzt841/editor`
-  编辑器核心
+  编辑器主体实现
 - `core/src/main/java/com/lzt841/editor/highlight`
-  高亮接口与内置高亮器
+  高亮相关接口与内置实现
 - `core/src/main/java/com/lzt841/editor/structure`
-  结构分析与折叠相关接口和实现
+  结构分析、代码块与折叠相关接口
 - `core/src/main/java/com/lzt841/editor/input`
-  鼠标/触摸交互抽象
+  鼠标与触摸交互抽象
 - `core/src/main/java/com/lzt841/demo`
-  桌面调试 Demo
+  本地调试 Demo
+- `lwjgl3`
+  桌面启动模块
+- `android`
+  Android 示例工程
 
-## 当前 Demo 可调试内容
+## 运行仓库内 Demo
 
-- 语言示例切换
-- 交互模式切换
-- 自动换行开关
-- 固定行号开关
-- 彩虹括号开关
-- 彩虹引导线开关
-- 搜索文本输入与应用
-- 上一个 / 下一个命中
-- 替换当前 / 全部替换
-- 只读 / 禁用状态切换
-- 右键菜单和长按菜单示例
-- 当前状态、匹配数、缩放倍率、最近交互事件显示
+```bash
+./gradlew lwjgl3:run
+```
+
+Windows：
+
+```powershell
+./gradlew.bat lwjgl3:run
+```
 
 ## 注意事项
 
 - `CodeEditorStyle.font` 不能为空
-- 如果多个控件共享同一个 `BitmapFont`，建议统一管理样式
-- 默认结构分析器是 `BraceCodeStructureProvider`
-- Python 等缩进语言建议显式设置 `PythonIndentCodeStructureProvider`
-- 查找目前是纯文本匹配，不区分 token 类型
+- 默认结构分析器适合大多数括号语言
+- Python 建议使用 `PythonIndentCodeStructureProvider`
+- 查找当前是纯文本匹配，不区分 token 类型
+- 发布依赖中不包含 `com.lzt841.demo.Main`
 
-## 许可
-
-仓库当前未单独声明许可证；如果需要开源发布，建议补充 `LICENSE` 文件。
+## License
+- Apache-2.0
