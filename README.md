@@ -29,16 +29,16 @@ The library is designed for in-app script editors, config editors, lightweight I
 ## Screenshots
 
 ### Java editing and context menu
-![Java editor with context menu](images/img.png)
+![Java editor with search](images/img.png)
 
 ### JSON highlighting
-![JSON highlight](images/img_1.png)
+![JSON highlight with menu](images/img_1.png)
 
-### Python indent structure
-![Python indent structure](images/img_2.png)
+### Android portrait mode with touch selection handles
+![Android portrait touch](images/img_2.jpg)
 
-### Disabled state
-![Disabled state](images/img_3.png)
+### Android portrait mode with touch cursor
+![Android portrait cursor](images/img_3.jpg)
 
 ## Installation
 
