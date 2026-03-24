@@ -169,8 +169,11 @@ public class CodeEditor extends Widget {
     private int analyzedWrapWidth = -1;
     private boolean analyzedWrapEnabled;
     private boolean disabled;
+    private boolean lineNumbersVisible = true;
     private boolean lineNumbersFixed = true;
     private boolean magnifierEnabled = true;
+    private boolean overscrollEnabled = true;
+    private boolean scrollbarsVisible = true;
     private boolean readOnly;
     private boolean wrapEnabled;
     private boolean rainbowBracketsEnabled;
@@ -222,6 +225,7 @@ public class CodeEditor extends Widget {
     private float repeatDeleteDelayRemaining;
     private float repeatDeleteIntervalRemaining;
     private boolean pinchZooming;
+    private boolean zoomEnabled = true;
     private float pinchInitialDistance;
     private float pinchInitialScale = 1f;
     private int searchMatchCount;
@@ -538,6 +542,27 @@ public class CodeEditor extends Widget {
         return lineNumbersFixed;
     }
 
+    public boolean isLineNumbersVisible() {
+        return lineNumbersVisible;
+    }
+
+    public void setLineNumbersVisible(boolean lineNumbersVisible) {
+        if (settings != null) {
+            settings.setLineNumbersVisible(lineNumbersVisible);
+            return;
+        }
+        applyLineNumbersVisible(lineNumbersVisible);
+    }
+
+    private void applyLineNumbersVisible(boolean lineNumbersVisible) {
+        if (this.lineNumbersVisible == lineNumbersVisible) {
+            return;
+        }
+        this.lineNumbersVisible = lineNumbersVisible;
+        invalidateLayout();
+        invalidateHierarchy();
+    }
+
     public void setLineNumbersFixed(boolean lineNumbersFixed) {
         if (settings != null) {
             settings.setLineNumbersFixed(lineNumbersFixed);
@@ -580,6 +605,70 @@ public class CodeEditor extends Widget {
         return magnifierEnabled;
     }
 
+    public boolean isOverscrollEnabled() {
+        return overscrollEnabled;
+    }
+
+    public void setOverscrollEnabled(boolean overscrollEnabled) {
+        if (settings != null) {
+            settings.setOverscrollEnabled(overscrollEnabled);
+            return;
+        }
+        applyOverscrollEnabled(overscrollEnabled);
+    }
+
+    private void applyOverscrollEnabled(boolean overscrollEnabled) {
+        this.overscrollEnabled = overscrollEnabled;
+        if (!overscrollEnabled) {
+            touchScrollVelocityX = 0f;
+            touchScrollVelocityY = 0f;
+            clampScroll();
+        }
+    }
+
+    public boolean isScrollbarsVisible() {
+        return scrollbarsVisible;
+    }
+
+    public void setScrollbarsVisible(boolean scrollbarsVisible) {
+        if (settings != null) {
+            settings.setScrollbarsVisible(scrollbarsVisible);
+            return;
+        }
+        applyScrollbarsVisible(scrollbarsVisible);
+    }
+
+    private void applyScrollbarsVisible(boolean scrollbarsVisible) {
+        if (this.scrollbarsVisible == scrollbarsVisible) {
+            return;
+        }
+        this.scrollbarsVisible = scrollbarsVisible;
+        draggingScrollbar = false;
+        draggingHorizontalScrollbar = false;
+        clampScroll();
+        invalidateLayout();
+        invalidateHierarchy();
+    }
+
+    public boolean isZoomEnabled() {
+        return zoomEnabled;
+    }
+
+    public void setZoomEnabled(boolean zoomEnabled) {
+        if (settings != null) {
+            settings.setZoomEnabled(zoomEnabled);
+            return;
+        }
+        applyZoomEnabled(zoomEnabled);
+    }
+
+    private void applyZoomEnabled(boolean zoomEnabled) {
+        this.zoomEnabled = zoomEnabled;
+        if (!zoomEnabled) {
+            pinchZooming = false;
+        }
+    }
+
     public void setMagnifierEnabled(boolean magnifierEnabled) {
         if (settings != null) {
             settings.setMagnifierEnabled(magnifierEnabled);
@@ -617,7 +706,11 @@ public class CodeEditor extends Widget {
             return;
         }
         applyWrapEnabled(settings.isWrapEnabled());
+        applyLineNumbersVisible(settings.isLineNumbersVisible());
         applyLineNumbersFixed(settings.isLineNumbersFixed());
+        applyScrollbarsVisible(settings.isScrollbarsVisible());
+        applyOverscrollEnabled(settings.isOverscrollEnabled());
+        applyZoomEnabled(settings.isZoomEnabled());
         applyMagnifierEnabled(settings.isMagnifierEnabled());
         applyRainbowBracketsEnabled(settings.isRainbowBracketsEnabled());
         applyRainbowGuidesEnabled(settings.isRainbowGuidesEnabled());
@@ -1979,6 +2072,9 @@ public class CodeEditor extends Widget {
     }
 
     private void drawGutterOverlay(Batch batch, int startRow, int endRow) {
+        if (getGutterWidth() <= 0f) {
+            return;
+        }
         if (style.gutterBackground != null) {
             style.gutterBackground.draw(
                 batch,
@@ -2001,17 +2097,18 @@ public class CodeEditor extends Widget {
             style.font.setColor(style.gutterFontColor);
             if (segment == 0) {
                 drawFoldIndicator(batch, line, rowBottom, baseline);
-
-                String lineNumber = Integer.toString(line + 1);
-                float numberWidth = measureText(lineNumber);
-                float lineNumberRight = getGutterLineNumberRightX();
-                style.font.draw(
-                    batch,
-                    lineNumber,
-                    getX() + getGutterRenderX() + lineNumberRight - numberWidth,
-                    baseline
-                );
-            } else {
+                if (lineNumbersVisible) {
+                    String lineNumber = Integer.toString(line + 1);
+                    float numberWidth = measureText(lineNumber);
+                    float lineNumberRight = getGutterLineNumberRightX();
+                    style.font.draw(
+                        batch,
+                        lineNumber,
+                        getX() + getGutterRenderX() + lineNumberRight - numberWidth,
+                        baseline
+                    );
+                }
+            } else if (lineNumbersVisible) {
                 float continuationWidth = measureText(".");
                 style.font.draw(
                     batch,
@@ -2496,11 +2593,11 @@ public class CodeEditor extends Widget {
     }
 
     private void drawScrollbar(Batch batch) {
-        if (style.scrollbarTrack == null || style.scrollbarKnob == null) {
+        if (!scrollbarsVisible || style.scrollbarTrack == null || style.scrollbarKnob == null) {
             return;
         }
 
-        if (hasVerticalScrollbar()) {
+        if (hasVisibleVerticalScrollbar()) {
             float x = getX() + getWidth() - style.scrollbarWidth - style.scrollbarMargin;
             float y = getY() + getScrollbarTrackY();
             float trackHeight = getScrollbarTrackHeight();
@@ -2511,7 +2608,7 @@ public class CodeEditor extends Widget {
             style.scrollbarKnob.draw(batch, x, thumbY, style.scrollbarWidth, thumbHeight);
         }
 
-        if (hasHorizontalScrollbar()) {
+        if (hasVisibleHorizontalScrollbar()) {
             float x = getX() + getHorizontalScrollbarTrackX();
             float y = getY() + getHorizontalScrollbarTrackY();
             float trackWidth = getHorizontalScrollbarTrackWidth();
@@ -3327,6 +3424,10 @@ public class CodeEditor extends Widget {
     }
 
     private void applyTouchBounce(float delta) {
+        if (!overscrollEnabled) {
+            clampScroll();
+            return;
+        }
         float minScrollX = getMinScrollX();
         float maxScrollX = getMaxScrollX();
         if (scrollX < minScrollX) {
@@ -3366,6 +3467,9 @@ public class CodeEditor extends Widget {
     }
 
     private float applyTouchScrollAxis(float current, float delta, float min, float max) {
+        if (!overscrollEnabled) {
+            return Math.max(min, Math.min(max, current + delta));
+        }
         float next = current + delta;
         if (current < min) {
             if (delta < 0f) {
@@ -3461,7 +3565,7 @@ public class CodeEditor extends Widget {
     }
 
     private boolean isInVerticalScrollbarHitArea(float x, float y) {
-        return hasVerticalScrollbar()
+        return hasVisibleVerticalScrollbar()
             && x >= getWidth() - style.scrollbarHitWidth
             && x <= getWidth()
             && y >= style.statusBarHeight
@@ -3469,7 +3573,7 @@ public class CodeEditor extends Widget {
     }
 
     private boolean isInHorizontalScrollbarHitArea(float x, float y) {
-        return hasHorizontalScrollbar()
+        return hasVisibleHorizontalScrollbar()
             && x >= getHorizontalScrollbarTrackX()
             && x <= getHorizontalScrollbarTrackX() + getHorizontalScrollbarTrackWidth()
             && y >= getHorizontalScrollbarTrackY() - style.scrollbarHitInset
@@ -3482,6 +3586,14 @@ public class CodeEditor extends Widget {
 
     private boolean hasHorizontalScrollbar() {
         return getMaxScrollX() > 0f;
+    }
+
+    private boolean hasVisibleVerticalScrollbar() {
+        return scrollbarsVisible && hasVerticalScrollbar();
+    }
+
+    private boolean hasVisibleHorizontalScrollbar() {
+        return scrollbarsVisible && hasHorizontalScrollbar();
     }
 
     private float getMinScrollX() {
@@ -3571,7 +3683,7 @@ public class CodeEditor extends Widget {
     }
 
     private void updateVerticalScrollbarFromDrag(float y) {
-        if (!hasVerticalScrollbar()) {
+        if (!hasVisibleVerticalScrollbar()) {
             return;
         }
 
@@ -3604,7 +3716,7 @@ public class CodeEditor extends Widget {
     }
 
     private void updateHorizontalScrollbarFromDrag(float x) {
-        if (!hasHorizontalScrollbar()) {
+        if (!hasVisibleHorizontalScrollbar()) {
             return;
         }
 
@@ -3977,10 +4089,19 @@ public class CodeEditor extends Widget {
     }
 
     private float getGutterWidth() {
+        float foldIndicatorWidth = !foldRegionsByStart.isEmpty() ? getFoldIndicatorWidth() : 0f;
+        if (!lineNumbersVisible) {
+            if (foldIndicatorWidth <= 0f) {
+                return 0f;
+            }
+            return style.gutterLeftPadding + foldIndicatorWidth + style.foldIndicatorRightPadding;
+        }
+
         float numberWidth = measureText(Integer.toString(Math.max(1, document.getLineCount())));
+        float foldGap = foldIndicatorWidth > 0f ? style.gutterFoldIndicatorGap : 0f;
         return Math.max(
             style.gutterMinWidth,
-            style.gutterLeftPadding + numberWidth + style.gutterFoldIndicatorGap + getFoldIndicatorWidth() + style.foldIndicatorRightPadding
+            style.gutterLeftPadding + numberWidth + foldGap + foldIndicatorWidth + style.foldIndicatorRightPadding
         );
     }
 
@@ -4029,7 +4150,7 @@ public class CodeEditor extends Widget {
 
     private float getHorizontalViewportRight() {
         float rightInset = style.textRightPadding;
-        if (hasVerticalScrollbar()) {
+        if (hasVisibleVerticalScrollbar()) {
             rightInset += style.scrollbarWidth + style.scrollbarMargin;
         }
         return Math.max(getHorizontalViewportLeft() + 1f, getWidth() - rightInset);
@@ -4040,9 +4161,13 @@ public class CodeEditor extends Widget {
     }
 
     private float getWrapWidth() {
+        float rightInset = style.textRightPadding;
+        if (hasVisibleVerticalScrollbar()) {
+            rightInset += style.scrollbarWidth + style.scrollbarGap;
+        }
         return Math.max(
             1f,
-            getWidth() - getTextStartX() - style.textRightPadding - style.scrollbarWidth - style.scrollbarGap
+            getWidth() - getTextStartX() - rightInset
         );
     }
 
@@ -4137,6 +4262,9 @@ public class CodeEditor extends Widget {
     }
 
     private void beginPinchZoom() {
+        if (!zoomEnabled) {
+            return;
+        }
         int[] pointers = new int[2];
         if (!getFirstTwoActivePointers(pointers)) {
             return;
@@ -5299,7 +5427,9 @@ public class CodeEditor extends Widget {
             if (touchInteraction) {
                 updateTouchPointer(pointer, x, y);
                 if (countActiveTouchPointers() >= 2) {
-                    beginPinchZoom();
+                    if (zoomEnabled) {
+                        beginPinchZoom();
+                    }
                     return true;
                 }
             }
@@ -5619,7 +5749,7 @@ public class CodeEditor extends Widget {
             lastTouchDragTimeNanos = nowNanos;
             if (useTouchInteractions()) {
                 updateTouchPointer(pointer, x, y);
-                if (pinchZooming || countActiveTouchPointers() >= 2) {
+                if (pinchZooming || (zoomEnabled && countActiveTouchPointers() >= 2)) {
                     if (!pinchZooming) {
                         beginPinchZoom();
                     }

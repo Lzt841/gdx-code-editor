@@ -55,7 +55,7 @@ Add the dependency:
 
 ```gradle
 dependencies {
-    implementation 'com.github.Lzt841:gdx-code-editor:v0.0.3'
+    implementation 'com.github.Lzt841:gdx-code-editor:v0.0.4'
 }
 ```
 
@@ -68,7 +68,7 @@ repositories {
 }
 
 dependencies {
-    implementation("com.github.Lzt841:gdx-code-editor:v0.0.3")
+    implementation("com.github.Lzt841:gdx-code-editor:v0.0.4")
 }
 ```
 

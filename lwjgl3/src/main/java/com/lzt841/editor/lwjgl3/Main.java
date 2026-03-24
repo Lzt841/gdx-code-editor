@@ -70,6 +70,10 @@ public class Main extends ApplicationAdapter {
     private TextButton interactionButton;
     private TextButton wrapButton;
     private TextButton lineNumberButton;
+    private TextButton lineNumberFixedButton;
+    private TextButton scrollbarButton;
+    private TextButton zoomEnabledButton;
+    private TextButton overscrollButton;
     private TextButton rainbowBracketButton;
     private TextButton rainbowGuideButton;
     private TextButton previousMatchButton;
@@ -273,7 +277,31 @@ public class Main extends ApplicationAdapter {
         lineNumberButton = createActionButton("", new Runnable() {
             @Override
             public void run() {
+                editor.setLineNumbersVisible(!editor.isLineNumbersVisible());
+            }
+        });
+        lineNumberFixedButton = createActionButton("", new Runnable() {
+            @Override
+            public void run() {
                 editor.setLineNumbersFixed(!editor.isLineNumbersFixed());
+            }
+        });
+        scrollbarButton = createActionButton("", new Runnable() {
+            @Override
+            public void run() {
+                editor.setScrollbarsVisible(!editor.isScrollbarsVisible());
+            }
+        });
+        zoomEnabledButton = createActionButton("", new Runnable() {
+            @Override
+            public void run() {
+                editor.setZoomEnabled(!editor.isZoomEnabled());
+            }
+        });
+        overscrollButton = createActionButton("", new Runnable() {
+            @Override
+            public void run() {
+                editor.setOverscrollEnabled(!editor.isOverscrollEnabled());
             }
         });
         rainbowBracketButton = createActionButton("", new Runnable() {
@@ -473,6 +501,14 @@ public class Main extends ApplicationAdapter {
         sidebar.add(wrapButton);
         sidebar.row();
         sidebar.add(lineNumberButton);
+        sidebar.row();
+        sidebar.add(lineNumberFixedButton);
+        sidebar.row();
+        sidebar.add(scrollbarButton);
+        sidebar.row();
+        sidebar.add(zoomEnabledButton);
+        sidebar.row();
+        sidebar.add(overscrollButton);
         sidebar.row();
         sidebar.add(rainbowBracketButton);
         sidebar.row();
@@ -703,7 +739,11 @@ public class Main extends ApplicationAdapter {
         profileButton.setText("Language Sample: " + profile.name);
         interactionButton.setText("Interaction Mode: " + editor.getInteractionMode().name());
         wrapButton.setText("Auto Wrap: " + onOff(editor.isWrapEnabled()));
-        lineNumberButton.setText("Line Numbers Fixed: " + onOff(editor.isLineNumbersFixed()));
+        lineNumberButton.setText("Line Numbers Visible: " + onOff(editor.isLineNumbersVisible()));
+        lineNumberFixedButton.setText("Line Numbers Fixed: " + onOff(editor.isLineNumbersFixed()));
+        scrollbarButton.setText("Scrollbars Visible: " + onOff(editor.isScrollbarsVisible()));
+        zoomEnabledButton.setText("Pinch Zoom Enabled: " + onOff(editor.isZoomEnabled()));
+        overscrollButton.setText("Overscroll: " + onOff(editor.isOverscrollEnabled()));
         rainbowBracketButton.setText("Rainbow Brackets: " + onOff(editor.isRainbowBracketsEnabled()));
         rainbowGuideButton.setText("Rainbow Guides: " + onOff(editor.isRainbowGuidesEnabled()));
         applySearchButton.setText("Apply Search");
@@ -728,7 +768,12 @@ public class Main extends ApplicationAdapter {
             "Sample: " + profile.name + "\n"
                 + "Highlighter: " + profile.description + "\n"
                 + "Disabled: " + onOff(editor.isDisabled()) + "   Read only: " + onOff(editor.isReadOnly()) + "\n"
-                + "Wrap: " + onOff(editor.isWrapEnabled()) + "   Fixed line numbers: " + onOff(editor.isLineNumbersFixed()) + "\n"
+                + "Wrap: " + onOff(editor.isWrapEnabled())
+                + "   Line numbers: " + onOff(editor.isLineNumbersVisible())
+                + "   Fixed gutter: " + onOff(editor.isLineNumbersFixed()) + "\n"
+                + "Scrollbars: " + onOff(editor.isScrollbarsVisible()) + "\n"
+                + "Pinch zoom: " + onOff(editor.isZoomEnabled())
+                + "   Overscroll: " + onOff(editor.isOverscrollEnabled()) + "\n"
                 + "Rainbow brackets: " + onOff(editor.isRainbowBracketsEnabled())
                 + "   Rainbow guides: " + onOff(editor.isRainbowGuidesEnabled()) + "\n"
                 + "Search case: " + (editor.isSearchCaseSensitive() ? "Sensitive" : "Ignore case") + "\n"

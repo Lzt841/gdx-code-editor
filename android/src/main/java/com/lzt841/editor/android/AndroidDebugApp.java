@@ -63,11 +63,15 @@ public class AndroidDebugApp extends ApplicationAdapter {
     private TextButton sampleButton;
     private TextButton wrapButton;
     private TextButton lineNumberButton;
+    private TextButton lineNumberFixedButton;
+    private TextButton scrollbarButton;
     private TextButton readOnlyButton;
     private TextButton disabledButton;
     private TextButton undoButton;
     private TextButton redoButton;
     private TextButton zoomButton;
+    private TextButton zoomEnabledButton;
+    private TextButton overscrollButton;
     private final Vector2 focusScrollTmp = new Vector2();
     private final Vector2 popupStageTmp = new Vector2();
     private Table popupMenu;
@@ -169,7 +173,19 @@ public class AndroidDebugApp extends ApplicationAdapter {
         lineNumberButton = button("Line Numbers", buttonStyle, new Runnable() {
             @Override
             public void run() {
+                editor.setLineNumbersVisible(!editor.isLineNumbersVisible());
+            }
+        });
+        lineNumberFixedButton = button("Line Numbers Fixed", buttonStyle, new Runnable() {
+            @Override
+            public void run() {
                 editor.setLineNumbersFixed(!editor.isLineNumbersFixed());
+            }
+        });
+        scrollbarButton = button("Scrollbars", buttonStyle, new Runnable() {
+            @Override
+            public void run() {
+                editor.setScrollbarsVisible(!editor.isScrollbarsVisible());
             }
         });
         readOnlyButton = button("Read Only", buttonStyle, new Runnable() {
@@ -205,6 +221,18 @@ public class AndroidDebugApp extends ApplicationAdapter {
             public void run() {
                 float next = editor.getZoomScale() >= 1.5f ? 1f : editor.getZoomScale() + 0.25f;
                 editor.setZoomScale(next);
+            }
+        });
+        zoomEnabledButton = button("Pinch Zoom", buttonStyle, new Runnable() {
+            @Override
+            public void run() {
+                editor.setZoomEnabled(!editor.isZoomEnabled());
+            }
+        });
+        overscrollButton = button("Overscroll", buttonStyle, new Runnable() {
+            @Override
+            public void run() {
+                editor.setOverscrollEnabled(!editor.isOverscrollEnabled());
             }
         });
 
@@ -269,13 +297,19 @@ public class AndroidDebugApp extends ApplicationAdapter {
         controlsTable.add(wrapButton);
         controlsTable.add(lineNumberButton);
         controlsTable.row();
+        controlsTable.add(lineNumberFixedButton);
+        controlsTable.add(scrollbarButton);
+        controlsTable.row();
+        controlsTable.add(zoomEnabledButton);
+        controlsTable.add(overscrollButton);
+        controlsTable.row();
+        controlsTable.add(zoomButton).colspan(2);
+        controlsTable.row();
         controlsTable.add(readOnlyButton);
         controlsTable.add(disabledButton);
         controlsTable.row();
         controlsTable.add(undoButton);
         controlsTable.add(redoButton);
-        controlsTable.row();
-        controlsTable.add(zoomButton).colspan(2);
         controlsTable.row();
         controlsTable.add(searchTitle).colspan(2).left().padTop(6f).padBottom(2f);
         controlsTable.row();
@@ -504,17 +538,26 @@ public class AndroidDebugApp extends ApplicationAdapter {
         DemoProfile profile = profiles[profileIndex];
         sampleButton.setText("Sample: " + profile.name);
         wrapButton.setText("Wrap: " + onOff(editor.isWrapEnabled()));
-        lineNumberButton.setText("Line Numbers: " + onOff(editor.isLineNumbersFixed()));
+        lineNumberButton.setText("Line Numbers: " + onOff(editor.isLineNumbersVisible()));
+        lineNumberFixedButton.setText("Fixed Gutter: " + onOff(editor.isLineNumbersFixed()));
+        scrollbarButton.setText("Scrollbars: " + onOff(editor.isScrollbarsVisible()));
         readOnlyButton.setText("Read Only: " + onOff(editor.isReadOnly()));
         disabledButton.setText("Disabled: " + onOff(editor.isDisabled()));
         undoButton.setText("Undo: " + onOff(editor.canUndo()));
         redoButton.setText("Redo: " + onOff(editor.canRedo()));
         zoomButton.setText("Zoom: " + String.format(java.util.Locale.ROOT, "%.2fx", editor.getZoomScale()));
+        zoomEnabledButton.setText("Pinch Zoom: " + onOff(editor.isZoomEnabled()));
+        overscrollButton.setText("Overscroll: " + onOff(editor.isOverscrollEnabled()));
         stateLabel.setText(
             "Highlighter: " + profile.description + "\n"
                 + "Cursor: " + (editor.getCursorLine() + 1) + ":" + (editor.getCursorColumn() + 1) + "\n"
                 + "Selection: " + onOff(editor.hasSelection()) + "\n"
                 + "Matches: " + editor.getSearchMatchCount() + "\n"
+                + "Line numbers: " + onOff(editor.isLineNumbersVisible())
+                + "   Fixed gutter: " + onOff(editor.isLineNumbersFixed()) + "\n"
+                + "Scrollbars: " + onOff(editor.isScrollbarsVisible()) + "\n"
+                + "Pinch zoom: " + onOff(editor.isZoomEnabled())
+                + "   Overscroll: " + onOff(editor.isOverscrollEnabled()) + "\n"
                 + "Tips: pinch to zoom, long press to test touch callback, drag handles to test auto-scroll."
         );
         eventLabel.setText(lastEvent);
