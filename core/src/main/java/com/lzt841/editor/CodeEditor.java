@@ -4,14 +4,21 @@ import com.badlogic.gdx.Gdx;
 import com.badlogic.gdx.Input;
 import com.badlogic.gdx.Application.ApplicationType;
 import com.badlogic.gdx.graphics.Color;
+import com.badlogic.gdx.graphics.Pixmap;
 import com.badlogic.gdx.graphics.Texture;
 import com.badlogic.gdx.graphics.g2d.Batch;
 import com.badlogic.gdx.graphics.g2d.BitmapFont;
 import com.badlogic.gdx.graphics.g2d.GlyphLayout;
+import com.badlogic.gdx.graphics.g2d.TextureRegion;
+import com.badlogic.gdx.math.Vector2;
+import com.badlogic.gdx.math.Vector3;
+import com.badlogic.gdx.scenes.scene2d.Actor;
 import com.badlogic.gdx.scenes.scene2d.InputEvent;
 import com.badlogic.gdx.scenes.scene2d.InputListener;
+import com.badlogic.gdx.scenes.scene2d.Stage;
 import com.badlogic.gdx.scenes.scene2d.ui.Skin;
 import com.badlogic.gdx.scenes.scene2d.ui.Widget;
+import com.badlogic.gdx.scenes.scene2d.utils.BaseDrawable;
 import com.badlogic.gdx.scenes.scene2d.utils.Drawable;
 import com.badlogic.gdx.utils.Align;
 import com.badlogic.gdx.utils.Array;
@@ -19,6 +26,7 @@ import com.badlogic.gdx.utils.IntMap;
 import com.badlogic.gdx.utils.IntFloatMap;
 import com.badlogic.gdx.utils.IntArray;
 import com.badlogic.gdx.utils.ObjectSet;
+import com.badlogic.gdx.utils.ScreenUtils;
 import com.badlogic.gdx.utils.TimeUtils;
 import com.lzt841.editor.highlight.CodeHighlighter;
 import com.lzt841.editor.highlight.CodeBracketIgnoreSpan;
@@ -59,6 +67,14 @@ public class CodeEditor extends Widget {
     private static final float DEFAULT_FOLD_BADGE_VERTICAL_PADDING = 4f;
     private static final float DEFAULT_SELECTION_HANDLE_RADIUS = 10f;
     private static final float DEFAULT_SELECTION_HANDLE_TOUCH_RADIUS_MULTIPLIER = 1.8f;
+    private static final float SELECTION_HANDLE_BULB_CENTER_Y_RATIO = 0.38f;
+    private static final float SELECTION_HANDLE_BULB_CENTER_X_LEFT_RATIO = 0.34f;
+    private static final float SELECTION_HANDLE_BULB_CENTER_X_RIGHT_RATIO = 0.66f;
+    private static final float SELECTION_HANDLE_ANCHOR_X_LEFT_RATIO = 0.58f;
+    private static final float SELECTION_HANDLE_ANCHOR_X_RIGHT_RATIO = 0.42f;
+    private static final int HANDLE_CORNER_TOP_LEFT = 0;
+    private static final int HANDLE_CORNER_TOP_RIGHT = 1;
+    private static final int HANDLE_CORNER_TOP_CENTER = 2;
     private static final float WHEEL_SCROLL_ROWS = 3f;
     private static final long CURSOR_BLINK_NS = 500_000_000L;
     private static final float AUTO_SCROLL_MAX_SPEED = 1200f;
@@ -69,8 +85,12 @@ public class CodeEditor extends Widget {
     private static final float TOUCH_OVERSCROLL_LIMIT = 96f;
     private static final float TOUCH_OVERSCROLL_DAMPING = 0.35f;
     private static final float TOUCH_SLOP = 18f;
+    private static final int TOUCH_SCROLL_AXIS_NONE = 0;
+    private static final int TOUCH_SCROLL_AXIS_HORIZONTAL = 1;
+    private static final int TOUCH_SCROLL_AXIS_VERTICAL = 2;
     private static final long LONG_PRESS_NS = 450_000_000L;
     private static final long DOUBLE_TAP_NS = 300_000_000L;
+    private static final long CARET_HANDLE_VISIBLE_NS = 3_000_000_000L;
     private static final float KEY_REPEAT_INITIAL_DELAY = 0.42f;
     private static final float KEY_REPEAT_INTERVAL = 0.045f;
     private static final float MIN_ZOOM_SCALE = 0.75f;
@@ -92,6 +112,12 @@ public class CodeEditor extends Widget {
         {0.345f, 0.757f, 0.996f, 0.24f},
         {0.753f, 0.541f, 0.992f, 0.24f}
     };
+    private static final FoldDisplayProvider DEFAULT_FOLD_DISPLAY_PROVIDER = new FoldDisplayProvider() {
+        @Override
+        public String getCollapsedText(CodeEditor editor, FoldDisplayContext context) {
+            return "...";
+        }
+    };
 
     private final GlyphLayout glyphLayout = new GlyphLayout();
     private final CodeDocument document = new CodeDocument();
@@ -102,13 +128,24 @@ public class CodeEditor extends Widget {
     private final ObjectSet<String> collapsedRegionKeys = new ObjectSet<>();
     private final IntFloatMap glyphWidthCache = new IntFloatMap();
     private final IntFloatMap glyphAdvanceCache = new IntFloatMap();
+    private final Vector2 scratchVector = new Vector2();
+    private final Vector3 scratchVector3 = new Vector3();
+    private final CodeEditorSettings.Listener settingsListener = new CodeEditorSettings.Listener() {
+        @Override
+        public void onSettingsChanged(CodeEditorSettings settings) {
+            applySettings(settings);
+        }
+    };
     private final boolean[] touchPointersDown = new boolean[MAX_TOUCH_POINTERS];
     private final float[] touchPointerX = new float[MAX_TOUCH_POINTERS];
     private final float[] touchPointerY = new float[MAX_TOUCH_POINTERS];
+    private final SelectionHandleOverlay selectionHandleOverlay = new SelectionHandleOverlay();
 
     private CodeEditorStyle style;
+    private CodeEditorSettings settings;
     private CodeHighlighter highlighter = new JavaCodeHighlighter();
     private CodeStructureProvider structureProvider = new BraceCodeStructureProvider();
+    private FoldDisplayProvider foldDisplayProvider = DEFAULT_FOLD_DISPLAY_PROVIDER;
     private CodeEditorInteractionMode interactionMode = CodeEditorInteractionMode.AUTO;
     private CodeEditorInteractionListener interactionListener;
     private CodeEditorOnscreenKeyboard onscreenKeyboard = CodeEditorOnscreenKeyboard.DEFAULT;
@@ -133,6 +170,7 @@ public class CodeEditor extends Widget {
     private boolean analyzedWrapEnabled;
     private boolean disabled;
     private boolean lineNumbersFixed = true;
+    private boolean magnifierEnabled = true;
     private boolean readOnly;
     private boolean wrapEnabled;
     private boolean rainbowBracketsEnabled;
@@ -148,6 +186,7 @@ public class CodeEditor extends Widget {
     private boolean draggingTouchScroll;
     private boolean draggingStartHandle;
     private boolean draggingEndHandle;
+    private boolean draggingCaretHandle;
     private boolean pendingSelectionMove;
     private boolean draggingSelectedText;
     private boolean pendingTouchPress;
@@ -160,6 +199,7 @@ public class CodeEditor extends Widget {
     private float touchDownY;
     private float touchScrollVelocityX;
     private float touchScrollVelocityY;
+    private int touchScrollAxisLock = TOUCH_SCROLL_AXIS_NONE;
     private long lastTouchDragTimeNanos;
     private long touchDownTimeNanos;
     private long lastTapTimeNanos;
@@ -170,6 +210,8 @@ public class CodeEditor extends Widget {
     private float lastMouseTapY = Float.NaN;
     private int handleDragFixedLine = -1;
     private int handleDragFixedColumn = -1;
+    private float handleDragPointerOffsetX;
+    private float handleDragPointerOffsetY;
     private int draggedSelectionStartLine = -1;
     private int draggedSelectionStartColumn = -1;
     private int draggedSelectionEndLine = -1;
@@ -191,9 +233,11 @@ public class CodeEditor extends Widget {
     private CodeEditorContentChangeType pendingContentChangeType = CodeEditorContentChangeType.UNKNOWN;
     private String draggedSelectionText = "";
     private boolean deferredMutationProcessingPending;
+    private long transientCaretHandleUntilNanos;
 
     public CodeEditor(CodeEditorStyle style) {
         setStyle(style);
+        setSettings(new CodeEditorSettings());
         setTouchable(com.badlogic.gdx.scenes.scene2d.Touchable.enabled);
         addListener(new EditorInputListener());
     }
@@ -257,11 +301,28 @@ public class CodeEditor extends Widget {
         invalidateLayout();
     }
 
+    public FoldDisplayProvider getFoldDisplayProvider() {
+        return foldDisplayProvider;
+    }
+
+    public void setFoldDisplayProvider(FoldDisplayProvider foldDisplayProvider) {
+        this.foldDisplayProvider = foldDisplayProvider == null ? DEFAULT_FOLD_DISPLAY_PROVIDER : foldDisplayProvider;
+        invalidateLayout();
+    }
+
     public CodeEditorInteractionMode getInteractionMode() {
         return interactionMode;
     }
 
     public void setInteractionMode(CodeEditorInteractionMode interactionMode) {
+        if (settings != null) {
+            settings.setInteractionMode(interactionMode);
+            return;
+        }
+        applyInteractionMode(interactionMode);
+    }
+
+    private void applyInteractionMode(CodeEditorInteractionMode interactionMode) {
         this.interactionMode = interactionMode == null ? CodeEditorInteractionMode.AUTO : interactionMode;
     }
 
@@ -478,6 +539,14 @@ public class CodeEditor extends Widget {
     }
 
     public void setLineNumbersFixed(boolean lineNumbersFixed) {
+        if (settings != null) {
+            settings.setLineNumbersFixed(lineNumbersFixed);
+            return;
+        }
+        applyLineNumbersFixed(lineNumbersFixed);
+    }
+
+    private void applyLineNumbersFixed(boolean lineNumbersFixed) {
         if (this.lineNumbersFixed == lineNumbersFixed) {
             return;
         }
@@ -491,12 +560,68 @@ public class CodeEditor extends Widget {
     }
 
     public void setWrapEnabled(boolean wrapEnabled) {
+        if (settings != null) {
+            settings.setWrapEnabled(wrapEnabled);
+            return;
+        }
+        applyWrapEnabled(wrapEnabled);
+    }
+
+    private void applyWrapEnabled(boolean wrapEnabled) {
         if (this.wrapEnabled == wrapEnabled) {
             return;
         }
         this.wrapEnabled = wrapEnabled;
         invalidateLayout();
         invalidateHierarchy();
+    }
+
+    public boolean isMagnifierEnabled() {
+        return magnifierEnabled;
+    }
+
+    public void setMagnifierEnabled(boolean magnifierEnabled) {
+        if (settings != null) {
+            settings.setMagnifierEnabled(magnifierEnabled);
+            return;
+        }
+        applyMagnifierEnabled(magnifierEnabled);
+    }
+
+    private void applyMagnifierEnabled(boolean magnifierEnabled) {
+        this.magnifierEnabled = magnifierEnabled;
+    }
+
+    public CodeEditorSettings getSettings() {
+        return settings;
+    }
+
+    public void setSettings(CodeEditorSettings settings) {
+        if (settings == null) {
+            throw new IllegalArgumentException("settings cannot be null");
+        }
+        if (this.settings == settings) {
+            applySettings(settings);
+            return;
+        }
+        if (this.settings != null) {
+            this.settings.removeListener(settingsListener);
+        }
+        this.settings = settings;
+        this.settings.addListener(settingsListener);
+        applySettings(settings);
+    }
+
+    private void applySettings(CodeEditorSettings settings) {
+        if (settings == null) {
+            return;
+        }
+        applyWrapEnabled(settings.isWrapEnabled());
+        applyLineNumbersFixed(settings.isLineNumbersFixed());
+        applyMagnifierEnabled(settings.isMagnifierEnabled());
+        applyRainbowBracketsEnabled(settings.isRainbowBracketsEnabled());
+        applyRainbowGuidesEnabled(settings.isRainbowGuidesEnabled());
+        applyInteractionMode(settings.getInteractionMode());
     }
 
     private void updateFontMetrics() {
@@ -508,6 +633,14 @@ public class CodeEditor extends Widget {
     }
 
     public void setRainbowBracketsEnabled(boolean rainbowBracketsEnabled) {
+        if (settings != null) {
+            settings.setRainbowBracketsEnabled(rainbowBracketsEnabled);
+            return;
+        }
+        applyRainbowBracketsEnabled(rainbowBracketsEnabled);
+    }
+
+    private void applyRainbowBracketsEnabled(boolean rainbowBracketsEnabled) {
         if (this.rainbowBracketsEnabled == rainbowBracketsEnabled) {
             return;
         }
@@ -520,6 +653,14 @@ public class CodeEditor extends Widget {
     }
 
     public void setRainbowGuidesEnabled(boolean rainbowGuidesEnabled) {
+        if (settings != null) {
+            settings.setRainbowGuidesEnabled(rainbowGuidesEnabled);
+            return;
+        }
+        applyRainbowGuidesEnabled(rainbowGuidesEnabled);
+    }
+
+    private void applyRainbowGuidesEnabled(boolean rainbowGuidesEnabled) {
         this.rainbowGuidesEnabled = rainbowGuidesEnabled;
     }
 
@@ -566,6 +707,7 @@ public class CodeEditor extends Widget {
     public void act(float delta) {
         flushDeferredMutationProcessing();
         super.act(delta);
+        syncSelectionHandleOverlay();
         ensureStageScrollFocus();
         updateKeyRepeat(delta);
         if (pendingTouchPress && !longPressTriggered && TimeUtils.nanoTime() - touchDownTimeNanos >= LONG_PRESS_NS) {
@@ -576,7 +718,7 @@ public class CodeEditor extends Widget {
             }
             notifyLongPress(touchDownX, touchDownY);
         }
-        if (draggingSelection || draggingStartHandle || draggingEndHandle || draggingSelectedText) {
+        if (draggingSelection || draggingStartHandle || draggingEndHandle || draggingCaretHandle || draggingSelectedText) {
             applySelectionAutoScroll(delta);
         }
         if (!draggingTouchScroll && !draggingScrollbar
@@ -613,10 +755,24 @@ public class CodeEditor extends Widget {
             } else {
                 drawCaret(batch);
             }
-            drawSelectionHandles(batch);
+            if (getStage() == null) {
+                drawSelectionHandles(batch);
+            }
         } finally {
             style.font.getData().setScale(originalScaleX, originalScaleY);
         }
+    }
+
+    @Override
+    protected void setStage(Stage stage) {
+        Stage previousStage = getStage();
+        if (previousStage == stage) {
+            super.setStage(stage);
+            return;
+        }
+        detachSelectionHandleOverlay(previousStage);
+        super.setStage(stage);
+        attachSelectionHandleOverlay(stage);
     }
 
     @Override
@@ -724,8 +880,10 @@ public class CodeEditor extends Widget {
         if (document.getCursorLine() < hiddenLines.length && hiddenLines[document.getCursorLine()]) {
             FoldRegion region = findContainingRegion(document.getCursorLine());
             if (region != null) {
-                int column = Math.min(document.getCursorColumn(), document.getLineLength(region.startLine));
-                document.moveCursorTo(region.startLine, column);
+                if (!isCollapsedSuffixCursorVisible(region, document.getCursorLine(), document.getCursorColumn())) {
+                    int column = Math.min(document.getCursorColumn(), document.getLineLength(region.startLine));
+                    document.moveCursorTo(region.startLine, column);
+                }
             }
         }
 
@@ -1064,8 +1222,11 @@ public class CodeEditor extends Widget {
         selectionAnchorLine = -1;
         selectionAnchorColumn = -1;
         draggingSelection = false;
+        draggingCaretHandle = false;
         handleDragFixedLine = -1;
         handleDragFixedColumn = -1;
+        handleDragPointerOffsetX = 0f;
+        handleDragPointerOffsetY = 0f;
         clearSelectedTextDragState();
     }
 
@@ -1131,6 +1292,7 @@ public class CodeEditor extends Widget {
             return;
         }
         SearchMatchRef ref = flatSearchMatches.get(index);
+        expandCollapsedRegionContainingLine(ref.line);
         currentSearchMatchLine = ref.line;
         currentSearchMatchStart = ref.match.start;
         currentSearchMatchEnd = ref.match.end;
@@ -1727,11 +1889,12 @@ public class CodeEditor extends Widget {
 
             FoldRegion region = foldRegionsByStart.get(line);
             if (segment == 0 && region != null && region.collapsed) {
-                String badge = "  ... " + (region.endLine - region.startLine) + " folded lines";
-                float badgeX = getX() + getTextRenderX() + layout.measureRange(start, end) + style.foldBadgeGap;
-                if (style.foldBadge != null) {
-                    float badgeWidth = measureText(badge) + style.foldBadgeHorizontalPadding;
-                    float badgeHorizontalInset = style.foldBadgeHorizontalPadding * 0.5f;
+                CollapsedFoldDisplay collapsedDisplay = getCollapsedFoldDisplay(region);
+                String collapsedText = collapsedDisplay.placeholderText;
+                float badgeX = getX() + getCollapsedFoldDisplayX(layout, start, end);
+                if (style.foldBadge != null && !collapsedText.isEmpty()) {
+                    float badgeWidth = getCollapsedFoldDisplayWidth(collapsedText);
+                    float badgeHorizontalInset = getCollapsedFoldDisplayHorizontalInset();
                     style.foldBadge.draw(
                         batch,
                         badgeX - badgeHorizontalInset,
@@ -1740,13 +1903,79 @@ public class CodeEditor extends Widget {
                         lineHeight - style.foldBadgeVerticalPadding * 2f
                     );
                 }
-                style.font.setColor(style.gutterFontColor);
-                style.font.draw(batch, badge, badgeX, baseline);
+                drawCollapsedFoldPlaceholderSelection(batch, selection, region, collapsedDisplay, badgeX, rowBottom);
+                if (!collapsedText.isEmpty()) {
+                    style.font.setColor(style.gutterFontColor);
+                    style.font.draw(batch, collapsedText, badgeX, baseline);
+                }
+                if (collapsedDisplay.hasSuffix()) {
+                    float suffixX = badgeX + measureText(collapsedText);
+                    drawCollapsedFoldSuffixDecorations(batch, selection, bracketMatch, collapsedDisplay, suffixX, rowBottom);
+                    drawCollapsedFoldSuffix(batch, collapsedDisplay, suffixX, baseline);
+                }
             }
         }
 
         drawGutterOverlay(batch, startRow, endRow);
         drawScrollbar(batch);
+    }
+
+    private void drawCollapsedFoldPlaceholderSelection(
+        Batch batch,
+        SelectionRange selection,
+        FoldRegion region,
+        CollapsedFoldDisplay display,
+        float badgeX,
+        float rowBottom
+    ) {
+        if (selection == null || style.selection == null || region == null || display == null || display.placeholderText.isEmpty()) {
+            return;
+        }
+        if (!selectionOverlapsCollapsedPlaceholder(selection, region, display)) {
+            return;
+        }
+
+        float badgeHorizontalInset = getCollapsedFoldDisplayHorizontalInset();
+        float badgeWidth = getCollapsedFoldDisplayWidth(display.placeholderText);
+        style.selection.draw(
+            batch,
+            badgeX - badgeHorizontalInset,
+            rowBottom + 2f,
+            Math.max(1f, badgeWidth),
+            lineHeight - 4f
+        );
+    }
+
+    private void drawCollapsedFoldSuffixDecorations(
+        Batch batch,
+        SelectionRange selection,
+        BracketMatch bracketMatch,
+        CollapsedFoldDisplay display,
+        float suffixX,
+        float rowBottom
+    ) {
+        if (display == null || !display.hasSuffix() || display.suffixLine < 0 || display.suffixLine >= lineLayouts.size) {
+            return;
+        }
+
+        LineLayout endLayout = lineLayouts.get(display.suffixLine);
+        drawSearchHighlights(batch, endLayout, display.suffixLine, display.suffixStart, display.suffixEnd, rowBottom, suffixX);
+        drawSelection(batch, selection, endLayout, display.suffixLine, display.suffixStart, display.suffixEnd, rowBottom, suffixX);
+        drawBracketHighlight(batch, bracketMatch, endLayout, display.suffixLine, 0, display.suffixStart, display.suffixEnd, rowBottom, suffixX);
+    }
+
+    private boolean selectionOverlapsCollapsedPlaceholder(SelectionRange selection, FoldRegion region, CollapsedFoldDisplay display) {
+        if (selection == null || region == null || region.endLine <= region.startLine) {
+            return false;
+        }
+
+        int hiddenStartLine = region.startLine;
+        int hiddenStartColumn = document.getLineLength(region.startLine);
+        int hiddenEndLine = region.endLine;
+        int hiddenEndColumn = display.hasSuffix() ? Math.max(0, display.suffixStart) : document.getLineLength(region.endLine);
+
+        return comparePosition(selection.endLine, selection.endColumn, hiddenStartLine, hiddenStartColumn) > 0
+            && comparePosition(selection.startLine, selection.startColumn, hiddenEndLine, hiddenEndColumn) < 0;
     }
 
     private void drawGutterOverlay(Batch batch, int startRow, int endRow) {
@@ -1794,6 +2023,86 @@ public class CodeEditor extends Widget {
         }
     }
 
+    private CollapsedFoldDisplay getCollapsedFoldDisplay(FoldRegion region) {
+        if (region == null) {
+            return new CollapsedFoldDisplay("", "", -1, -1, -1);
+        }
+        String placeholderText;
+        if (foldDisplayProvider == null) {
+            placeholderText = DEFAULT_FOLD_DISPLAY_PROVIDER.getCollapsedText(this, null);
+        } else {
+            FoldDisplayContext context = new FoldDisplayContext(
+                region.startLine,
+                region.endLine,
+                region.depth,
+                region.startText,
+                region.endText
+            );
+            placeholderText = foldDisplayProvider.getCollapsedText(this, context);
+        }
+        return buildCollapsedFoldDisplay(region, placeholderText == null ? "" : placeholderText);
+    }
+
+    private float getCollapsedFoldDisplayX(LineLayout layout, int start, int end) {
+        return getTextRenderX() + layout.measureRange(start, end) + style.foldBadgeGap;
+    }
+
+    private float getCollapsedFoldDisplayHorizontalInset() {
+        return style.foldBadgeHorizontalPadding * 0.5f;
+    }
+
+    private float getCollapsedFoldDisplayWidth(String collapsedText) {
+        if (collapsedText == null || collapsedText.isEmpty()) {
+            return 0f;
+        }
+        return measureText(collapsedText) + style.foldBadgeHorizontalPadding;
+    }
+
+    private void drawCollapsedFoldSuffix(Batch batch, CollapsedFoldDisplay display, float x, float baseline) {
+        if (display == null || !display.hasSuffix()) {
+            return;
+        }
+        if (display.suffixLine < 0 || display.suffixLine >= lineLayouts.size) {
+            style.font.setColor(style.fontColor);
+            style.font.draw(batch, display.suffixText, x, baseline);
+            return;
+        }
+        LineLayout endLayout = lineLayouts.get(display.suffixLine);
+        drawStyledRange(
+            batch,
+            endLayout,
+            display.suffixStart,
+            display.suffixEnd,
+            x,
+            baseline
+        );
+    }
+
+    private boolean isInsideCollapsedFoldDisplayHitArea(float x, float y, int row, LineLayout layout, int start, int end, FoldRegion region) {
+        if (region == null || !region.collapsed) {
+            return false;
+        }
+        String collapsedText = getCollapsedFoldDisplay(region).placeholderText;
+        if (collapsedText.isEmpty()) {
+            return false;
+        }
+        float rowBottom = rowBottom(row);
+        if (y < rowBottom || y > rowBottom + lineHeight) {
+            return false;
+        }
+        float left = getCollapsedFoldDisplayX(layout, start, end) - getCollapsedFoldDisplayHorizontalInset();
+        float right = left + getCollapsedFoldDisplayWidth(collapsedText);
+        return x >= left && x <= right;
+    }
+
+    private boolean isCollapsedSuffixCursorVisible(FoldRegion region, int line, int column) {
+        if (region == null || !region.collapsed || line != region.endLine) {
+            return false;
+        }
+        CollapsedFoldDisplay display = getCollapsedFoldDisplay(region);
+        return display.hasSuffix() && column >= display.suffixStart;
+    }
+
     private void drawVisibleRowBackgrounds(Batch batch, int startRow, int endRow, FoldRegion activeBlock) {
         for (int row = startRow; row <= endRow; row++) {
             int line = findLineByVisualRow(row);
@@ -1825,28 +2134,44 @@ public class CodeEditor extends Widget {
 
             if (cursor < token.start) {
                 int plainEnd = Math.min(token.start, end);
-                drawText(batch, layout.text, cursor, plainEnd, x, baseline, baseColor);
+                drawText(batch, layout, cursor, plainEnd, x, baseline, baseColor);
                 x += layout.measureRange(cursor, plainEnd);
             }
 
             int tokenStart = Math.max(token.start, start);
             int tokenEnd = Math.min(token.end, end);
-            drawText(batch, layout.text, tokenStart, tokenEnd, x, baseline, disabled ? baseColor : token.color);
+            drawText(batch, layout, tokenStart, tokenEnd, x, baseline, disabled ? baseColor : token.color);
             x += layout.measureRange(tokenStart, tokenEnd);
             cursor = tokenEnd;
         }
 
         if (cursor < end) {
-            drawText(batch, layout.text, cursor, end, x, baseline, baseColor);
+            drawText(batch, layout, cursor, end, x, baseline, baseColor);
         }
     }
 
-    private void drawText(Batch batch, String text, int start, int end, float x, float y, Color color) {
+    private void drawText(Batch batch, LineLayout layout, int start, int end, float x, float y, Color color) {
+        String text = layout.text;
         if (start >= end) {
             return;
         }
         style.font.setColor(color);
-        style.font.draw(batch, text, x, y, start, end, 0f, Align.left, false);
+        int runStart = start;
+        float runX = x;
+        for (int i = start; i < end; i++) {
+            if (text.charAt(i) != '\t') {
+                continue;
+            }
+            if (runStart < i) {
+                style.font.draw(batch, text, runX, y, runStart, i, 0f, Align.left, false);
+                runX += layout.measureRange(runStart, i);
+            }
+            runX += layout.measureRange(i, i + 1);
+            runStart = i + 1;
+        }
+        if (runStart < end) {
+            style.font.draw(batch, text, runX, y, runStart, end, 0f, Align.left, false);
+        }
     }
 
     private float getTextBaseline(float rowBottom) {
@@ -1886,6 +2211,19 @@ public class CodeEditor extends Widget {
         int end,
         float rowBottom
     ) {
+        drawSelection(batch, selection, layout, line, start, end, rowBottom, getX() + getTextRenderX());
+    }
+
+    private void drawSelection(
+        Batch batch,
+        SelectionRange selection,
+        LineLayout layout,
+        int line,
+        int start,
+        int end,
+        float rowBottom,
+        float renderX
+    ) {
         if (selection == null || style.selection == null) {
             return;
         }
@@ -1905,7 +2243,7 @@ public class CodeEditor extends Widget {
             return;
         }
 
-        float x = getX() + getTextRenderX() + layout.measureRange(start, selectedStart);
+        float x = renderX + layout.measureRange(start, selectedStart);
         float width = layout.measureRange(selectedStart, selectedEnd);
         style.selection.draw(batch, x, rowBottom + 2f, Math.max(1f, width), lineHeight - 4f);
     }
@@ -1917,6 +2255,18 @@ public class CodeEditor extends Widget {
         int start,
         int end,
         float rowBottom
+    ) {
+        drawSearchHighlights(batch, layout, line, start, end, rowBottom, getX() + getTextRenderX());
+    }
+
+    private void drawSearchHighlights(
+        Batch batch,
+        LineLayout layout,
+        int line,
+        int start,
+        int end,
+        float rowBottom,
+        float renderX
     ) {
         if (style.searchHighlight == null || line < 0 || line >= searchMatches.size) {
             return;
@@ -1931,7 +2281,7 @@ public class CodeEditor extends Widget {
             if (highlightStart >= highlightEnd) {
                 continue;
             }
-            float x = getX() + getTextRenderX() + layout.measureRange(start, highlightStart);
+            float x = renderX + layout.measureRange(start, highlightStart);
             float width = layout.measureRange(highlightStart, highlightEnd);
             Drawable highlight = isCurrentSearchMatch(line, match) && style.currentSearchHighlight != null
                 ? style.currentSearchHighlight
@@ -1958,11 +2308,25 @@ public class CodeEditor extends Widget {
         int end,
         float rowBottom
     ) {
+        drawBracketHighlight(batch, bracketMatch, layout, line, segment, start, end, rowBottom, getX() + getTextRenderX());
+    }
+
+    private void drawBracketHighlight(
+        Batch batch,
+        BracketMatch bracketMatch,
+        LineLayout layout,
+        int line,
+        int segment,
+        int start,
+        int end,
+        float rowBottom,
+        float renderX
+    ) {
         if (bracketMatch == null || style.bracketMatch == null) {
             return;
         }
-        drawBracketHighlightAt(batch, bracketMatch.anchorLine, bracketMatch.anchorColumn, layout, line, segment, start, end, rowBottom);
-        drawBracketHighlightAt(batch, bracketMatch.matchLine, bracketMatch.matchColumn, layout, line, segment, start, end, rowBottom);
+        drawBracketHighlightAt(batch, bracketMatch.anchorLine, bracketMatch.anchorColumn, layout, line, segment, start, end, rowBottom, renderX);
+        drawBracketHighlightAt(batch, bracketMatch.matchLine, bracketMatch.matchColumn, layout, line, segment, start, end, rowBottom, renderX);
     }
 
     private void drawBracketHighlightAt(
@@ -1976,11 +2340,26 @@ public class CodeEditor extends Widget {
         int end,
         float rowBottom
     ) {
+        drawBracketHighlightAt(batch, targetLine, targetColumn, layout, line, segment, start, end, rowBottom, getX() + getTextRenderX());
+    }
+
+    private void drawBracketHighlightAt(
+        Batch batch,
+        int targetLine,
+        int targetColumn,
+        LineLayout layout,
+        int line,
+        int segment,
+        int start,
+        int end,
+        float rowBottom,
+        float renderX
+    ) {
         if (line != targetLine || targetColumn < start || targetColumn >= end || targetColumn >= layout.text.length()) {
             return;
         }
-        float x = getX() + getTextRenderX() + layout.measureRange(start, targetColumn);
-        float width = Math.max(1f, glyphWidth(layout.text.charAt(targetColumn)));
+        float x = renderX + layout.measureRange(start, targetColumn);
+        float width = Math.max(1f, layout.measureRange(targetColumn, targetColumn + 1));
         style.bracketMatch.draw(batch, x, rowBottom + 2f, width, lineHeight - 4f);
     }
 
@@ -2145,34 +2524,290 @@ public class CodeEditor extends Widget {
     }
 
     private void drawSelectionHandles(Batch batch) {
+        drawSelectionHandles(batch, getX(), getY());
+    }
+
+    private void drawSelectionHandles(Batch batch, float baseX, float baseY) {
+        if (!hasSelectionHandleDrawable() || !shouldShowTouchHandles()) {
+            return;
+        }
         SelectionRange selection = getSelectionRange();
-        if (selection == null || style.selectionHandle == null || !shouldShowTouchHandles()) {
+        if (selection == null) {
+            drawCaretHandle(batch, baseX, baseY);
+            drawHandleMagnifier(batch, baseX, baseY);
             return;
         }
         HandlePlacement start = getHandlePlacement(selection.startLine, selection.startColumn, false);
         HandlePlacement end = getHandlePlacement(selection.endLine, selection.endColumn, true);
-        if (start != null) {
-            style.selectionHandle.draw(
+        if (isHandleVisibleWithinEditorBounds(start)) {
+            Drawable startHandle = getSelectionHandleDrawable(false);
+            startHandle.draw(
                 batch,
-                getX() + start.x - style.selectionHandleRadius,
-                getY() + start.y - style.selectionHandleRadius,
+                baseX + start.drawX,
+                baseY + start.drawY,
                 style.selectionHandleRadius * 2f,
                 style.selectionHandleRadius * 2f
             );
         }
-        if (end != null) {
-            style.selectionHandle.draw(
+        if (isHandleVisibleWithinEditorBounds(end)) {
+            Drawable endHandle = getSelectionHandleDrawable(true);
+            endHandle.draw(
                 batch,
-                getX() + end.x - style.selectionHandleRadius,
-                getY() + end.y - style.selectionHandleRadius,
+                baseX + end.drawX,
+                baseY + end.drawY,
                 style.selectionHandleRadius * 2f,
                 style.selectionHandleRadius * 2f
             );
+        }
+        drawHandleMagnifier(batch, baseX, baseY);
+    }
+
+    private void drawCaretHandle(Batch batch, float baseX, float baseY) {
+        if (!shouldShowTransientCaretHandle()) {
+            return;
+        }
+        Drawable caretHandle = getCaretHandleDrawable();
+        if (caretHandle == null) {
+            return;
+        }
+        HandlePlacement caret = getCaretHandlePlacement();
+        if (!isHandleVisibleWithinEditorBounds(caret)) {
+            return;
+        }
+        caretHandle.draw(
+            batch,
+            baseX + caret.drawX,
+            baseY + caret.drawY,
+            style.selectionHandleRadius * 2f,
+            style.selectionHandleRadius * 2f
+        );
+    }
+
+    private void drawHandleMagnifier(Batch batch, float baseX, float baseY) {
+        if (!shouldShowHandleMagnifier() || getStage() == null) {
+            return;
+        }
+
+        Stage stage = getStage();
+        float popupWidth = getMagnifierWidth();
+        float popupHeight = getMagnifierHeight();
+        float popupInset = Math.max(0f, style.magnifierContentPadding);
+        float popupX = baseX + lastDragX - popupWidth * 0.5f;
+        float popupY = baseY + lastDragY + getMagnifierVerticalOffset();
+        if (popupY + popupHeight > stage.getHeight() - 6f) {
+            popupY = baseY + lastDragY - popupHeight - getMagnifierVerticalOffset();
+        }
+        popupX = clamp(popupX, 6f, stage.getWidth() - popupWidth - 6f);
+        popupY = clamp(popupY, 6f, stage.getHeight() - popupHeight - 6f);
+
+        int backBufferWidth = Gdx.graphics.getBackBufferWidth();
+        int backBufferHeight = Gdx.graphics.getBackBufferHeight();
+        float scaleX = backBufferWidth / Math.max(1f, (float) Gdx.graphics.getWidth());
+        float scaleY = backBufferHeight / Math.max(1f, (float) Gdx.graphics.getHeight());
+        float contentWidth = Math.max(8f, popupWidth - popupInset * 2f);
+        float contentHeight = Math.max(8f, popupHeight - popupInset * 2f);
+        float sampleStageWidth = Math.max(lineHeight, contentWidth * 0.5f);
+        float sampleStageHeight = Math.max(lineHeight * 0.8f, contentHeight * 0.5f);
+        int sampleWidth = Math.max(24, Math.round(sampleStageWidth * scaleX));
+        int sampleHeight = Math.max(24, Math.round(sampleStageHeight * scaleY));
+
+        scratchVector3.set(baseX + lastDragX, baseY + lastDragY + style.selectionHandleRadius * 2f, 0f);
+        stage.getViewport().project(scratchVector3);
+        int sourceX = clamp(Math.round(scratchVector3.x * scaleX) - sampleWidth / 2, 0, Math.max(0, backBufferWidth - sampleWidth));
+        int sourceY = clamp(Math.round(scratchVector3.y * scaleY) - sampleHeight / 2, 0, Math.max(0, backBufferHeight - sampleHeight));
+
+        batch.flush();
+        TextureRegion captured = ScreenUtils.getFrameBufferTexture(sourceX, sourceY, sampleWidth, sampleHeight);
+        try {
+            if (style.magnifierBackground != null) {
+                style.magnifierBackground.draw(batch, popupX, popupY, popupWidth, popupHeight);
+            }
+            batch.draw(
+                captured,
+                popupX + popupInset,
+                popupY + popupInset,
+                contentWidth,
+                contentHeight
+            );
+            batch.flush();
+        } finally {
+            if (captured != null && captured.getTexture() != null) {
+                captured.getTexture().dispose();
+            }
         }
     }
 
     private boolean shouldShowTouchHandles() {
         return useTouchInteractions();
+    }
+
+    private boolean shouldShowHandleMagnifier() {
+        return magnifierEnabled
+            && useTouchInteractions()
+            && (draggingStartHandle || draggingEndHandle || draggingCaretHandle)
+            && isHandleVisibleWithinEditorBounds(getActiveHandlePlacement());
+    }
+
+    private float getMagnifierWidth() {
+        return style.magnifierWidth > 0f ? style.magnifierWidth : stageUnitsFromCentimetersX(4f);
+    }
+
+    private float getMagnifierHeight() {
+        return style.magnifierHeight > 0f ? style.magnifierHeight : stageUnitsFromCentimetersY(1.5f);
+    }
+
+    private float getMagnifierVerticalOffset() {
+        return stageUnitsFromCentimetersY(1f);
+    }
+
+    private void showTransientCaretHandle() {
+        transientCaretHandleUntilNanos = TimeUtils.nanoTime() + CARET_HANDLE_VISIBLE_NS;
+    }
+
+    private void hideTransientCaretHandle() {
+        transientCaretHandleUntilNanos = 0L;
+    }
+
+    private boolean shouldShowTransientCaretHandle() {
+        return shouldShowTouchHandles()
+            && getSelectionRange() == null
+            && !disabled
+            && (draggingCaretHandle || TimeUtils.nanoTime() < transientCaretHandleUntilNanos);
+    }
+
+    private boolean hasSelectionHandleDrawable() {
+        return style.selectionHandleStart != null || style.selectionHandleEnd != null || style.selectionHandle != null;
+    }
+
+    private Drawable getSelectionHandleDrawable(boolean endHandle) {
+        Drawable handle = endHandle ? style.selectionHandleEnd : style.selectionHandleStart;
+        if (handle == null) {
+            handle = style.selectionHandle;
+        }
+        return handle;
+    }
+
+    private Drawable getCaretHandleDrawable() {
+        Drawable handle = style.selectionHandleCaret;
+        return handle != null ? handle : getSelectionHandleDrawable(true);
+    }
+
+    private HandlePlacement getActiveHandlePlacement() {
+        SelectionRange selection = getSelectionRange();
+        if (draggingStartHandle && selection != null) {
+            return getHandlePlacement(selection.startLine, selection.startColumn, false);
+        }
+        if (draggingEndHandle && selection != null) {
+            return getHandlePlacement(selection.endLine, selection.endColumn, true);
+        }
+        if (draggingCaretHandle) {
+            return getCaretHandlePlacement();
+        }
+        return null;
+    }
+
+    private boolean isHandleVisibleWithinEditorBounds(HandlePlacement handle) {
+        if (handle == null) {
+            return false;
+        }
+        float marginX = stageUnitsFromCentimetersX(0.3f);
+        float marginY = stageUnitsFromCentimetersY(0.3f);
+        float handleSize = style.selectionHandleRadius * 2f;
+        float left = handle.drawX;
+        float right = handle.drawX + handleSize;
+        float bottom = handle.drawY;
+        float top = handle.drawY + handleSize;
+        return right >= -marginX
+            && left <= getWidth() + marginX
+            && top >= -marginY
+            && bottom <= getHeight() + marginY;
+    }
+
+    private void attachSelectionHandleOverlay(Stage stage) {
+        if (stage == null) {
+            return;
+        }
+        if (selectionHandleOverlay.getStage() != null && selectionHandleOverlay.getStage() != stage) {
+            selectionHandleOverlay.remove();
+        }
+        if (selectionHandleOverlay.getStage() != stage) {
+            stage.addActor(selectionHandleOverlay);
+        }
+        syncSelectionHandleOverlay();
+    }
+
+    private void detachSelectionHandleOverlay(Stage stage) {
+        if (stage == null) {
+            return;
+        }
+        if (selectionHandleOverlay.getStage() == stage) {
+            selectionHandleOverlay.remove();
+        }
+    }
+
+    private void syncSelectionHandleOverlay() {
+        Stage stage = getStage();
+        if (stage == null) {
+            return;
+        }
+        if (selectionHandleOverlay.getStage() != stage) {
+            attachSelectionHandleOverlay(stage);
+            return;
+        }
+        selectionHandleOverlay.setBounds(0f, 0f, stage.getWidth(), stage.getHeight());
+        selectionHandleOverlay.setVisible(shouldShowTouchHandles()
+            && hasSelectionHandleDrawable()
+            && (getSelectionRange() != null || shouldShowTransientCaretHandle())
+            && isVisible());
+        if (selectionHandleOverlay.isVisible()) {
+            selectionHandleOverlay.toFront();
+        }
+    }
+
+    private Vector2 getStageOrigin() {
+        scratchVector.set(0f, 0f);
+        return localToStageCoordinates(scratchVector);
+    }
+
+    private boolean beginSelectionHandleOverlayDrag(float stageX, float stageY) {
+        Vector2 local = stageToLocalHandleCoordinates(stageX, stageY);
+        lastDragX = local.x;
+        lastDragY = local.y;
+        return beginAnyHandleDrag(local.x, local.y);
+    }
+
+    private void updateSelectionHandleOverlayDrag(float stageX, float stageY) {
+        Vector2 local = stageToLocalHandleCoordinates(stageX, stageY);
+        lastDragX = local.x;
+        lastDragY = local.y;
+        updateAnyHandleDrag(local.x, local.y);
+    }
+
+    private void endSelectionHandleOverlayDrag() {
+        boolean draggedHandle = draggingStartHandle || draggingEndHandle || draggingCaretHandle;
+        draggingStartHandle = false;
+        draggingEndHandle = false;
+        draggingCaretHandle = false;
+        handleDragFixedLine = -1;
+        handleDragFixedColumn = -1;
+        handleDragPointerOffsetX = 0f;
+        handleDragPointerOffsetY = 0f;
+        if (draggedHandle) {
+            refreshBlink();
+        }
+    }
+
+    private Vector2 stageToLocalHandleCoordinates(float stageX, float stageY) {
+        scratchVector.set(stageX, stageY);
+        return stageToLocalCoordinates(scratchVector);
+    }
+
+    private boolean isStagePositionNearSelectionHandle(float stageX, float stageY) {
+        if (!shouldShowTouchHandles()) {
+            return false;
+        }
+        Vector2 local = stageToLocalHandleCoordinates(stageX, stageY);
+        return isNearAnyHandle(local.x, local.y);
     }
 
     private void moveCursorByVisualRows(int delta) {
@@ -2236,22 +2871,11 @@ public class CodeEditor extends Widget {
     }
 
     private void placeCursorAtRow(float x, int row) {
-        if (row < 0 || row >= totalVisualRows) {
+        CodePoint point = getCodePointAtRowX(row, Math.max(0f, x + scrollX - getTextStartX()));
+        if (point == null) {
             return;
         }
-
-        int line = findLineByVisualRow(row);
-        if (line < 0 || line >= lineLayouts.size) {
-            return;
-        }
-
-        LineLayout layout = lineLayouts.get(line);
-        int segment = clamp(row - visualRowStart[line], 0, layout.getVisualRowCount() - 1);
-        int start = layout.segmentStarts.get(segment);
-        int end = layout.segmentEnds.get(segment);
-        float localX = Math.max(0f, x + scrollX - getTextStartX());
-        int column = findColumnForX(layout, start, end, localX);
-        document.moveCursorTo(line, column);
+        document.moveCursorTo(point.line, point.column);
         resetPreferredColumn();
         ensureCursorVisible();
     }
@@ -2261,7 +2885,13 @@ public class CodeEditor extends Widget {
         if (row < 0 || row >= totalVisualRows) {
             return null;
         }
+        return getCodePointAtRowX(row, Math.max(0f, x + scrollX - getTextStartX()));
+    }
 
+    private CodePoint getCodePointAtRowX(int row, float localX) {
+        if (row < 0 || row >= totalVisualRows) {
+            return null;
+        }
         int line = findLineByVisualRow(row);
         if (line < 0 || line >= lineLayouts.size) {
             return null;
@@ -2271,7 +2901,20 @@ public class CodeEditor extends Widget {
         int segment = clamp(row - visualRowStart[line], 0, layout.getVisualRowCount() - 1);
         int start = layout.segmentStarts.get(segment);
         int end = layout.segmentEnds.get(segment);
-        float localX = Math.max(0f, x + scrollX - getTextStartX());
+        FoldRegion region = segment == 0 ? foldRegionsByStart.get(line) : null;
+        if (region != null && region.collapsed) {
+            CollapsedFoldDisplay display = getCollapsedFoldDisplay(region);
+            if (display.hasSuffix()) {
+                float suffixX = layout.measureRange(start, end) + style.foldBadgeGap + measureText(display.placeholderText);
+                float suffixWidth = lineLayouts.get(region.endLine).measureRange(display.suffixStart, display.suffixEnd);
+                if (localX >= suffixX) {
+                    float suffixLocalX = Math.max(0f, Math.min(localX - suffixX, suffixWidth));
+                    int suffixColumn = findColumnForX(lineLayouts.get(region.endLine), display.suffixStart, display.suffixEnd, suffixLocalX);
+                    return new CodePoint(region.endLine, suffixColumn);
+                }
+            }
+        }
+
         int column = findColumnForX(layout, start, end, localX);
         return new CodePoint(line, column);
     }
@@ -2282,8 +2925,32 @@ public class CodeEditor extends Widget {
             return null;
         }
         float rowBottom = rowBottom(placement.row);
-        float y = endHandle ? rowBottom + 2f : rowBottom + lineHeight - 2f;
-        return new HandlePlacement(placement.x, y);
+        float anchorY = rowBottom + 2f;
+        float handleSize = style.selectionHandleRadius * 2f;
+        float drawX = endHandle ? placement.x : placement.x - handleSize;
+        float drawY = anchorY - handleSize;
+        float hitX = drawX + handleSize * 0.5f;
+        float hitY = drawY + handleSize * SELECTION_HANDLE_BULB_CENTER_Y_RATIO;
+        return new HandlePlacement(placement.x, anchorY, drawX, drawY, hitX, hitY);
+    }
+
+    private HandlePlacement getCaretHandlePlacement() {
+        CursorPlacement placement = getCursorPlacement(document.getCursorLine(), document.getCursorColumn());
+        if (placement == null) {
+            return null;
+        }
+        float rowBottom = rowBottom(placement.row);
+        float anchorY = rowBottom + 2f;
+        float handleSize = style.selectionHandleRadius * 2f;
+        float drawX = placement.x - style.selectionHandleRadius;
+        float drawY = anchorY - handleSize;
+        float hitX = placement.x;
+        float hitY = drawY + handleSize * 0.5f;
+        return new HandlePlacement(placement.x, anchorY, drawX, drawY, hitX, hitY);
+    }
+
+    private boolean beginAnyHandleDrag(float x, float y) {
+        return beginHandleDrag(x, y) || beginCaretHandleDrag(x, y);
     }
 
     private boolean beginHandleDrag(float x, float y) {
@@ -2301,6 +2968,8 @@ public class CodeEditor extends Widget {
             longPressTriggered = false;
             handleDragFixedLine = selection.endLine;
             handleDragFixedColumn = selection.endColumn;
+            handleDragPointerOffsetX = x - start.x;
+            handleDragPointerOffsetY = y - start.y;
             touchScrollVelocityX = 0f;
             touchScrollVelocityY = 0f;
             return true;
@@ -2312,6 +2981,8 @@ public class CodeEditor extends Widget {
             longPressTriggered = false;
             handleDragFixedLine = selection.startLine;
             handleDragFixedColumn = selection.startColumn;
+            handleDragPointerOffsetX = x - end.x;
+            handleDragPointerOffsetY = y - end.y;
             touchScrollVelocityX = 0f;
             touchScrollVelocityY = 0f;
             return true;
@@ -2319,21 +2990,64 @@ public class CodeEditor extends Widget {
         return false;
     }
 
+    private boolean beginCaretHandleDrag(float x, float y) {
+        if (!shouldShowTransientCaretHandle()) {
+            return false;
+        }
+        HandlePlacement caret = getCaretHandlePlacement();
+        if (!isNearHandle(x, y, caret)) {
+            return false;
+        }
+        draggingCaretHandle = true;
+        draggingStartHandle = false;
+        draggingEndHandle = false;
+        pendingTouchPress = false;
+        longPressTriggered = false;
+        handleDragFixedLine = -1;
+        handleDragFixedColumn = -1;
+        handleDragPointerOffsetX = x - caret.x;
+        handleDragPointerOffsetY = y - caret.y;
+        touchScrollVelocityX = 0f;
+        touchScrollVelocityY = 0f;
+        showTransientCaretHandle();
+        return true;
+    }
+
     private boolean isNearHandle(float x, float y, HandlePlacement handle) {
         if (handle == null) {
             return false;
         }
-        float dx = x - handle.x;
-        float dy = y - handle.y;
+        float dx = x - handle.hitX;
+        float dy = y - handle.hitY;
         float radius = style.selectionHandleRadius * style.selectionHandleTouchRadiusMultiplier;
         return dx * dx + dy * dy <= radius * radius;
+    }
+
+    private boolean isNearAnyHandle(float x, float y) {
+        SelectionRange selection = getSelectionRange();
+        if (selection != null) {
+            HandlePlacement start = getHandlePlacement(selection.startLine, selection.startColumn, false);
+            HandlePlacement end = getHandlePlacement(selection.endLine, selection.endColumn, true);
+            return (isHandleVisibleWithinEditorBounds(start) && isNearHandle(x, y, start))
+                || (isHandleVisibleWithinEditorBounds(end) && isNearHandle(x, y, end));
+        }
+        HandlePlacement caret = getCaretHandlePlacement();
+        return isHandleVisibleWithinEditorBounds(caret) && isNearHandle(x, y, caret);
+    }
+
+    private void updateAnyHandleDrag(float x, float y) {
+        if (draggingCaretHandle) {
+            updateCaretHandleDrag(x, y);
+            return;
+        }
+        updateSelectionHandleDrag(x, y);
     }
 
     private void updateSelectionHandleDrag(float x, float y) {
         if (handleDragFixedLine < 0) {
             return;
         }
-        CodePoint point = getCodePointAt(x, y, true);
+        CodePoint point = getCodePointAt(x - handleDragPointerOffsetX, y - handleDragPointerOffsetY, true);
         if (point == null) {
             return;
         }
@@ -2342,6 +3056,20 @@ public class CodeEditor extends Widget {
         selectionAnchorColumn = handleDragFixedColumn;
         document.moveCursorTo(point.line, point.column);
         ensureCursorVisible();
+        refreshBlink();
+    }
+
+    private void updateCaretHandleDrag(float x, float y) {
+        CodePoint point = getCodePointAt(x - handleDragPointerOffsetX, y - handleDragPointerOffsetY, true);
+        if (point == null) {
+            return;
+        }
+
+        selectionAnchorLine = -1;
+        selectionAnchorColumn = -1;
+        document.moveCursorTo(point.line, point.column);
+        ensureCursorVisible();
+        showTransientCaretHandle();
         refreshBlink();
     }
 
@@ -2375,6 +3103,10 @@ public class CodeEditor extends Widget {
             return null;
         }
         if (line < hiddenLines.length && hiddenLines[line]) {
+            FoldRegion containingRegion = findContainingRegion(line);
+            if (isCollapsedSuffixCursorVisible(containingRegion, line, column)) {
+                return getCollapsedSuffixCursorPlacement(containingRegion, column);
+            }
             return null;
         }
 
@@ -2385,6 +3117,27 @@ public class CodeEditor extends Widget {
         float x = getTextStartX() + layout.measureRange(start, safeColumn) - scrollX;
         int row = visualRowStart[line] + segment;
         return new CursorPlacement(row, x);
+    }
+
+    private CursorPlacement getCollapsedSuffixCursorPlacement(FoldRegion region, int column) {
+        if (region == null || !region.collapsed || region.startLine < 0 || region.startLine >= lineLayouts.size) {
+            return null;
+        }
+        CollapsedFoldDisplay display = getCollapsedFoldDisplay(region);
+        if (!display.hasSuffix()) {
+            return null;
+        }
+        LineLayout startLayout = lineLayouts.get(region.startLine);
+        if (startLayout.getVisualRowCount() <= 0) {
+            return null;
+        }
+        int start = startLayout.segmentStarts.get(0);
+        int end = startLayout.segmentEnds.get(0);
+        int safeColumn = Math.max(display.suffixStart, Math.min(column, lineLayouts.get(region.endLine).text.length()));
+        float x = getCollapsedFoldDisplayX(startLayout, start, end)
+            + measureText(display.placeholderText)
+            + lineLayouts.get(region.endLine).measureRange(display.suffixStart, safeColumn);
+        return new CursorPlacement(visualRowStart[region.startLine], x);
     }
 
     private FoldRegion findRelevantRegion(int line) {
@@ -2514,6 +3267,8 @@ public class CodeEditor extends Widget {
         if (scrollX != previousScrollX || scrollY != previousScrollY) {
             if (draggingSelectedText) {
                 updateSelectedTextDrag(lastDragX, lastDragY);
+            } else if (draggingCaretHandle) {
+                updateCaretHandleDrag(lastDragX, lastDragY);
             } else if (draggingStartHandle || draggingEndHandle) {
                 updateSelectionHandleDrag(lastDragX, lastDragY);
             } else {
@@ -2530,7 +3285,16 @@ public class CodeEditor extends Widget {
             return;
         }
 
-        applyTouchScrollDelta(touchScrollVelocityX * delta, touchScrollVelocityY * delta);
+        float deltaX = touchScrollVelocityX * delta;
+        float deltaY = touchScrollVelocityY * delta;
+        if (touchScrollAxisLock == TOUCH_SCROLL_AXIS_HORIZONTAL) {
+            deltaY = 0f;
+            touchScrollVelocityY = 0f;
+        } else if (touchScrollAxisLock == TOUCH_SCROLL_AXIS_VERTICAL) {
+            deltaX = 0f;
+            touchScrollVelocityX = 0f;
+        }
+        applyTouchScrollDelta(deltaX, deltaY);
         suppressOutwardFlingAtBounds();
 
         float damping = Math.max(0f, 1f - TOUCH_FLING_DAMPING * delta);
@@ -2622,6 +3386,78 @@ public class CodeEditor extends Widget {
             return Math.min(max + TOUCH_OVERSCROLL_LIMIT, max + (next - max) * TOUCH_OVERSCROLL_DAMPING);
         }
         return next;
+    }
+
+    private void drawTintedRect(Batch batch, float x, float y, float width, float height, Color color) {
+        if (width <= 0f || height <= 0f || style.whitePixelTexture == null || color == null) {
+            return;
+        }
+        Color previous = batch.getColor();
+        float previousR = previous.r;
+        float previousG = previous.g;
+        float previousB = previous.b;
+        float previousA = previous.a;
+        batch.setColor(color);
+        batch.draw(style.whitePixelTexture, x, y, width, height);
+        batch.setColor(previousR, previousG, previousB, previousA);
+    }
+
+    private float stageUnitsFromCentimetersX(float centimeters) {
+        Stage stage = getStage();
+        if (stage == null) {
+            return centimeters * 38f;
+        }
+        float ppiX = getSafePpiX();
+        float pixels = centimeters * ppiX / 2.54f;
+        float stageUnitsPerPixel = stage.getWidth() / Math.max(1f, (float) Gdx.graphics.getWidth());
+        return pixels * stageUnitsPerPixel;
+    }
+
+    private float stageUnitsFromCentimetersY(float centimeters) {
+        Stage stage = getStage();
+        if (stage == null) {
+            return centimeters * 38f;
+        }
+        float ppiY = getSafePpiY();
+        float pixels = centimeters * ppiY / 2.54f;
+        float stageUnitsPerPixel = stage.getHeight() / Math.max(1f, (float) Gdx.graphics.getHeight());
+        return pixels * stageUnitsPerPixel;
+    }
+
+    private float getSafePpiX() {
+        float ppi = Gdx.graphics.getPpiX();
+        if (ppi > 0f) {
+            return ppi;
+        }
+        float density = Gdx.graphics.getDensity();
+        return density > 0f ? density * 160f : 96f;
+    }
+
+    private float getSafePpiY() {
+        float ppi = Gdx.graphics.getPpiY();
+        if (ppi > 0f) {
+            return ppi;
+        }
+        float density = Gdx.graphics.getDensity();
+        return density > 0f ? density * 160f : 96f;
+    }
+
+    private void resetTouchScrollAxisLock() {
+        touchScrollAxisLock = TOUCH_SCROLL_AXIS_NONE;
+    }
+
+    private void updateTouchScrollAxisLock(float x, float y) {
+        if (touchScrollAxisLock != TOUCH_SCROLL_AXIS_NONE) {
+            return;
+        }
+        float dx = x - touchDownX;
+        float dy = y - touchDownY;
+        if (dx * dx + dy * dy <= TOUCH_SLOP * TOUCH_SLOP) {
+            return;
+        }
+        touchScrollAxisLock = Math.abs(dx) >= Math.abs(dy)
+            ? TOUCH_SCROLL_AXIS_HORIZONTAL
+            : TOUCH_SCROLL_AXIS_VERTICAL;
     }
 
     private boolean isInVerticalScrollbarHitArea(float x, float y) {
@@ -3065,7 +3901,7 @@ public class CodeEditor extends Widget {
 
     private float glyphWidth(char character) {
         if (character == '\t') {
-            return glyphWidth(' ') * CodeDocument.INDENT_SIZE;
+            return getTabWidth();
         }
         if (glyphWidthCache.containsKey(character)) {
             return glyphWidthCache.get(character, style.font.getSpaceXadvance());
@@ -3087,10 +3923,6 @@ public class CodeEditor extends Widget {
         }
 
         char current = text.charAt(index);
-        if (current == '\t') {
-            return glyphWidth(' ') * CodeDocument.INDENT_SIZE;
-        }
-
         char next = index + 1 < text.length() ? text.charAt(index + 1) : 0;
         int cacheKey = (current << 16) | next;
         if (glyphAdvanceCache.containsKey(cacheKey)) {
@@ -3109,6 +3941,26 @@ public class CodeEditor extends Widget {
             advance = Math.max(1f, advance);
         }
         glyphAdvanceCache.put(cacheKey, advance);
+        return advance;
+    }
+
+    private float getTabWidth() {
+        return Math.max(1f, glyphWidth(' ') * CodeDocument.INDENT_SIZE);
+    }
+
+    private float getTabAdvanceAtWidth(float currentWidth) {
+        float tabWidth = getTabWidth();
+        if (tabWidth <= 0f) {
+            return 0f;
+        }
+        float remainder = currentWidth % tabWidth;
+        if (remainder < 0f) {
+            remainder += tabWidth;
+        }
+        float advance = tabWidth - remainder;
+        if (advance < 0.5f) {
+            advance = tabWidth;
+        }
         return advance;
     }
 
@@ -3298,18 +4150,22 @@ public class CodeEditor extends Widget {
         pinchZooming = true;
         pinchInitialDistance = distance;
         pinchInitialScale = zoomScale;
+        resetTouchScrollAxisLock();
         pendingTouchPress = false;
         longPressTriggered = false;
         draggingTouchScroll = false;
         draggingSelection = false;
         draggingStartHandle = false;
         draggingEndHandle = false;
+        draggingCaretHandle = false;
         draggingScrollbar = false;
         draggingHorizontalScrollbar = false;
         touchScrollVelocityX = 0f;
         touchScrollVelocityY = 0f;
         handleDragFixedLine = -1;
         handleDragFixedColumn = -1;
+        handleDragPointerOffsetX = 0f;
+        handleDragPointerOffsetY = 0f;
     }
 
     private void updatePinchZoom() {
@@ -3420,7 +4276,58 @@ public class CodeEditor extends Widget {
         return first == second || (first != null && second != null && first.toIntBits() == second.toIntBits());
     }
 
+    private CollapsedFoldDisplay buildCollapsedFoldDisplay(FoldRegion region, String placeholderText) {
+        if (region == null) {
+            return new CollapsedFoldDisplay(placeholderText, "", -1, -1, -1);
+        }
+        int trimStart = leadingTrimIndex(region.endText);
+        if (trimStart >= region.endText.length()) {
+            return new CollapsedFoldDisplay(placeholderText, "", -1, -1, -1);
+        }
+        String trimmedEnd = region.endText.substring(trimStart).trim();
+        if (!looksLikeFoldClosingSuffix(trimmedEnd)) {
+            return new CollapsedFoldDisplay(placeholderText, "", -1, -1, -1);
+        }
+
+        int sourceStart = trimStart;
+        int maxSuffixLength = 48;
+        int sourceEnd = Math.min(region.endText.length(), sourceStart + maxSuffixLength);
+        String shownSuffix = region.endText.substring(sourceStart, sourceEnd).trim();
+        if (shownSuffix.isEmpty()) {
+            return new CollapsedFoldDisplay(placeholderText, "", -1, -1, -1);
+        }
+
+        return new CollapsedFoldDisplay(placeholderText, shownSuffix, region.endLine, sourceStart, sourceStart + shownSuffix.length());
+    }
+
+    private static boolean looksLikeFoldClosingSuffix(String text) {
+        if (text == null || text.isEmpty()) {
+            return false;
+        }
+        return text.startsWith("}")
+            || text.startsWith("]")
+            || text.startsWith(")")
+            || text.startsWith("</")
+            || text.startsWith("*/")
+            || text.startsWith("?>");
+    }
+
+    private static int leadingTrimIndex(String text) {
+        if (text == null) {
+            return 0;
+        }
+        int index = 0;
+        while (index < text.length() && Character.isWhitespace(text.charAt(index))) {
+            index++;
+        }
+        return index;
+    }
+
     private static int clamp(int value, int min, int max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    private static float clamp(float value, float min, float max) {
         return Math.max(min, Math.min(max, value));
     }
 
@@ -3439,12 +4346,16 @@ public class CodeEditor extends Widget {
         final int endLine;
         final int depth;
         final String key;
+        final String startText;
+        final String endText;
         boolean collapsed;
 
         FoldRegion(int startLine, int endLine, int depth, Array<String> lines) {
             this.startLine = startLine;
             this.endLine = endLine;
             this.depth = depth;
+            this.startText = startLine >= 0 && startLine < lines.size ? lines.get(startLine) : "";
+            this.endText = endLine >= 0 && endLine < lines.size ? lines.get(endLine) : "";
             this.key = startLine + ":" + sanitize(lines.get(startLine)) + "->" + sanitize(lines.get(endLine)) + ":" + depth;
         }
 
@@ -3498,7 +4409,11 @@ public class CodeEditor extends Widget {
             }
             prefixWidths = new float[text.length() + 1];
             for (int i = 0; i < text.length(); i++) {
-                prefixWidths[i + 1] = prefixWidths[i] + editor.glyphAdvance(text, i);
+                char current = text.charAt(i);
+                float advance = current == '\t'
+                    ? editor.getTabAdvanceAtWidth(prefixWidths[i])
+                    : editor.glyphAdvance(text, i);
+                prefixWidths[i + 1] = prefixWidths[i] + advance;
             }
         }
 
@@ -3540,6 +4455,26 @@ public class CodeEditor extends Widget {
         SearchMatchRef(int line, SearchMatch match) {
             this.line = line;
             this.match = match;
+        }
+    }
+
+    private static final class CollapsedFoldDisplay {
+        final String placeholderText;
+        final String suffixText;
+        final int suffixLine;
+        final int suffixStart;
+        final int suffixEnd;
+
+        CollapsedFoldDisplay(String placeholderText, String suffixText, int suffixLine, int suffixStart, int suffixEnd) {
+            this.placeholderText = placeholderText == null ? "" : placeholderText;
+            this.suffixText = suffixText == null ? "" : suffixText;
+            this.suffixLine = suffixLine;
+            this.suffixStart = suffixStart;
+            this.suffixEnd = suffixEnd;
+        }
+
+        boolean hasSuffix() {
+            return !suffixText.isEmpty() && suffixStart >= 0 && suffixEnd > suffixStart;
         }
     }
 
@@ -3596,10 +4531,18 @@ public class CodeEditor extends Widget {
     private static final class HandlePlacement {
         final float x;
         final float y;
+        final float drawX;
+        final float drawY;
+        final float hitX;
+        final float hitY;
 
-        HandlePlacement(float x, float y) {
+        HandlePlacement(float x, float y, float drawX, float drawY, float hitX, float hitY) {
             this.x = x;
             this.y = y;
+            this.drawX = drawX;
+            this.drawY = drawY;
+            this.hitX = hitX;
+            this.hitY = hitY;
         }
     }
 
@@ -3633,7 +4576,54 @@ public class CodeEditor extends Widget {
         TYPE
     }
 
+    private final class SelectionHandleOverlay extends Actor {
+        SelectionHandleOverlay() {
+            setTouchable(com.badlogic.gdx.scenes.scene2d.Touchable.enabled);
+            addListener(new InputListener() {
+                @Override
+                public boolean touchDown(InputEvent event, float x, float y, int pointer, int button) {
+                    if (!shouldHandleOverlayTouch(button) || !isStagePositionNearSelectionHandle(x, y)) {
+                        return false;
+                    }
+                    return beginSelectionHandleOverlayDrag(x, y);
+                }
+
+                @Override
+                public void touchDragged(InputEvent event, float x, float y, int pointer) {
+                    updateSelectionHandleOverlayDrag(x, y);
+                }
+
+                @Override
+                public void touchUp(InputEvent event, float x, float y, int pointer, int button) {
+                    endSelectionHandleOverlayDrag();
+                }
+            });
+        }
+
+        @Override
+        public Actor hit(float x, float y, boolean touchable) {
+            if (!isVisible() || (touchable && getTouchable() != com.badlogic.gdx.scenes.scene2d.Touchable.enabled)) {
+                return null;
+            }
+            return isStagePositionNearSelectionHandle(x, y) ? this : null;
+        }
+
+        @Override
+        public void draw(Batch batch, float parentAlpha) {
+            if (!isVisible()) {
+                return;
+            }
+            Vector2 stageOrigin = getStageOrigin();
+            drawSelectionHandles(batch, stageOrigin.x, stageOrigin.y);
+        }
+
+        private boolean shouldHandleOverlayTouch(int button) {
+            return useTouchInteractions() && button == Input.Buttons.LEFT;
+        }
+    }
+
     public static class CodeEditorStyle {
+        private final Array<Texture> ownedTextures = new Array<>();
         public BitmapFont font;
         public Color fontColor = new Color(0.85f, 0.89f, 0.94f, 1f);
         public Color disabledFontColor = new Color(0.48f, 0.54f, 0.61f, 1f);
@@ -3659,6 +4649,10 @@ public class CodeEditor extends Widget {
         public Drawable searchHighlight;
         public Drawable currentSearchHighlight;
         public Drawable selectionHandle;
+        public Drawable selectionHandleStart;
+        public Drawable selectionHandleEnd;
+        public Drawable selectionHandleCaret;
+        public Drawable magnifierBackground;
         public Drawable bracketMatch;
         public Drawable guide;
         public Drawable foldExpanded;
@@ -3691,8 +4685,15 @@ public class CodeEditor extends Widget {
         public float foldBadgeVerticalPadding = DEFAULT_FOLD_BADGE_VERTICAL_PADDING;
         public float selectionHandleRadius = DEFAULT_SELECTION_HANDLE_RADIUS;
         public float selectionHandleTouchRadiusMultiplier = DEFAULT_SELECTION_HANDLE_TOUCH_RADIUS_MULTIPLIER;
+        public float magnifierWidth = 0f;
+        public float magnifierHeight = 0f;
+        public float magnifierContentPadding = 0f;
 
         public CodeEditorStyle() {
+        }
+
+        public static ThemeBuilder theme(BitmapFont font) {
+            return new ThemeBuilder(font);
         }
 
         public CodeEditorStyle(CodeEditorStyle style) {
@@ -3721,6 +4722,10 @@ public class CodeEditor extends Widget {
             this.searchHighlight = style.searchHighlight;
             this.currentSearchHighlight = style.currentSearchHighlight;
             this.selectionHandle = style.selectionHandle;
+            this.selectionHandleStart = style.selectionHandleStart;
+            this.selectionHandleEnd = style.selectionHandleEnd;
+            this.selectionHandleCaret = style.selectionHandleCaret;
+            this.magnifierBackground = style.magnifierBackground;
             this.bracketMatch = style.bracketMatch;
             this.guide = style.guide;
             this.foldExpanded = style.foldExpanded;
@@ -3753,6 +4758,527 @@ public class CodeEditor extends Widget {
             this.foldBadgeVerticalPadding = style.foldBadgeVerticalPadding;
             this.selectionHandleRadius = style.selectionHandleRadius;
             this.selectionHandleTouchRadiusMultiplier = style.selectionHandleTouchRadiusMultiplier;
+            this.magnifierWidth = style.magnifierWidth;
+            this.magnifierHeight = style.magnifierHeight;
+            this.magnifierContentPadding = style.magnifierContentPadding;
+        }
+
+        public void disposeGeneratedResources() {
+            for (Texture texture : ownedTextures) {
+                if (texture != null) {
+                    texture.dispose();
+                }
+            }
+            ownedTextures.clear();
+        }
+
+        private void addOwnedTexture(Texture texture) {
+            if (texture != null && !ownedTextures.contains(texture, true)) {
+                ownedTextures.add(texture);
+            }
+        }
+
+        public static final class ThemeBuilder {
+            private final BitmapFont font;
+            private Texture whitePixelTexture;
+            private boolean ownsWhitePixelTexture;
+            private Drawable magnifierBackground;
+            private final Color accentColor = new Color(0.274f, 0.561f, 0.898f, 1f);
+            private final Color backgroundColor = new Color(0.055f, 0.078f, 0.109f, 1f);
+            private final Color gutterColor = new Color(0.028f, 0.039f, 0.051f, 1f);
+            private final Color gutterDividerColor = new Color(0.204f, 0.294f, 0.392f, 1f);
+            private final Color textColor = new Color(0.93f, 0.96f, 0.99f, 1f);
+            private final Color gutterTextColor = new Color(0.64f, 0.72f, 0.8f, 1f);
+            private final Color messageTextColor = new Color(0.54f, 0.64f, 0.74f, 1f);
+            private final Color disabledTextColor = new Color(0.55f, 0.61f, 0.68f, 1f);
+            private final Color magnifierBackgroundColor = new Color(0.96f, 0.98f, 1f, 0.98f);
+            private float scrollbarWidth = -1f;
+            private float selectionHandleRadius = -1f;
+            private float textBaselineOffset = -6f;
+            private float magnifierWidth = -1f;
+            private float magnifierHeight = -1f;
+
+            ThemeBuilder(BitmapFont font) {
+                if (font == null) {
+                    throw new IllegalArgumentException("font cannot be null");
+                }
+                this.font = font;
+            }
+
+            public ThemeBuilder themeColor(Color color) {
+                if (color == null) {
+                    return this;
+                }
+                accentColor.set(color);
+                return this;
+            }
+
+            public ThemeBuilder backgroundColor(Color color) {
+                if (color == null) {
+                    return this;
+                }
+                backgroundColor.set(color);
+                return this;
+            }
+
+            public ThemeBuilder gutterColor(Color color) {
+                if (color == null) {
+                    return this;
+                }
+                gutterColor.set(color);
+                return this;
+            }
+
+            public ThemeBuilder textColor(Color color) {
+                if (color == null) {
+                    return this;
+                }
+                textColor.set(color);
+                return this;
+            }
+
+            public ThemeBuilder gutterTextColor(Color color) {
+                if (color == null) {
+                    return this;
+                }
+                gutterTextColor.set(color);
+                return this;
+            }
+
+            public ThemeBuilder scrollbarWidth(float scrollbarWidth) {
+                this.scrollbarWidth = Math.max(4f, scrollbarWidth);
+                return this;
+            }
+
+            public ThemeBuilder selectionHandleRadius(float selectionHandleRadius) {
+                this.selectionHandleRadius = Math.max(6f, selectionHandleRadius);
+                return this;
+            }
+
+            public ThemeBuilder textBaselineOffset(float textBaselineOffset) {
+                this.textBaselineOffset = textBaselineOffset;
+                return this;
+            }
+
+            public ThemeBuilder whitePixelTexture(Texture whitePixelTexture) {
+                this.whitePixelTexture = whitePixelTexture;
+                this.ownsWhitePixelTexture = false;
+                return this;
+            }
+
+            public ThemeBuilder magnifierWidth(float magnifierWidth) {
+                this.magnifierWidth = Math.max(24f, magnifierWidth);
+                return this;
+            }
+
+            public ThemeBuilder magnifierHeight(float magnifierHeight) {
+                this.magnifierHeight = Math.max(24f, magnifierHeight);
+                return this;
+            }
+
+            public ThemeBuilder magnifierBackgroundColor(Color color) {
+                if (color != null) {
+                    this.magnifierBackgroundColor.set(color);
+                }
+                return this;
+            }
+
+            public ThemeBuilder magnifierBackground(Drawable magnifierBackground) {
+                this.magnifierBackground = magnifierBackground;
+                return this;
+            }
+
+            public CodeEditorStyle build() {
+                CodeEditorStyle style = new CodeEditorStyle();
+                style.font = font;
+
+                Texture pixel = whitePixelTexture;
+                if (pixel == null) {
+                    pixel = createWhitePixelTexture();
+                    ownsWhitePixelTexture = true;
+                }
+
+                style.whitePixelTexture = pixel;
+                if (ownsWhitePixelTexture) {
+                    style.addOwnedTexture(pixel);
+                }
+
+                float fontLineHeight = Math.max(12f, font.getLineHeight());
+                float derivedScrollbarWidth = scrollbarWidth > 0f
+                    ? scrollbarWidth
+                    : Math.max(6f, Math.round(fontLineHeight * 0.26f));
+                float derivedHandleRadius = selectionHandleRadius > 0f
+                    ? selectionHandleRadius
+                    : Math.max(6f, centimetersToUiUnits(0.15f));
+                float derivedMagnifierHeight = magnifierHeight > 0f ? magnifierHeight : 0f;
+                float derivedMagnifierWidth = magnifierWidth > 0f ? magnifierWidth : 0f;
+                float derivedMagnifierPadding = Math.max(4f, fontLineHeight * 0.18f);
+                float derivedFoldIndicatorSize = Math.max(10f, fontLineHeight * 0.42f);
+                float derivedRowPadding = Math.max(5f, fontLineHeight * 0.22f);
+                float derivedTextPadding = Math.max(12f, fontLineHeight * 0.7f);
+                float derivedGutterPadding = Math.max(6f, fontLineHeight * 0.32f);
+                float derivedFoldGap = Math.max(8f, fontLineHeight * 0.36f);
+                float derivedFoldRightPadding = Math.max(7f, fontLineHeight * 0.3f);
+                float derivedGutterMinWidth = Math.max(40f, fontLineHeight * 2.4f);
+
+                Color focusedBackground = mix(backgroundColor, accentColor, 0.045f, 1f);
+                Color disabledBackground = mix(backgroundColor, Color.BLACK, 0.22f, 1f);
+                Color currentLineColor = mix(backgroundColor, accentColor, 0.14f, 1f);
+                Color currentBlockColor = mix(backgroundColor, accentColor, 0.15f, 0.72f);
+                Color selectionColor = mix(accentColor, Color.WHITE, 0.08f, 0.58f);
+                Color searchColor = mix(accentColor, new Color(1f, 0.82f, 0.33f, 1f), 0.72f, 0.26f);
+                Color currentSearchColor = mix(accentColor, new Color(1f, 0.86f, 0.42f, 1f), 0.72f, 0.54f);
+                Color guideColor = mix(accentColor, backgroundColor, 0.42f, 0.18f);
+                Color bracketMatchColor = mix(accentColor, new Color(1f, 0.82f, 0.36f, 1f), 0.45f, 0.34f);
+                Color scrollbarTrackColor = mix(backgroundColor, Color.BLACK, 0.12f, 1f);
+                Color scrollbarKnobColor = mix(accentColor, backgroundColor, 0.36f, 1f);
+                Color foldBadgeColor = mix(backgroundColor, accentColor, 0.24f, 1f);
+                Color gutterDivider = mix(gutterDividerColor, accentColor, 0.18f, 1f);
+
+                style.background = createSolidDrawable(pixel, backgroundColor);
+                style.focusedBackground = createSolidDrawable(pixel, focusedBackground);
+                style.disabledBackground = createSolidDrawable(pixel, disabledBackground);
+                style.gutterBackground = createGutterDrawable(pixel, gutterColor, gutterDivider, 2f);
+                style.currentBlock = createSolidDrawable(pixel, currentBlockColor);
+                style.currentLine = createSolidDrawable(pixel, currentLineColor);
+                style.cursor = createSolidDrawable(pixel, accentColor);
+                style.selection = createSolidDrawable(pixel, selectionColor);
+                style.searchHighlight = createSolidDrawable(pixel, searchColor);
+                style.currentSearchHighlight = createSolidDrawable(pixel, currentSearchColor);
+                style.selectionHandleStart = createCornerSelectionHandleDrawable(
+                    pixel,
+                    HANDLE_CORNER_TOP_RIGHT,
+                    accentColor
+                );
+                style.selectionHandleEnd = createCornerSelectionHandleDrawable(
+                    pixel,
+                    HANDLE_CORNER_TOP_LEFT,
+                    accentColor
+                );
+                style.selectionHandleCaret = createCornerSelectionHandleDrawable(pixel,HANDLE_CORNER_TOP_CENTER, accentColor);
+                style.selectionHandle = style.selectionHandleEnd;
+                style.magnifierBackground = magnifierBackground != null
+                    ? magnifierBackground
+                    : createRoundedRectDrawable(pixel, magnifierBackgroundColor, Math.max(8f, fontLineHeight * 0.45f));
+                style.bracketMatch = createSolidDrawable(pixel, bracketMatchColor);
+                style.guide = createSolidDrawable(pixel, guideColor);
+                style.foldExpanded = createChevronDrawable(pixel, false, mix(textColor, accentColor, 0.18f, 1f));
+                style.foldCollapsed = createChevronDrawable(pixel, true, mix(textColor, accentColor, 0.18f, 1f));
+                style.scrollbarTrack = createSolidDrawable(pixel, scrollbarTrackColor);
+                style.scrollbarKnob = createSolidDrawable(pixel, scrollbarKnobColor);
+                style.foldBadge = createSolidDrawable(pixel, foldBadgeColor);
+
+                style.fontColor = new Color(textColor);
+                style.gutterFontColor = new Color(gutterTextColor);
+                style.messageFontColor = new Color(messageTextColor);
+                style.disabledFontColor = new Color(disabledTextColor);
+                style.keywordColor = mix(accentColor, new Color(0.29f, 0.75f, 0.98f, 1f), 0.58f, 1f);
+                style.typeColor = mix(accentColor, new Color(0.52f, 0.86f, 0.64f, 1f), 0.28f, 1f);
+                style.stringColor = new Color(0.984f, 0.63f, 0.396f, 1f);
+                style.commentColor = new Color(0.486f, 0.588f, 0.486f, 1f);
+                style.numberColor = new Color(0.914f, 0.761f, 0.384f, 1f);
+                style.annotationColor = mix(accentColor, new Color(0.965f, 0.522f, 0.722f, 1f), 0.32f, 1f);
+                style.literalColor = mix(accentColor, new Color(0.875f, 0.506f, 0.506f, 1f), 0.26f, 1f);
+
+                style.scrollbarWidth = derivedScrollbarWidth;
+                style.scrollbarHitWidth = Math.max(style.scrollbarWidth * 2.5f, DEFAULT_SCROLLBAR_HIT_WIDTH);
+                style.scrollbarMinThumbSize = Math.max(24f, derivedScrollbarWidth * 3f);
+                style.selectionHandleRadius = derivedHandleRadius;
+                style.selectionHandleTouchRadiusMultiplier = Math.max(1.8f, derivedHandleRadius / 6f);
+                style.magnifierWidth = derivedMagnifierWidth;
+                style.magnifierHeight = derivedMagnifierHeight;
+                style.magnifierContentPadding = derivedMagnifierPadding;
+                style.foldIndicatorSize = derivedFoldIndicatorSize;
+                style.textBaselineOffset = textBaselineOffset;
+                style.gutterMinWidth = derivedGutterMinWidth;
+                style.gutterLeftPadding = derivedGutterPadding;
+                style.gutterFoldIndicatorGap = derivedFoldGap;
+                style.foldIndicatorRightPadding = derivedFoldRightPadding;
+                style.textLeftPadding = derivedTextPadding;
+                style.textRightPadding = Math.max(derivedTextPadding + 6f, fontLineHeight * 1.02f);
+                style.rowPadding = derivedRowPadding;
+                style.guideSpacing = DEFAULT_GUIDE_SPACING;
+                style.guideOffsetX = DEFAULT_GUIDE_OFFSET_X;
+                return style;
+            }
+
+            private static Texture createWhitePixelTexture() {
+                Pixmap pixmap = new Pixmap(1, 1, Pixmap.Format.RGBA8888);
+                pixmap.setColor(Color.WHITE);
+                pixmap.fill();
+                Texture texture = new Texture(pixmap);
+                pixmap.dispose();
+                return texture;
+            }
+
+            private static float centimetersToUiUnits(float centimeters) {
+                float ppiX = Gdx.graphics.getPpiX();
+                float ppiY = Gdx.graphics.getPpiY();
+                float ppi;
+                if (ppiX > 0f && ppiY > 0f) {
+                    ppi = (ppiX + ppiY) * 0.5f;
+                } else {
+                    float density = Gdx.graphics.getDensity();
+                    ppi = density > 0f ? density * 160f : 96f;
+                }
+                return centimeters * ppi / 2.54f;
+            }
+
+            private static Color mix(Color first, Color second, float secondAmount, float alpha) {
+                float clamped = Math.max(0f, Math.min(1f, secondAmount));
+                return new Color(
+                    first.r + (second.r - first.r) * clamped,
+                    first.g + (second.g - first.g) * clamped,
+                    first.b + (second.b - first.b) * clamped,
+                    alpha
+                );
+            }
+
+            private static Drawable createSolidDrawable(final Texture pixel, final Color color) {
+                final Color tint = new Color(color);
+                return new BaseDrawable() {
+                    @Override
+                    public void draw(Batch batch, float x, float y, float width, float height) {
+                        Color previous = batch.getColor();
+                        float previousR = previous.r;
+                        float previousG = previous.g;
+                        float previousB = previous.b;
+                        float previousA = previous.a;
+                        batch.setColor(tint);
+                        batch.draw(pixel, x, y, width, height);
+                        batch.setColor(previousR, previousG, previousB, previousA);
+                    }
+                };
+            }
+
+            private static Drawable createRoundedRectDrawable(final Texture pixel, final Color color, final float radius) {
+                final Color tint = new Color(color);
+                return new BaseDrawable() {
+                    @Override
+                    public void draw(Batch batch, float x, float y, float width, float height) {
+                        float clampedRadius = Math.max(1f, Math.min(Math.min(width, height) * 0.5f, radius));
+                        float centerWidth = Math.max(0f, width - clampedRadius * 2f);
+                        float centerHeight = Math.max(0f, height - clampedRadius * 2f);
+                        drawRect(batch, pixel, x + clampedRadius, y, centerWidth, height, tint);
+                        drawRect(batch, pixel, x, y + clampedRadius, clampedRadius, centerHeight, tint);
+                        drawRect(batch, pixel, x + width - clampedRadius, y + clampedRadius, clampedRadius, centerHeight, tint);
+                        drawCircle(batch, pixel, x + clampedRadius, y + clampedRadius, clampedRadius, tint);
+                        drawCircle(batch, pixel, x + width - clampedRadius, y + clampedRadius, clampedRadius, tint);
+                        drawCircle(batch, pixel, x + clampedRadius, y + height - clampedRadius, clampedRadius, tint);
+                        drawCircle(batch, pixel, x + width - clampedRadius, y + height - clampedRadius, clampedRadius, tint);
+                    }
+                };
+            }
+
+            private static Drawable createGutterDrawable(final Texture pixel, final Color fillColor, final Color borderColor, final float borderWidth) {
+                final Color fill = new Color(fillColor);
+                final Color border = new Color(borderColor);
+                return new BaseDrawable() {
+                    @Override
+                    public void draw(Batch batch, float x, float y, float width, float height) {
+                        Color previous = batch.getColor();
+                        float previousR = previous.r;
+                        float previousG = previous.g;
+                        float previousB = previous.b;
+                        float previousA = previous.a;
+                        batch.setColor(fill);
+                        batch.draw(pixel, x, y, width, height);
+                        float actualBorder = Math.max(1f, Math.min(borderWidth, width));
+                        batch.setColor(border);
+                        batch.draw(pixel, x + width - actualBorder, y, actualBorder, height);
+                        batch.setColor(previousR, previousG, previousB, previousA);
+                    }
+                };
+            }
+
+            private static Drawable createChevronDrawable(final Texture pixel, final boolean collapsed, final Color color) {
+                final Color tint = new Color(color);
+                return new BaseDrawable() {
+                    {
+                        setMinWidth(12f);
+                        setMinHeight(12f);
+                    }
+
+                    @Override
+                    public void draw(Batch batch, float x, float y, float width, float height) {
+                        float thickness = Math.max(1.35f, Math.min(width, height) * 0.14f);
+                        if (collapsed) {
+                            drawSegment(batch, pixel, x + width * 0.34f, y + height * 0.22f, x + width * 0.7f, y + height * 0.5f, thickness, tint);
+                            drawSegment(batch, pixel, x + width * 0.34f, y + height * 0.78f, x + width * 0.7f, y + height * 0.5f, thickness, tint);
+                        } else {
+                            drawSegment(batch, pixel, x + width * 0.22f, y + height * 0.64f, x + width * 0.5f, y + height * 0.3f, thickness, tint);
+                            drawSegment(batch, pixel, x + width * 0.78f, y + height * 0.64f, x + width * 0.5f, y + height * 0.3f, thickness, tint);
+                        }
+                    }
+                };
+            }
+
+            private static Drawable createCornerSelectionHandleDrawable(
+                final Texture pixel,
+                final int cornerMode,
+                final Color outerColor
+            ) {
+                final Color outer = new Color(outerColor);
+                return new BaseDrawable() {
+                    @Override
+                    public void draw(Batch batch, float x, float y, float width, float height) {
+                        drawCornerBubbleHandle(batch, pixel, x, y, width, height, cornerMode, outer);
+                    }
+                };
+            }
+
+
+            private static void drawCornerBubbleHandle(
+                Batch batch,
+                Texture pixel,
+                float x,
+                float y,
+                float width,
+                float height,
+                int cornerMode,
+                Color color
+            ) {
+                float radius = Math.min(width, height) * 0.5f;
+                float centerX = x + width * 0.5f;
+                float centerY = y + height * 0.5f;
+                drawCircle(batch, pixel, centerX, centerY, radius, color);
+                if (cornerMode == HANDLE_CORNER_TOP_LEFT) {
+                    drawRect(batch, pixel, x, centerY, width * 0.5f, height * 0.5f, color);
+                } else if (cornerMode == HANDLE_CORNER_TOP_RIGHT) {
+                    drawRect(batch, pixel, centerX, centerY, width * 0.5f, height * 0.5f, color);
+                } else {
+                    float h= Math.round(Math.sqrt(width*width+height*height)/2);
+                    drawTriangle(batch, pixel, centerX,centerY+h, centerX-width*0.5f, centerY, centerX+width*0.5f, centerY, color);
+                }
+            }
+
+            private static void drawRect(Batch batch, Texture pixel, float x, float y, float width, float height, Color color) {
+                Color previous = batch.getColor();
+                float previousR = previous.r;
+                float previousG = previous.g;
+                float previousB = previous.b;
+                float previousA = previous.a;
+                batch.setColor(color);
+                batch.draw(pixel, x, y, width, height);
+                batch.setColor(previousR, previousG, previousB, previousA);
+            }
+
+            static float[] triangle = new float[4*5];
+            private static void drawTriangle(Batch batch, Texture pixel, float x1, float y1, float x2, float y2,float x3,float y3, Color color) {
+                Color previous = batch.getColor();
+                float previousR = previous.r;
+                float previousG = previous.g;
+                float previousB = previous.b;
+                float previousA = previous.a;
+                float colorFloatBits = color.toFloatBits();
+                float x4=(x2+x3)/2;
+                float y4=(y2+y3)/2;
+                batch.setColor(color);
+                triangle[0] = x1;
+                triangle[1] = y1;
+                triangle[2] = colorFloatBits;
+                triangle[3] = 0;
+                triangle[4] = 0;
+                triangle[5] = x2;
+                triangle[6] = y2;
+                triangle[7] = colorFloatBits;
+                triangle[8] = 0;
+                triangle[9] = 0;
+                triangle[10] = x4;
+                triangle[11] = y4;
+                triangle[12] = colorFloatBits;
+                triangle[13] = 0;
+                triangle[14] = 0;
+                triangle[15] = x3;
+                triangle[16] = y3;
+                triangle[17] = colorFloatBits;
+                triangle[18] = 0;
+                triangle[19] = 0;
+                batch.draw(pixel, triangle, 0, triangle.length);
+                batch.setColor(previousR, previousG, previousB, previousA);
+            }
+
+            private static void drawCircle(Batch batch, Texture pixel, float centerX, float centerY, float radius, Color color) {
+                if (radius <= 0f) {
+                    return;
+                }
+                Color previous = batch.getColor();
+                float previousR = previous.r;
+                float previousG = previous.g;
+                float previousB = previous.b;
+                float previousA = previous.a;
+                batch.setColor(color);
+                int steps = Math.max(8, Math.round(radius * 2.4f));
+                float diameter = radius * 2f;
+                float stripHeight = diameter / steps;
+                for (int i = 0; i < steps; i++) {
+                    float stripCenterY = centerY - radius + stripHeight * (i + 0.5f);
+                    float dy = stripCenterY - centerY;
+                    float halfWidth = (float) Math.sqrt(Math.max(0f, radius * radius - dy * dy));
+                    batch.draw(
+                        pixel,
+                        centerX - halfWidth,
+                        stripCenterY - stripHeight * 0.5f,
+                        halfWidth * 2f,
+                        stripHeight + 0.5f
+                    );
+                }
+                batch.setColor(previousR, previousG, previousB, previousA);
+            }
+
+            private static void drawSegment(Batch batch, Texture pixel, float x1, float y1, float x2, float y2, float thickness, Color color) {
+                Color previous = batch.getColor();
+                float previousR = previous.r;
+                float previousG = previous.g;
+                float previousB = previous.b;
+                float previousA = previous.a;
+                float dx = x2 - x1;
+                float dy = y2 - y1;
+                float length = (float) Math.sqrt(dx * dx + dy * dy);
+                float angle = (float) Math.toDegrees(Math.atan2(dy, dx));
+                batch.setColor(color);
+                batch.draw(
+                    pixel,
+                    x1,
+                    y1 - thickness * 0.5f,
+                    0f,
+                    thickness * 0.5f,
+                    length,
+                    thickness,
+                    1f,
+                    1f,
+                    angle,
+                    0,
+                    0,
+                    1,
+                    1,
+                    false,
+                    false
+                );
+                batch.setColor(previousR, previousG, previousB, previousA);
+            }
+        }
+    }
+
+    public interface FoldDisplayProvider {
+        String getCollapsedText(CodeEditor editor, FoldDisplayContext context);
+    }
+
+    public static final class FoldDisplayContext {
+        public final int startLine;
+        public final int endLine;
+        public final int depth;
+        public final int hiddenLineCount;
+        public final String startLineText;
+        public final String endLineText;
+
+        public FoldDisplayContext(int startLine, int endLine, int depth, String startLineText, String endLineText) {
+            this.startLine = startLine;
+            this.endLine = endLine;
+            this.depth = depth;
+            this.hiddenLineCount = Math.max(0, endLine - startLine);
+            this.startLineText = startLineText == null ? "" : startLineText;
+            this.endLineText = endLineText == null ? "" : endLineText;
         }
     }
 
@@ -3783,6 +5309,7 @@ public class CodeEditor extends Widget {
             lastDragY = y;
             touchDownX = x;
             touchDownY = y;
+            resetTouchScrollAxisLock();
             touchScrollVelocityX = 0f;
             touchScrollVelocityY = 0f;
             lastTouchDragTimeNanos = TimeUtils.nanoTime();
@@ -3793,15 +5320,18 @@ public class CodeEditor extends Widget {
             draggingSelectedText = false;
             draggingStartHandle = false;
             draggingEndHandle = false;
+            draggingCaretHandle = false;
             draggingHorizontalScrollbar = false;
             handleDragFixedLine = -1;
             handleDragFixedColumn = -1;
+            handleDragPointerOffsetX = 0f;
+            handleDragPointerOffsetY = 0f;
 
             if (!touchInteraction && button == Input.Buttons.RIGHT) {
                 return notifySecondaryClick(x, y);
             }
 
-            if (touchInteraction && beginHandleDrag(x, y)) {
+            if (touchInteraction && beginAnyHandleDrag(x, y)) {
                 return true;
             }
 
@@ -3820,6 +5350,7 @@ public class CodeEditor extends Widget {
                 clearSelection();
                 if (isInsideGutter(x) || touchInteraction) {
                     draggingTouchScroll = true;
+                    resetTouchScrollAxisLock();
                 }
                 return true;
             }
@@ -3831,8 +5362,11 @@ public class CodeEditor extends Widget {
                 toggleFold(region);
                 return true;
             }
-            if (segment == 0 && region != null && region.collapsed) {
+            if (segment == 0 && region != null && region.collapsed
+                && isInsideCollapsedFoldDisplayHitArea(x, y, row, lineLayouts.get(line), lineLayouts.get(line).segmentStarts.get(segment), lineLayouts.get(line).segmentEnds.get(segment), region)) {
                 expandCollapsedRegion(region);
+                refreshBlink();
+                return true;
             }
 
             if (touchInteraction) {
@@ -3844,6 +5378,7 @@ public class CodeEditor extends Widget {
             if (isInsideGutter(x)) {
                 clearSelection();
                 draggingTouchScroll = true;
+                resetTouchScrollAxisLock();
                 return true;
             }
 
@@ -4101,8 +5636,8 @@ public class CodeEditor extends Widget {
                 }
                 return;
             }
-            if (draggingStartHandle || draggingEndHandle) {
-                updateSelectionHandleDrag(x, y);
+            if (draggingStartHandle || draggingEndHandle || draggingCaretHandle) {
+                updateAnyHandleDrag(x, y);
                 return;
             }
             if (pendingSelectionMove) {
@@ -4126,19 +5661,31 @@ public class CodeEditor extends Widget {
                 if (dx * dx + dy * dy > TOUCH_SLOP * TOUCH_SLOP) {
                     pendingTouchPress = false;
                     draggingTouchScroll = true;
+                    resetTouchScrollAxisLock();
                     touchScrollVelocityX = 0f;
                     touchScrollVelocityY = 0f;
                 }
             }
             if (draggingTouchScroll) {
+                updateTouchScrollAxisLock(x, y);
                 float scrollDeltaX = -(x - previousDragX);
                 float scrollDeltaY = y - previousDragY;
+                if (touchScrollAxisLock == TOUCH_SCROLL_AXIS_HORIZONTAL) {
+                    scrollDeltaY = 0f;
+                } else if (touchScrollAxisLock == TOUCH_SCROLL_AXIS_VERTICAL) {
+                    scrollDeltaX = 0f;
+                }
                 float scrollBeforeX = scrollX;
                 float scrollBeforeY = scrollY;
                 applyTouchScrollDelta(scrollDeltaX, scrollDeltaY);
                 float elapsedSeconds = Math.max(0.001f, (nowNanos - previousTimeNanos) / 1_000_000_000f);
                 float sampledVelocityX = (scrollX - scrollBeforeX) / elapsedSeconds;
                 float sampledVelocityY = (scrollY - scrollBeforeY) / elapsedSeconds;
+                if (touchScrollAxisLock == TOUCH_SCROLL_AXIS_HORIZONTAL) {
+                    sampledVelocityY = 0f;
+                } else if (touchScrollAxisLock == TOUCH_SCROLL_AXIS_VERTICAL) {
+                    sampledVelocityX = 0f;
+                }
                 touchScrollVelocityX = touchScrollVelocityX * 0.25f + sampledVelocityX * 0.75f;
                 touchScrollVelocityY = touchScrollVelocityY * 0.25f + sampledVelocityY * 0.75f;
                 return;
@@ -4162,9 +5709,13 @@ public class CodeEditor extends Widget {
                 pendingTouchPress = false;
                 longPressTriggered = false;
                 draggingTouchScroll = false;
+                resetTouchScrollAxisLock();
                 draggingSelection = false;
                 draggingStartHandle = false;
                 draggingEndHandle = false;
+                draggingCaretHandle = false;
+                handleDragPointerOffsetX = 0f;
+                handleDragPointerOffsetY = 0f;
                 clearSelectedTextDragState();
                 draggingScrollbar = false;
                 draggingHorizontalScrollbar = false;
@@ -4172,7 +5723,7 @@ public class CodeEditor extends Widget {
                 touchScrollVelocityY = 0f;
                 return;
             }
-            boolean handleDrag = draggingStartHandle || draggingEndHandle;
+            boolean handleDrag = draggingStartHandle || draggingEndHandle || draggingCaretHandle;
             boolean selectedTextDrag = draggingSelectedText;
             boolean pendingSelectionMoveTap = pendingSelectionMove;
             boolean shouldFling = draggingTouchScroll
@@ -4188,11 +5739,15 @@ public class CodeEditor extends Widget {
             draggingScrollbar = false;
             draggingHorizontalScrollbar = false;
             draggingTouchScroll = false;
+            resetTouchScrollAxisLock();
             draggingSelection = false;
             draggingStartHandle = false;
             draggingEndHandle = false;
+            draggingCaretHandle = false;
             handleDragFixedLine = -1;
             handleDragFixedColumn = -1;
+            handleDragPointerOffsetX = 0f;
+            handleDragPointerOffsetY = 0f;
             pendingTouchPress = false;
             longPressTriggered = false;
             pendingSelectionMove = false;
@@ -4226,6 +5781,7 @@ public class CodeEditor extends Widget {
                 } else {
                     clearSelection();
                     placeCursor(x, y);
+                    showTransientCaretHandle();
                     if (shouldShowKeyboardForTouchTap(x, y)) {
                         onscreenKeyboard.show(true);
                     }

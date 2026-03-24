@@ -55,7 +55,7 @@ Add the dependency:
 
 ```gradle
 dependencies {
-    implementation 'com.github.Lzt841:gdx-code-editor:v0.0.2'
+    implementation 'com.github.Lzt841:gdx-code-editor:v0.0.3'
 }
 ```
 
@@ -68,7 +68,7 @@ repositories {
 }
 
 dependencies {
-    implementation("com.github.Lzt841:gdx-code-editor:v0.0.2")
+    implementation("com.github.Lzt841:gdx-code-editor:v0.0.3")
 }
 ```
 
@@ -84,11 +84,14 @@ import com.lzt841.editor.structure.BraceCodeStructureProvider;
 
 BitmapFont font = new BitmapFont();
 
-CodeEditor.CodeEditorStyle style = new CodeEditor.CodeEditorStyle();
-style.font = font;
+CodeEditor.CodeEditorStyle style = CodeEditor.CodeEditorStyle.theme(font)
+    .themeColor(new Color(0.24f, 0.55f, 0.92f, 1f))
+    .backgroundColor(new Color(0.06f, 0.08f, 0.11f, 1f))
+    .gutterColor(new Color(0.03f, 0.04f, 0.05f, 1f))
+    .build();
 
 CodeEditor editor = new CodeEditor(style);
-editor.setText("public class Demo {\n    void test() {}\n}");
+editor.setText("public class Demo {\n\tvoid test() {}\n}");
 editor.setHighlighter(BuiltinCodeHighlighters.java());
 editor.setStructureProvider(new BraceCodeStructureProvider());
 editor.setWrapEnabled(false);
@@ -137,6 +140,19 @@ Python-style indent structure:
 editor.setStructureProvider(new PythonIndentCodeStructureProvider());
 ```
 
+Custom collapsed-fold display:
+
+```java
+editor.setFoldDisplayProvider(new CodeEditor.FoldDisplayProvider() {
+    @Override
+    public String getCollapsedText(CodeEditor editor, CodeEditor.FoldDisplayContext context) {
+        return ".." + context.endLineText.trim();
+    }
+});
+```
+
+The default implementation already appends the trimmed end line, so brace folds render like `{..}` instead of `{..`.
+
 ## Search and Replace
 
 ```java
@@ -159,6 +175,7 @@ Notes:
 - the current match has its own highlight
 - replace-all is grouped as one undo/redo step
 - typing over a selection replaces the selected text first
+- tab characters in `setText(...)` content are measured and rendered consistently
 
 ## Content Change Listener
 
@@ -242,7 +259,41 @@ Touch mode also supports pinch zoom.
 
 ## Style
 
-`CodeEditorStyle` is similar in spirit to libGDX `TextFieldStyle`. It lets you control drawables, colors, and layout sizing.
+`CodeEditorStyle` is similar in spirit to libGDX `TextFieldStyle`. You can still assign every drawable manually, but the recommended path is to start from the built-in theme builder.
+
+### Theme Builder
+
+```java
+CodeEditor.CodeEditorStyle style = CodeEditor.CodeEditorStyle.theme(font)
+    .themeColor(new Color(0.24f, 0.55f, 0.92f, 1f))
+    .backgroundColor(new Color(0.06f, 0.08f, 0.11f, 1f))
+    .gutterColor(new Color(0.03f, 0.04f, 0.05f, 1f))
+    .textColor(Color.WHITE)
+    .gutterTextColor(new Color(0.66f, 0.72f, 0.8f, 1f))
+    .textBaselineOffset(-6f)
+    .build();
+```
+
+The builder automatically creates a full editor theme, including:
+
+- background and focused background
+- gutter background and divider
+- cursor, selection, search highlight, and current-match highlight
+- fold icons and fold badge
+- scrollbar track and knob
+- touch selection handle
+
+If you do not explicitly set scrollbar width or selection handle size, the builder derives sensible defaults from the font line height, so larger fonts automatically get larger handles and scrollbars.
+
+If the builder creates its own white-pixel texture internally, you can release it with:
+
+```java
+style.disposeGeneratedResources();
+```
+
+### Manual Style
+
+You can also populate `CodeEditorStyle` yourself when you want full control over every drawable and size.
 
 Common drawable fields:
 

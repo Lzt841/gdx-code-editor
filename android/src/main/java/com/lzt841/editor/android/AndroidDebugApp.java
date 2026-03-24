@@ -539,34 +539,15 @@ public class AndroidDebugApp extends ApplicationAdapter {
     }
 
     private CodeEditor.CodeEditorStyle createEditorStyle() {
-        CodeEditor.CodeEditorStyle style = new CodeEditor.CodeEditorStyle();
-        style.font = font;
-        style.background = createSolidDrawable(new Color(0.055f, 0.078f, 0.109f, 1f));
-        style.focusedBackground = createSolidDrawable(new Color(0.058f, 0.082f, 0.115f, 1f));
-        style.disabledBackground = createSolidDrawable(new Color(0.039f, 0.055f, 0.075f, 1f));
-        style.gutterBackground = createGutterDrawable(
-            new Color(0.022f, 0.031f, 0.043f, 1f),
-            new Color(0.196f, 0.286f, 0.38f, 1f),
-            2f
-        );
-        style.currentBlock = createSolidDrawable(new Color(0.078f, 0.118f, 0.161f, 0.78f));
-        style.currentLine = createSolidDrawable(new Color(0.098f, 0.145f, 0.204f, 1f));
-        style.cursor = createSolidDrawable(new Color(0.984f, 0.824f, 0.43f, 1f));
-        style.selection = createSolidDrawable(new Color(0.204f, 0.408f, 0.663f, 0.6f));
-        style.searchHighlight = createSolidDrawable(new Color(0.941f, 0.745f, 0.271f, 0.24f));
-        style.currentSearchHighlight = createSolidDrawable(new Color(1f, 0.831f, 0.314f, 0.54f));
-        style.selectionHandle = createSolidDrawable(new Color(0.298f, 0.592f, 0.922f, 0.98f));
-        style.bracketMatch = createSolidDrawable(new Color(0.937f, 0.737f, 0.29f, 0.34f));
-        style.guide = createSolidDrawable(new Color(0.357f, 0.514f, 0.678f, 0.18f));
-        style.scrollbarTrack = createSolidDrawable(new Color(0.102f, 0.137f, 0.18f, 1f));
-        style.scrollbarKnob = createSolidDrawable(new Color(0.286f, 0.392f, 0.471f, 1f));
-        style.foldBadge = createSolidDrawable(new Color(0.188f, 0.275f, 0.353f, 1f));
-        style.foldExpanded = createChevronDrawable(false, new Color(0.79f, 0.86f, 0.93f, 1f));
-        style.foldCollapsed = createChevronDrawable(true, new Color(0.79f, 0.86f, 0.93f, 1f));
-        style.fontColor = new Color(0.93f, 0.96f, 0.99f, 1f);
-        style.disabledFontColor = new Color(0.55f, 0.61f, 0.68f, 1f);
-        style.messageFontColor = new Color(0.54f, 0.64f, 0.74f, 1f);
-        style.gutterFontColor = new Color(0.64f, 0.72f, 0.8f, 1f);
+        CodeEditor.CodeEditorStyle style = CodeEditor.CodeEditorStyle.theme(font)
+            .whitePixelTexture(whitePixel)
+            .themeColor(new Color(0.298f, 0.592f, 0.922f, 1f))
+            .backgroundColor(new Color(0.055f, 0.078f, 0.109f, 1f))
+            .gutterColor(new Color(0.022f, 0.031f, 0.043f, 1f))
+            .textColor(new Color(0.93f, 0.96f, 0.99f, 1f))
+            .gutterTextColor(new Color(0.64f, 0.72f, 0.8f, 1f))
+            .textBaselineOffset(-9f)
+            .build();
         style.gutterMinWidth = 58f;
         style.gutterLeftPadding = 10f;
         style.gutterFoldIndicatorGap = 10f;
@@ -575,20 +556,16 @@ public class AndroidDebugApp extends ApplicationAdapter {
         style.textLeftPadding = 18f;
         style.textRightPadding = 28f;
         style.rowPadding = 8f;
-        style.textBaselineOffset = -9f;
-        style.scrollbarWidth = 9f;
         style.scrollbarHitWidth = 28f;
         style.scrollbarGap = 12f;
         style.scrollbarMargin = 5f;
         style.scrollbarMinThumbSize = 32f;
-        style.selectionHandleRadius = 13f;
         style.selectionHandleTouchRadiusMultiplier = 2f;
         style.guideSpacing = 20f;
         style.guideOffsetX = -7f;
         style.foldBadgeGap = 12f;
         style.foldBadgeHorizontalPadding = 14f;
         style.foldBadgeVerticalPadding = 5f;
-        style.whitePixelTexture = whitePixel;
         return style;
     }
 

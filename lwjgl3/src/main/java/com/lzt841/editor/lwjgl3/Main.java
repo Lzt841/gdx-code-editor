@@ -797,32 +797,19 @@ public class Main extends ApplicationAdapter {
     }
 
     private CodeEditor.CodeEditorStyle createEditorStyle() {
-        TextureRegion region = new TextureRegion(whitePixel);
-        CodeEditor.CodeEditorStyle style = new CodeEditor.CodeEditorStyle();
-        style.font = font;
-        style.background = new TextureRegionDrawable(region).tint(new Color(0.051f, 0.074f, 0.102f, 1f));
-        style.focusedBackground = new TextureRegionDrawable(region).tint(new Color(0.066f, 0.094f, 0.129f, 1f));
-        style.disabledBackground = new TextureRegionDrawable(region).tint(new Color(0.043f, 0.059f, 0.078f, 1f));
-        style.gutterBackground = new TextureRegionDrawable(region).tint(new Color(0.060f, 0.086f, 0.115f, 1f));
-        style.currentBlock = new TextureRegionDrawable(region).tint(new Color(0.071f, 0.106f, 0.145f, 0.72f));
-        style.currentLine = new TextureRegionDrawable(region).tint(new Color(0.094f, 0.133f, 0.184f, 1f));
-        style.cursor = new TextureRegionDrawable(region).tint(new Color(0.984f, 0.824f, 0.43f, 1f));
-        style.selection = new TextureRegionDrawable(region).tint(new Color(0.196f, 0.376f, 0.612f, 0.55f));
-        style.searchHighlight = new TextureRegionDrawable(region).tint(new Color(0.945f, 0.741f, 0.255f, 0.28f));
-        style.currentSearchHighlight = new TextureRegionDrawable(region).tint(new Color(1f, 0.824f, 0.286f, 0.5f));
-        style.selectionHandle = new TextureRegionDrawable(region).tint(new Color(0.274f, 0.561f, 0.898f, 0.95f));
-        style.bracketMatch = new TextureRegionDrawable(region).tint(new Color(0.933f, 0.722f, 0.275f, 0.35f));
-        style.guide = new TextureRegionDrawable(region).tint(new Color(0.184f, 0.266f, 0.333f, 0.8f));
-        style.scrollbarTrack = new TextureRegionDrawable(region).tint(new Color(0.094f, 0.129f, 0.172f, 1f));
-        style.scrollbarKnob = new TextureRegionDrawable(region).tint(new Color(0.263f, 0.357f, 0.431f, 1f));
-        style.foldBadge = new TextureRegionDrawable(region).tint(new Color(0.184f, 0.266f, 0.333f, 1f));
-        style.foldExpanded = createChevronDrawable(false, new Color(0.72f, 0.79f, 0.86f, 1f));
-        style.foldCollapsed = createChevronDrawable(true, new Color(0.72f, 0.79f, 0.86f, 1f));
+        CodeEditor.CodeEditorStyle style = CodeEditor.CodeEditorStyle.theme(font)
+            .whitePixelTexture(whitePixel)
+            .themeColor(new Color(0.274f, 0.561f, 0.898f, 1f))
+            .backgroundColor(new Color(0.051f, 0.074f, 0.102f, 1f))
+            .gutterColor(new Color(0.060f, 0.086f, 0.115f, 1f))
+            .textColor(new Color(0.93f, 0.96f, 0.99f, 1f))
+            .gutterTextColor(new Color(0.64f, 0.72f, 0.8f, 1f))
+            .textBaselineOffset(-6f)
+            .build();
         style.gutterLeftPadding = 6f;
         style.gutterFoldIndicatorGap = 8f;
         style.foldIndicatorSize = 10f;
         style.foldIndicatorRightPadding = 8f;
-        style.selectionHandleRadius = 11f;
         style.rainbowBracketColors = new Color[] {
             new Color(0.976f, 0.392f, 0.380f, 1f),
             new Color(0.988f, 0.690f, 0.278f, 1f),
