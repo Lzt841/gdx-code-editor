@@ -10,6 +10,8 @@ public class CodeEditorSettings {
     private boolean lineNumbersVisible = true;
     private boolean lineNumbersFixed = true;
     private boolean magnifierEnabled = true;
+    private boolean transientCaretHandleEnabled = true;
+    private boolean passwordMode;
     private boolean rainbowBracketsEnabled;
     private boolean rainbowGuidesEnabled;
     private boolean scrollbarsVisible = true;
@@ -62,6 +64,30 @@ public class CodeEditorSettings {
             return;
         }
         this.magnifierEnabled = magnifierEnabled;
+        notifyChanged();
+    }
+
+    public boolean isTransientCaretHandleEnabled() {
+        return transientCaretHandleEnabled;
+    }
+
+    public void setTransientCaretHandleEnabled(boolean transientCaretHandleEnabled) {
+        if (this.transientCaretHandleEnabled == transientCaretHandleEnabled) {
+            return;
+        }
+        this.transientCaretHandleEnabled = transientCaretHandleEnabled;
+        notifyChanged();
+    }
+
+    public boolean isPasswordMode() {
+        return passwordMode;
+    }
+
+    public void setPasswordMode(boolean passwordMode) {
+        if (this.passwordMode == passwordMode) {
+            return;
+        }
+        this.passwordMode = passwordMode;
         notifyChanged();
     }
 

@@ -90,11 +90,11 @@ public class CodeEditor extends Widget {
     private static final int TOUCH_SCROLL_AXIS_VERTICAL = 2;
     private static final long LONG_PRESS_NS = 450_000_000L;
     private static final long DOUBLE_TAP_NS = 300_000_000L;
-    private static final long CARET_HANDLE_VISIBLE_NS = 3_000_000_000L;
+    private static final long CARET_HANDLE_VISIBLE_NS = 1_000_000_000L;
     private static final float KEY_REPEAT_INITIAL_DELAY = 0.42f;
     private static final float KEY_REPEAT_INTERVAL = 0.045f;
-    private static final float MIN_ZOOM_SCALE = 0.75f;
-    private static final float MAX_ZOOM_SCALE = 2.5f;
+    private static final float MIN_ZOOM_SCALE = 0.5f;
+    private static final float MAX_ZOOM_SCALE = 3.0f;
     private static final int MAX_TOUCH_POINTERS = 20;
     private static final float[][] DEFAULT_RAINBOW_BRACKET_PALETTE = {
         {0.976f, 0.392f, 0.380f, 1f},
@@ -172,6 +172,8 @@ public class CodeEditor extends Widget {
     private boolean lineNumbersVisible = true;
     private boolean lineNumbersFixed = true;
     private boolean magnifierEnabled = true;
+    private boolean transientCaretHandleEnabled = true;
+    private boolean passwordMode;
     private boolean overscrollEnabled = true;
     private boolean scrollbarsVisible = true;
     private boolean readOnly;
@@ -238,6 +240,9 @@ public class CodeEditor extends Widget {
     private String draggedSelectionText = "";
     private boolean deferredMutationProcessingPending;
     private long transientCaretHandleUntilNanos;
+    private boolean hadInputFocus;
+    private InputFilter inputFilter;
+    private char passwordCharacter = '*';
 
     public CodeEditor(CodeEditorStyle style) {
         setStyle(style);
@@ -485,7 +490,7 @@ public class CodeEditor extends Widget {
             return false;
         }
 
-        String safeReplacement = replacement == null ? "" : replacement;
+        String safeReplacement = sanitizeInputText(replacement, true);
         clearSelection();
         markPendingContentChange(CodeEditorContentChangeType.REPLACE_CURRENT);
         document.beginCompoundEdit();
@@ -512,7 +517,7 @@ public class CodeEditor extends Widget {
             return 0;
         }
 
-        String safeReplacement = replacement == null ? "" : replacement;
+        String safeReplacement = sanitizeInputText(replacement, true);
         Array<SearchMatchRef> matchesToReplace = new Array<>(flatSearchMatches);
         expandCollapsedRegionsForSearchMatches(matchesToReplace);
         ensureLayout();
@@ -603,6 +608,82 @@ public class CodeEditor extends Widget {
 
     public boolean isMagnifierEnabled() {
         return magnifierEnabled;
+    }
+
+    public InputFilter getInputFilter() {
+        return inputFilter;
+    }
+
+    public void setInputFilter(InputFilter inputFilter) {
+        this.inputFilter = inputFilter;
+    }
+
+    public boolean isPasswordMode() {
+        return passwordMode;
+    }
+
+    public void setPasswordMode(boolean passwordMode) {
+        if (settings != null) {
+            settings.setPasswordMode(passwordMode);
+            return;
+        }
+        applyPasswordMode(passwordMode);
+    }
+
+    private void applyPasswordMode(boolean passwordMode) {
+        if (this.passwordMode == passwordMode) {
+            return;
+        }
+        this.passwordMode = passwordMode;
+        invalidateLayout();
+        invalidateHierarchy();
+    }
+
+    public char getPasswordCharacter() {
+        return passwordCharacter;
+    }
+
+    public void setPasswordCharacter(char passwordCharacter) {
+        if (passwordCharacter == 0 || passwordCharacter == '\n' || passwordCharacter == '\r') {
+            throw new IllegalArgumentException("passwordCharacter must be a visible single-line character");
+        }
+        if (this.passwordCharacter == passwordCharacter) {
+            return;
+        }
+        this.passwordCharacter = passwordCharacter;
+        if (passwordMode) {
+            invalidateLayout();
+            invalidateHierarchy();
+        }
+    }
+
+    public boolean isTransientCaretHandleEnabled() {
+        return transientCaretHandleEnabled;
+    }
+
+    public void setTransientCaretHandleEnabled(boolean transientCaretHandleEnabled) {
+        if (settings != null) {
+            settings.setTransientCaretHandleEnabled(transientCaretHandleEnabled);
+            return;
+        }
+        applyTransientCaretHandleEnabled(transientCaretHandleEnabled);
+    }
+
+    private void applyTransientCaretHandleEnabled(boolean transientCaretHandleEnabled) {
+        if (this.transientCaretHandleEnabled == transientCaretHandleEnabled) {
+            return;
+        }
+        this.transientCaretHandleEnabled = transientCaretHandleEnabled;
+        if (!transientCaretHandleEnabled) {
+            hideTransientCaretHandle();
+            if (draggingCaretHandle) {
+                draggingCaretHandle = false;
+                handleDragFixedLine = -1;
+                handleDragFixedColumn = -1;
+                handleDragPointerOffsetX = 0f;
+                handleDragPointerOffsetY = 0f;
+            }
+        }
     }
 
     public boolean isOverscrollEnabled() {
@@ -712,6 +793,8 @@ public class CodeEditor extends Widget {
         applyOverscrollEnabled(settings.isOverscrollEnabled());
         applyZoomEnabled(settings.isZoomEnabled());
         applyMagnifierEnabled(settings.isMagnifierEnabled());
+        applyTransientCaretHandleEnabled(settings.isTransientCaretHandleEnabled());
+        applyPasswordMode(settings.isPasswordMode());
         applyRainbowBracketsEnabled(settings.isRainbowBracketsEnabled());
         applyRainbowGuidesEnabled(settings.isRainbowGuidesEnabled());
         applyInteractionMode(settings.getInteractionMode());
@@ -800,6 +883,11 @@ public class CodeEditor extends Widget {
     public void act(float delta) {
         flushDeferredMutationProcessing();
         super.act(delta);
+        boolean focused = isFocused();
+        if (hadInputFocus && !focused) {
+            hideTouchHandlesImmediately();
+        }
+        hadInputFocus = focused;
         syncSelectionHandleOverlay();
         ensureStageScrollFocus();
         updateKeyRepeat(delta);
@@ -907,11 +995,17 @@ public class CodeEditor extends Widget {
         foldRegions.clear();
         foldRegionsByStart.clear();
 
-        CodeStructureInfo structureInfo = structureProvider.analyze(lines);
+        CodeStructureInfo structureInfo = passwordMode
+            ? new CodeStructureInfo(new int[lineCount], new Array<CodeFoldRegion>())
+            : structureProvider.analyze(lines);
         int[] indentLevels = structureInfo.indentLevels;
-        Array<Array<CodeHighlightSpan>> highlightLines = highlighter.highlight(lines, style);
-        bracketIgnoreLines = normalizeBracketIgnoreLines(highlighter.getBracketIgnoreSpans(lines), lines.size);
-        Array<Array<CodeHighlightSpan>> rainbowBracketLines = buildRainbowBracketSpans(lines, bracketIgnoreLines);
+        Array<Array<CodeHighlightSpan>> highlightLines = passwordMode ? new Array<Array<CodeHighlightSpan>>() : highlighter.highlight(lines, style);
+        bracketIgnoreLines = passwordMode
+            ? normalizeBracketIgnoreLines(new Array<Array<CodeBracketIgnoreSpan>>(), lines.size)
+            : normalizeBracketIgnoreLines(highlighter.getBracketIgnoreSpans(lines), lines.size);
+        Array<Array<CodeHighlightSpan>> rainbowBracketLines = passwordMode
+            ? new Array<Array<CodeHighlightSpan>>()
+            : buildRainbowBracketSpans(lines, bracketIgnoreLines);
         searchMatches = buildSearchMatches(lines);
         hiddenLines = new boolean[lineCount];
         visualRowsPerLine = new int[lineCount];
@@ -920,20 +1014,21 @@ public class CodeEditor extends Widget {
 
         for (int i = 0; i < lineCount; i++) {
             String line = lines.get(i);
+            String displayLine = getDisplayLineText(line);
             Array<CodeHighlightSpan> highlight = i < highlightLines.size ? highlightLines.get(i) : new Array<>(0);
             Array<CodeHighlightSpan> rainbowBrackets = i < rainbowBracketLines.size
                 ? rainbowBracketLines.get(i)
                 : new Array<>(0);
-            LineLayout layout = new LineLayout(line, safeIndentLevel(indentLevels, i), buildHighlightTokens(line, highlight, rainbowBrackets));
+            LineLayout layout = new LineLayout(displayLine, safeIndentLevel(indentLevels, i), buildHighlightTokens(displayLine, highlight, rainbowBrackets));
             layout.ensurePrefixWidths(this);
-            maxLineWidth = Math.max(maxLineWidth, layout.measureRange(0, line.length()));
+            maxLineWidth = Math.max(maxLineWidth, layout.measureRange(0, displayLine.length()));
             if (wrapEnabled) {
                 wrapLine(layout, wrapWidth);
             } else {
                 layout.segmentStarts.clear();
                 layout.segmentEnds.clear();
                 layout.segmentStarts.add(0);
-                layout.segmentEnds.add(line.length());
+                layout.segmentEnds.add(displayLine.length());
             }
             lineLayouts.add(layout);
         }
@@ -1639,8 +1734,12 @@ public class CodeEditor extends Widget {
         if (disabled || readOnly) {
             return false;
         }
+        String sanitized = sanitizeInputText(Gdx.app.getClipboard().getContents(), true);
+        if (sanitized.isEmpty()) {
+            return false;
+        }
         markPendingContentChange(CodeEditorContentChangeType.PASTE);
-        replaceSelectionWith(Gdx.app.getClipboard().getContents(), true);
+        replaceSelectionWith(sanitized, true);
         return true;
     }
 
@@ -2275,6 +2374,17 @@ public class CodeEditor extends Widget {
         return rowBottom + lineHeight + style.textBaselineOffset;
     }
 
+    private String getDisplayLineText(String actualLine) {
+        if (!passwordMode || actualLine == null || actualLine.isEmpty()) {
+            return actualLine == null ? "" : actualLine;
+        }
+        StringBuilder builder = new StringBuilder(actualLine.length());
+        for (int i = 0; i < actualLine.length(); i++) {
+            builder.append(passwordCharacter);
+        }
+        return builder.toString();
+    }
+
     private void drawCaret(Batch batch) {
         if (!isFocused() || disabled) {
             return;
@@ -2735,7 +2845,7 @@ public class CodeEditor extends Widget {
     }
 
     private boolean shouldShowTouchHandles() {
-        return useTouchInteractions();
+        return useTouchInteractions() && isFocused();
     }
 
     private boolean shouldShowHandleMagnifier() {
@@ -2758,6 +2868,10 @@ public class CodeEditor extends Widget {
     }
 
     private void showTransientCaretHandle() {
+        if (!transientCaretHandleEnabled) {
+            transientCaretHandleUntilNanos = 0L;
+            return;
+        }
         transientCaretHandleUntilNanos = TimeUtils.nanoTime() + CARET_HANDLE_VISIBLE_NS;
     }
 
@@ -2765,8 +2879,44 @@ public class CodeEditor extends Widget {
         transientCaretHandleUntilNanos = 0L;
     }
 
+    private boolean acceptsInputCharacter(char character) {
+        return inputFilter == null || inputFilter.acceptChar(this, character);
+    }
+
+    private String sanitizeInputText(String text, boolean normalizeLineBreaks) {
+        if (text == null || text.isEmpty()) {
+            return "";
+        }
+        String source = normalizeLineBreaks ? text.replace("\r\n", "\n").replace('\r', '\n') : text;
+        StringBuilder builder = new StringBuilder(source.length());
+        for (int i = 0; i < source.length(); i++) {
+            char current = source.charAt(i);
+            if (acceptsInputCharacter(current)) {
+                builder.append(current);
+            }
+        }
+        return builder.toString();
+    }
+
+    private void clearHandleDragState() {
+        draggingStartHandle = false;
+        draggingEndHandle = false;
+        draggingCaretHandle = false;
+        handleDragFixedLine = -1;
+        handleDragFixedColumn = -1;
+        handleDragPointerOffsetX = 0f;
+        handleDragPointerOffsetY = 0f;
+    }
+
+    private void hideTouchHandlesImmediately() {
+        clearHandleDragState();
+        hideTransientCaretHandle();
+        syncSelectionHandleOverlay();
+    }
+
     private boolean shouldShowTransientCaretHandle() {
         return shouldShowTouchHandles()
+            && transientCaretHandleEnabled
             && getSelectionRange() == null
             && !disabled
             && (draggingCaretHandle || TimeUtils.nanoTime() < transientCaretHandleUntilNanos);
@@ -2882,13 +3032,7 @@ public class CodeEditor extends Widget {
 
     private void endSelectionHandleOverlayDrag() {
         boolean draggedHandle = draggingStartHandle || draggingEndHandle || draggingCaretHandle;
-        draggingStartHandle = false;
-        draggingEndHandle = false;
-        draggingCaretHandle = false;
-        handleDragFixedLine = -1;
-        handleDragFixedColumn = -1;
-        handleDragPointerOffsetX = 0f;
-        handleDragPointerOffsetY = 0f;
+        clearHandleDragState();
         if (draggedHandle) {
             refreshBlink();
         }
@@ -3114,10 +3258,21 @@ public class CodeEditor extends Widget {
         if (handle == null) {
             return false;
         }
-        float dx = x - handle.hitX;
-        float dy = y - handle.hitY;
-        float radius = style.selectionHandleRadius * style.selectionHandleTouchRadiusMultiplier;
-        return dx * dx + dy * dy <= radius * radius;
+        float handleSize = style.selectionHandleRadius * 2f;
+        float extraPadding = Math.max(
+            0f,
+            style.selectionHandleRadius * (style.selectionHandleTouchRadiusMultiplier - 1f)
+        );
+        float left = handle.drawX;
+        float right = handle.drawX + handleSize;
+        float bottom = handle.drawY;
+        float top = handle.drawY + handleSize;
+        float nearestX = clamp(x, left, right);
+        float nearestY = clamp(y, bottom, top);
+        float dx = x - nearestX;
+        float dy = y - nearestY;
+        return dx * dx + dy * dy <= extraPadding * extraPadding
+            || (x >= left && x <= right && y >= bottom && y <= top);
     }
 
     private boolean isNearAnyHandle(float x, float y) {
@@ -5392,6 +5547,23 @@ public class CodeEditor extends Widget {
         String getCollapsedText(CodeEditor editor, FoldDisplayContext context);
     }
 
+    public interface InputFilter {
+        boolean acceptChar(CodeEditor editor, char character);
+    }
+
+    public static class AllowedCharactersFilter implements InputFilter {
+        private final String allowedCharacters;
+
+        public AllowedCharactersFilter(String allowedCharacters) {
+            this.allowedCharacters = allowedCharacters == null ? "" : allowedCharacters;
+        }
+
+        @Override
+        public boolean acceptChar(CodeEditor editor, char character) {
+            return allowedCharacters.indexOf(character) >= 0;
+        }
+    }
+
     public static final class FoldDisplayContext {
         public final int startLine;
         public final int endLine;
@@ -5650,6 +5822,9 @@ public class CodeEditor extends Widget {
                     if (readOnly) {
                         return true;
                     }
+                    if (!acceptsInputCharacter('\n')) {
+                        return true;
+                    }
                     expandCollapsedRegionsForEdit(EditIntent.ENTER);
                     markPendingContentChange(CodeEditorContentChangeType.INSERT);
                     document.beginCompoundEdit();
@@ -5665,12 +5840,16 @@ public class CodeEditor extends Widget {
                     if (readOnly) {
                         return true;
                     }
+                    String tabInsertion = sanitizeInputText("    ", false);
+                    if (tabInsertion.isEmpty()) {
+                        return true;
+                    }
                     expandCollapsedRegionsForEdit(EditIntent.TAB);
                     markPendingContentChange(CodeEditorContentChangeType.INSERT);
                     document.beginCompoundEdit();
                     try {
                         deleteSelectionIfPresent();
-                        document.insertText("    ");
+                        document.insertText(tabInsertion);
                     } finally {
                         document.endCompoundEdit();
                     }
@@ -5716,6 +5895,9 @@ public class CodeEditor extends Widget {
             }
 
             if (!Character.isISOControl(character)) {
+                if (!acceptsInputCharacter(character)) {
+                    return true;
+                }
                 expandCollapsedRegionsForEdit(EditIntent.TYPE);
                 markPendingContentChange(CodeEditorContentChangeType.INSERT);
                 document.beginCompoundEdit();

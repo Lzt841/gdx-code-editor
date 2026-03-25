@@ -72,6 +72,8 @@ public class Main extends ApplicationAdapter {
     private TextButton lineNumberButton;
     private TextButton lineNumberFixedButton;
     private TextButton scrollbarButton;
+    private TextButton transientHandleButton;
+    private TextButton passwordModeButton;
     private TextButton zoomEnabledButton;
     private TextButton overscrollButton;
     private TextButton rainbowBracketButton;
@@ -292,6 +294,18 @@ public class Main extends ApplicationAdapter {
                 editor.setScrollbarsVisible(!editor.isScrollbarsVisible());
             }
         });
+        transientHandleButton = createActionButton("", new Runnable() {
+            @Override
+            public void run() {
+                editor.setTransientCaretHandleEnabled(!editor.isTransientCaretHandleEnabled());
+            }
+        });
+        passwordModeButton = createActionButton("", new Runnable() {
+            @Override
+            public void run() {
+                editor.setPasswordMode(!editor.isPasswordMode());
+            }
+        });
         zoomEnabledButton = createActionButton("", new Runnable() {
             @Override
             public void run() {
@@ -505,6 +519,10 @@ public class Main extends ApplicationAdapter {
         sidebar.add(lineNumberFixedButton);
         sidebar.row();
         sidebar.add(scrollbarButton);
+        sidebar.row();
+        sidebar.add(transientHandleButton);
+        sidebar.row();
+        sidebar.add(passwordModeButton);
         sidebar.row();
         sidebar.add(zoomEnabledButton);
         sidebar.row();
@@ -742,6 +760,8 @@ public class Main extends ApplicationAdapter {
         lineNumberButton.setText("Line Numbers Visible: " + onOff(editor.isLineNumbersVisible()));
         lineNumberFixedButton.setText("Line Numbers Fixed: " + onOff(editor.isLineNumbersFixed()));
         scrollbarButton.setText("Scrollbars Visible: " + onOff(editor.isScrollbarsVisible()));
+        transientHandleButton.setText("Transient Handle: " + onOff(editor.isTransientCaretHandleEnabled()));
+        passwordModeButton.setText("Password Mode: " + onOff(editor.isPasswordMode()));
         zoomEnabledButton.setText("Pinch Zoom Enabled: " + onOff(editor.isZoomEnabled()));
         overscrollButton.setText("Overscroll: " + onOff(editor.isOverscrollEnabled()));
         rainbowBracketButton.setText("Rainbow Brackets: " + onOff(editor.isRainbowBracketsEnabled()));
@@ -771,7 +791,9 @@ public class Main extends ApplicationAdapter {
                 + "Wrap: " + onOff(editor.isWrapEnabled())
                 + "   Line numbers: " + onOff(editor.isLineNumbersVisible())
                 + "   Fixed gutter: " + onOff(editor.isLineNumbersFixed()) + "\n"
-                + "Scrollbars: " + onOff(editor.isScrollbarsVisible()) + "\n"
+                + "Scrollbars: " + onOff(editor.isScrollbarsVisible())
+                + "   Transient handle: " + onOff(editor.isTransientCaretHandleEnabled()) + "\n"
+                + "Password mode: " + onOff(editor.isPasswordMode()) + "\n"
                 + "Pinch zoom: " + onOff(editor.isZoomEnabled())
                 + "   Overscroll: " + onOff(editor.isOverscrollEnabled()) + "\n"
                 + "Rainbow brackets: " + onOff(editor.isRainbowBracketsEnabled())

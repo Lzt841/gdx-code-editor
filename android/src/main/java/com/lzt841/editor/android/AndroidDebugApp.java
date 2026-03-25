@@ -65,6 +65,8 @@ public class AndroidDebugApp extends ApplicationAdapter {
     private TextButton lineNumberButton;
     private TextButton lineNumberFixedButton;
     private TextButton scrollbarButton;
+    private TextButton transientHandleButton;
+    private TextButton passwordModeButton;
     private TextButton readOnlyButton;
     private TextButton disabledButton;
     private TextButton undoButton;
@@ -188,6 +190,18 @@ public class AndroidDebugApp extends ApplicationAdapter {
                 editor.setScrollbarsVisible(!editor.isScrollbarsVisible());
             }
         });
+        transientHandleButton = button("Transient Handle", buttonStyle, new Runnable() {
+            @Override
+            public void run() {
+                editor.setTransientCaretHandleEnabled(!editor.isTransientCaretHandleEnabled());
+            }
+        });
+        passwordModeButton = button("Password Mode", buttonStyle, new Runnable() {
+            @Override
+            public void run() {
+                editor.setPasswordMode(!editor.isPasswordMode());
+            }
+        });
         readOnlyButton = button("Read Only", buttonStyle, new Runnable() {
             @Override
             public void run() {
@@ -299,6 +313,9 @@ public class AndroidDebugApp extends ApplicationAdapter {
         controlsTable.row();
         controlsTable.add(lineNumberFixedButton);
         controlsTable.add(scrollbarButton);
+        controlsTable.row();
+        controlsTable.add(transientHandleButton);
+        controlsTable.add(passwordModeButton);
         controlsTable.row();
         controlsTable.add(zoomEnabledButton);
         controlsTable.add(overscrollButton);
@@ -541,6 +558,8 @@ public class AndroidDebugApp extends ApplicationAdapter {
         lineNumberButton.setText("Line Numbers: " + onOff(editor.isLineNumbersVisible()));
         lineNumberFixedButton.setText("Fixed Gutter: " + onOff(editor.isLineNumbersFixed()));
         scrollbarButton.setText("Scrollbars: " + onOff(editor.isScrollbarsVisible()));
+        transientHandleButton.setText("Transient Handle: " + onOff(editor.isTransientCaretHandleEnabled()));
+        passwordModeButton.setText("Password Mode: " + onOff(editor.isPasswordMode()));
         readOnlyButton.setText("Read Only: " + onOff(editor.isReadOnly()));
         disabledButton.setText("Disabled: " + onOff(editor.isDisabled()));
         undoButton.setText("Undo: " + onOff(editor.canUndo()));
@@ -555,7 +574,9 @@ public class AndroidDebugApp extends ApplicationAdapter {
                 + "Matches: " + editor.getSearchMatchCount() + "\n"
                 + "Line numbers: " + onOff(editor.isLineNumbersVisible())
                 + "   Fixed gutter: " + onOff(editor.isLineNumbersFixed()) + "\n"
-                + "Scrollbars: " + onOff(editor.isScrollbarsVisible()) + "\n"
+                + "Scrollbars: " + onOff(editor.isScrollbarsVisible())
+                + "   Transient handle: " + onOff(editor.isTransientCaretHandleEnabled()) + "\n"
+                + "Password mode: " + onOff(editor.isPasswordMode()) + "\n"
                 + "Pinch zoom: " + onOff(editor.isZoomEnabled())
                 + "   Overscroll: " + onOff(editor.isOverscrollEnabled()) + "\n"
                 + "Tips: pinch to zoom, long press to test touch callback, drag handles to test auto-scroll."
