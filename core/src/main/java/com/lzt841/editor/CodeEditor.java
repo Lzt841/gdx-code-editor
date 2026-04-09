@@ -159,6 +159,10 @@ public class CodeEditor extends Widget {
     private float scrollX;
     private float scrollY;
     private float maxLineWidth;
+    private float clipAreaX;
+    private float clipAreaY;
+    private float clipAreaWidth;
+    private float clipAreaHeight;
     private float preferredCursorX = -1f;
     private float zoomScale = 1f;
     private float baseFontScaleX = 1f;
@@ -169,6 +173,8 @@ public class CodeEditor extends Widget {
     private int analyzedWrapWidth = -1;
     private boolean analyzedWrapEnabled;
     private boolean disabled;
+    private boolean clipAreaEnabled = true;
+    private boolean customClipArea;
     private boolean lineNumbersVisible = true;
     private boolean lineNumbersFixed = true;
     private boolean magnifierEnabled = true;
@@ -551,6 +557,39 @@ public class CodeEditor extends Widget {
         return lineNumbersVisible;
     }
 
+    public boolean isClipAreaEnabled() {
+        return clipAreaEnabled;
+    }
+
+    public void setClipAreaEnabled(boolean clipAreaEnabled) {
+        this.clipAreaEnabled = clipAreaEnabled;
+    }
+
+    public boolean hasCustomClipArea() {
+        return customClipArea;
+    }
+
+    public void setClipArea(float x, float y, float width, float height) {
+        float normalizedWidth = Math.max(0f, width);
+        float normalizedHeight = Math.max(0f, height);
+        if (customClipArea
+            && Float.compare(clipAreaX, x) == 0
+            && Float.compare(clipAreaY, y) == 0
+            && Float.compare(clipAreaWidth, normalizedWidth) == 0
+            && Float.compare(clipAreaHeight, normalizedHeight) == 0) {
+            return;
+        }
+        customClipArea = true;
+        clipAreaX = x;
+        clipAreaY = y;
+        clipAreaWidth = normalizedWidth;
+        clipAreaHeight = normalizedHeight;
+    }
+
+    public void clearClipArea() {
+        customClipArea = false;
+    }
+
     public void setLineNumbersVisible(boolean lineNumbersVisible) {
         if (settings != null) {
             settings.setLineNumbersVisible(lineNumbersVisible);
@@ -930,11 +969,18 @@ public class CodeEditor extends Widget {
                 background.draw(batch, getX(), getY(), getWidth(), getHeight());
             }
 
-            drawRows(batch);
-            if (draggingSelectedText) {
-                drawDraggedSelectionDropCaret(batch);
-            } else {
-                drawCaret(batch);
+            boolean clipped = clipAreaEnabled && beginEditorClip();
+            try {
+                drawRows(batch);
+                if (draggingSelectedText) {
+                    drawDraggedSelectionDropCaret(batch);
+                } else {
+                    drawCaret(batch);
+                }
+            } finally {
+                if (clipped) {
+                    clipEnd();
+                }
             }
             if (getStage() == null) {
                 drawSelectionHandles(batch);
@@ -4243,15 +4289,39 @@ public class CodeEditor extends Widget {
         return Math.max(1f, getHeight() - style.topBarHeight - style.statusBarHeight);
     }
 
+    private boolean beginEditorClip() {
+        float clipX = getEditorClipAreaX();
+        float clipY = getEditorClipAreaY();
+        float clipWidth = getEditorClipAreaWidth();
+        float clipHeight = getEditorClipAreaHeight();
+        if (clipWidth <= 0f || clipHeight <= 0f) {
+            return false;
+        }
+        return clipBegin(clipX, clipY, clipWidth, clipHeight);
+    }
+
+    private float getEditorClipAreaX() {
+        return getX() + (customClipArea ? clipAreaX : 0f);
+    }
+
+    private float getEditorClipAreaY() {
+        return getY() + (customClipArea ? clipAreaY : style.statusBarHeight);
+    }
+
+    private float getEditorClipAreaWidth() {
+        return customClipArea ? clipAreaWidth : getWidth();
+    }
+
+    private float getEditorClipAreaHeight() {
+        return customClipArea ? clipAreaHeight : getContentHeight();
+    }
+
     private float getGutterWidth() {
-        float foldIndicatorWidth = !foldRegionsByStart.isEmpty() ? getFoldIndicatorWidth() : 0f;
         if (!lineNumbersVisible) {
-            if (foldIndicatorWidth <= 0f) {
-                return 0f;
-            }
-            return style.gutterLeftPadding + foldIndicatorWidth + style.foldIndicatorRightPadding;
+            return 0f;
         }
 
+        float foldIndicatorWidth = !foldRegionsByStart.isEmpty() ? getFoldIndicatorWidth() : 0f;
         float numberWidth = measureText(Integer.toString(Math.max(1, document.getLineCount())));
         float foldGap = foldIndicatorWidth > 0f ? style.gutterFoldIndicatorGap : 0f;
         return Math.max(
