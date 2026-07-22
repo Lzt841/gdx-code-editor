@@ -150,7 +150,8 @@ public class AndroidDebugApp extends ApplicationAdapter {
         Table editorCard = new Table();
         editorCard.setBackground(card);
         editorCard.pad(8f);
-        editorCard.setClip(true);
+        // Handles hang below the caret; parent clip would cut them and the editor edges.
+        editorCard.setClip(false);
         editorCard.add(editor).grow();
         root.add(editorCard).grow().minHeight(0f);
         root.row();
@@ -624,7 +625,7 @@ public class AndroidDebugApp extends ApplicationAdapter {
         style.scrollbarGap = 12f;
         style.scrollbarMargin = 5f;
         style.scrollbarMinThumbSize = 32f;
-        style.selectionHandleTouchRadiusMultiplier = 2f;
+        style.selectionHandleTouchRadiusMultiplier = 1.25f;
         style.guideSpacing = 20f;
         style.guideOffsetX = -7f;
         style.foldBadgeGap = 12f;

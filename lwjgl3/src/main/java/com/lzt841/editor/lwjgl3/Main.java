@@ -99,13 +99,18 @@ public class Main extends ApplicationAdapter {
     private TextButton popupSearchButton;
     private TextButton popupWrapButton;
     private TextButton popupCloseButton;
+    private TextButton clipAreaButton;
+    private TextButton selectWordButton;
+    private TextButton selectLineButton;
 
     private DemoProfile[] profiles;
     private int profileIndex;
     private String lastEventText = "Ready";
     private Table popupMenu;
+    private Table editorFrame;
     private CodeEditorInteractionContext activePopupContext;
     private final Vector2 popupStagePosition = new Vector2();
+    private boolean customClipInsetEnabled;
 
     @Override
     public void create() {
@@ -129,6 +134,7 @@ public class Main extends ApplicationAdapter {
         editor.setLineNumbersFixed(true);
         editor.setRainbowBracketsEnabled(true);
         editor.setRainbowGuidesEnabled(true);
+        editor.setTransientCaretHandleEnabled(true);
         editor.setSearchText("value");
         editor.setReadOnly(false);
         editor.setDisabled(false);
@@ -146,12 +152,16 @@ public class Main extends ApplicationAdapter {
         applyProfile(0);
 
         ScrollPane sidebar = createSidebar();
-        root.add(sidebar).minWidth(320f).top().fillY();
+        root.add(sidebar).minWidth(300f).prefWidth(300f).top().fillY();
 
-        Table body = new Table();
-        body.setClip(true);
-        body.add(editor).expand().fill();
-        root.add(body).expand().fill();
+        editorFrame = new Table();
+        editorFrame.setBackground(new TextureRegionDrawable(new TextureRegion(whitePixel))
+            .tint(new Color(0.09f, 0.14f, 0.2f, 1f)));
+        editorFrame.pad(10f);
+        // Do not clip the frame: selection handles hang below the caret and must remain visible.
+        editorFrame.setClip(false);
+        editorFrame.add(editor).expand().fill();
+        root.add(editorFrame).expand().fill();
 
         popupMenu = createPopupMenu();
         stage.addActor(popupMenu);
@@ -170,12 +180,17 @@ public class Main extends ApplicationAdapter {
         });
 
         Gdx.input.setInputProcessor(stage);
+        stage.setKeyboardFocus(editor);
         refreshDebugPanel();
+        applyCustomClipInset();
     }
 
     @Override
     public void render() {
         refreshDebugPanel();
+        if (customClipInsetEnabled) {
+            applyCustomClipInset();
+        }
         ScreenUtils.clear(0.047f, 0.071f, 0.102f, 1f);
         stage.act(Gdx.graphics.getDeltaTime());
         stage.draw();
@@ -185,6 +200,9 @@ public class Main extends ApplicationAdapter {
     public void resize(int width, int height) {
         if (stage != null) {
             stage.getViewport().update(width, height, true);
+            if (customClipInsetEnabled) {
+                applyCustomClipInset();
+            }
         }
     }
 
@@ -253,7 +271,7 @@ public class Main extends ApplicationAdapter {
 
         Label title = new Label("Code Editor Debug", debugTitleStyle);
         Label intro = new Label(
-            "Toggle editor capabilities, switch built-in highlighters, and quickly reproduce touch or mouse issues from one place.",
+            "Toggle editor capabilities and samples. Use Select Word/Line to test handles; Custom Clip Inset verifies scissor vs free handles.",
             debugMutedStyle
         );
         intro.setWrap(true);
@@ -486,6 +504,43 @@ public class Main extends ApplicationAdapter {
                 editor.setDisabled(!editor.isDisabled());
             }
         });
+        clipAreaButton = createActionButton("", new Runnable() {
+            @Override
+            public void run() {
+                customClipInsetEnabled = !customClipInsetEnabled;
+                applyCustomClipInset();
+                lastEventText = customClipInsetEnabled
+                    ? "Clip: custom inset enabled (text clips, handles stay free)"
+                    : "Clip: full editor bounds";
+            }
+        });
+        selectWordButton = createActionButton("Select Word At Cursor", new Runnable() {
+            @Override
+            public void run() {
+                stage.setKeyboardFocus(editor);
+                // Desktop AUTO does not enable touch handles; force TOUCH for handle tests.
+                if (editor.getInteractionMode() != CodeEditorInteractionMode.TOUCH) {
+                    editor.setInteractionMode(CodeEditorInteractionMode.TOUCH);
+                }
+                editor.selectWordAtCursor();
+                lastEventText = editor.hasSelection()
+                    ? "Selection: word — drag blue bulb under the caret"
+                    : "Selection: no word at cursor";
+            }
+        });
+        selectLineButton = createActionButton("Select Current Line", new Runnable() {
+            @Override
+            public void run() {
+                stage.setKeyboardFocus(editor);
+                if (editor.getInteractionMode() != CodeEditorInteractionMode.TOUCH) {
+                    editor.setInteractionMode(CodeEditorInteractionMode.TOUCH);
+                }
+                editor.selectLineAtCursor();
+                lastEventText = editor.hasSelection()
+                    ? "Selection: line — drag blue bulb under the caret"
+                    : "Selection: empty line";
+            }
+        });
 
         TextButton reloadButton = createActionButton("Reload Current Sample", new Runnable() {
             @Override
@@ -496,11 +551,14 @@ public class Main extends ApplicationAdapter {
         TextButton jumpTopButton = createActionButton("Move Cursor To Start", new Runnable() {
             @Override
             public void run() {
-                if (!editor.isDisabled()) {
+                if (editor.isDisabled()) {
                     editor.setDisabled(false);
+                }
+                if (editor.isReadOnly()) {
                     editor.setReadOnly(false);
                 }
                 editor.setText(profiles[profileIndex].text);
+                lastEventText = "Cursor/sample reset";
             }
         });
 
@@ -512,6 +570,18 @@ public class Main extends ApplicationAdapter {
         sidebar.row();
         sidebar.add(interactionButton);
         sidebar.row();
+        sidebar.add(new Label("Clip / Handles", debugTitleStyle)).padBottom(2f);
+        sidebar.row();
+        sidebar.add(clipAreaButton);
+        sidebar.row();
+        sidebar.add(selectWordButton);
+        sidebar.row();
+        sidebar.add(selectLineButton);
+        sidebar.row();
+        sidebar.add(transientHandleButton);
+        sidebar.row();
+        sidebar.add(new Label("Display", debugTitleStyle)).padBottom(2f);
+        sidebar.row();
         sidebar.add(wrapButton);
         sidebar.row();
         sidebar.add(lineNumberButton);
@@ -519,8 +589,6 @@ public class Main extends ApplicationAdapter {
         sidebar.add(lineNumberFixedButton);
         sidebar.row();
         sidebar.add(scrollbarButton);
-        sidebar.row();
-        sidebar.add(transientHandleButton);
         sidebar.row();
         sidebar.add(passwordModeButton);
         sidebar.row();
@@ -766,6 +834,7 @@ public class Main extends ApplicationAdapter {
         overscrollButton.setText("Overscroll: " + onOff(editor.isOverscrollEnabled()));
         rainbowBracketButton.setText("Rainbow Brackets: " + onOff(editor.isRainbowBracketsEnabled()));
         rainbowGuideButton.setText("Rainbow Guides: " + onOff(editor.isRainbowGuidesEnabled()));
+        clipAreaButton.setText("Custom Clip Inset: " + onOff(customClipInsetEnabled));
         applySearchButton.setText("Apply Search");
         previousMatchButton.setText("Previous Match");
         nextMatchButton.setText("Next Match");
@@ -787,6 +856,9 @@ public class Main extends ApplicationAdapter {
         statusLabel.setText(
             "Sample: " + profile.name + "\n"
                 + "Highlighter: " + profile.description + "\n"
+                + "Interaction: " + editor.getInteractionMode().name() + "\n"
+                + "Custom clip: " + onOff(customClipInsetEnabled)
+                + "   Clip enabled: " + onOff(editor.isClipAreaEnabled()) + "\n"
                 + "Disabled: " + onOff(editor.isDisabled()) + "   Read only: " + onOff(editor.isReadOnly()) + "\n"
                 + "Wrap: " + onOff(editor.isWrapEnabled())
                 + "   Line numbers: " + onOff(editor.isLineNumbersVisible())
@@ -798,12 +870,11 @@ public class Main extends ApplicationAdapter {
                 + "   Overscroll: " + onOff(editor.isOverscrollEnabled()) + "\n"
                 + "Rainbow brackets: " + onOff(editor.isRainbowBracketsEnabled())
                 + "   Rainbow guides: " + onOff(editor.isRainbowGuidesEnabled()) + "\n"
-                + "Search case: " + (editor.isSearchCaseSensitive() ? "Sensitive" : "Ignore case") + "\n"
-                + "Search: " + (editor.getSearchText().isEmpty() ? "(none)" : editor.getSearchText()) + "\n"
-                + "Current match: " + (editor.hasCurrentSearchMatch() ? editor.getCurrentSearchMatchOrdinal() : 0)
+                + "Search: " + (editor.getSearchText().isEmpty() ? "(none)" : editor.getSearchText())
+                + "  " + (editor.hasCurrentSearchMatch() ? editor.getCurrentSearchMatchOrdinal() : 0)
                 + "/" + editor.getSearchMatchCount() + "\n"
                 + "Zoom: " + formatZoom(editor.getZoomScale()) + "\n"
-                + "Menu demo: mouse right click or touch long press"
+                + "Handle test: Select Word/Line, then drag blue bulbs"
         );
         metricsLabel.setText(
             "Lines: " + editor.getLineCount() + "\n"
@@ -811,7 +882,7 @@ public class Main extends ApplicationAdapter {
                 + "Selection: " + onOff(editor.hasSelection()) + "\n"
                 + "Undo/Redo: " + onOff(editor.canUndo()) + "/" + onOff(editor.canRedo()) + "\n"
                 + "Matches: " + editor.getSearchMatchCount() + "\n"
-                + "Tips: Shift + wheel for horizontal scroll, pinch in touch mode to zoom, and drag selected text in mouse mode to move it."
+                + "Tips: double-click word, drag handles, toggle custom clip, long-press for menu."
         );
         eventLabel.setText(lastEventText);
     }
@@ -861,6 +932,22 @@ public class Main extends ApplicationAdapter {
 
     private String onOff(boolean value) {
         return value ? "On" : "Off";
+    }
+
+    private void applyCustomClipInset() {
+        if (editor == null) {
+            return;
+        }
+        if (!customClipInsetEnabled) {
+            editor.clearClipArea();
+            editor.setClipAreaEnabled(true);
+            return;
+        }
+        // Small inset so custom scissor is visible; default (off) uses full widget bounds.
+        float inset = 12f;
+        float width = Math.max(1f, editor.getWidth() - inset * 2f);
+        float height = Math.max(1f, editor.getHeight() - inset * 2f);
+        editor.setClipArea(inset, inset, width, height);
     }
 
     private CodeEditor.CodeEditorStyle createEditorStyle() {
@@ -1027,7 +1114,7 @@ public class Main extends ApplicationAdapter {
         builder.append("        }\n");
         builder.append("    }\n\n");
 
-        for (int i = 0; i < 200; i++) {
+        for (int i = 0; i < 48; i++) {
             builder.append("    public int computeBlock").append(i).append("(List<String> values) {\n");
             builder.append("        int total = 0;\n");
             builder.append("        for (int index = 0; index < values.size(); index++) {\n");

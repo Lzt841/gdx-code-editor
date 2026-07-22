@@ -10,9 +10,11 @@ import com.badlogic.gdx.graphics.g2d.Batch;
 import com.badlogic.gdx.graphics.g2d.BitmapFont;
 import com.badlogic.gdx.graphics.g2d.GlyphLayout;
 import com.badlogic.gdx.graphics.g2d.TextureRegion;
+import com.badlogic.gdx.math.Rectangle;
 import com.badlogic.gdx.math.Vector2;
 import com.badlogic.gdx.math.Vector3;
 import com.badlogic.gdx.scenes.scene2d.Actor;
+import com.badlogic.gdx.scenes.scene2d.utils.ScissorStack;
 import com.badlogic.gdx.scenes.scene2d.InputEvent;
 import com.badlogic.gdx.scenes.scene2d.InputListener;
 import com.badlogic.gdx.scenes.scene2d.Stage;
@@ -66,12 +68,8 @@ public class CodeEditor extends Widget {
     private static final float DEFAULT_FOLD_BADGE_HORIZONTAL_PADDING = 12f;
     private static final float DEFAULT_FOLD_BADGE_VERTICAL_PADDING = 4f;
     private static final float DEFAULT_SELECTION_HANDLE_RADIUS = 10f;
-    private static final float DEFAULT_SELECTION_HANDLE_TOUCH_RADIUS_MULTIPLIER = 1.8f;
-    private static final float SELECTION_HANDLE_BULB_CENTER_Y_RATIO = 0.38f;
-    private static final float SELECTION_HANDLE_BULB_CENTER_X_LEFT_RATIO = 0.34f;
-    private static final float SELECTION_HANDLE_BULB_CENTER_X_RIGHT_RATIO = 0.66f;
-    private static final float SELECTION_HANDLE_ANCHOR_X_LEFT_RATIO = 0.58f;
-    private static final float SELECTION_HANDLE_ANCHOR_X_RIGHT_RATIO = 0.42f;
+    private static final float DEFAULT_SELECTION_HANDLE_TOUCH_RADIUS_MULTIPLIER = 1.25f;
+    private static final float SELECTION_HANDLE_TOUCH_RADIUS_MULTIPLIER_MAX = 1.35f;
     private static final int HANDLE_CORNER_TOP_LEFT = 0;
     private static final int HANDLE_CORNER_TOP_RIGHT = 1;
     private static final int HANDLE_CORNER_TOP_CENTER = 2;
@@ -130,6 +128,7 @@ public class CodeEditor extends Widget {
     private final IntFloatMap glyphAdvanceCache = new IntFloatMap();
     private final Vector2 scratchVector = new Vector2();
     private final Vector3 scratchVector3 = new Vector3();
+    private final Rectangle clipLocalBounds = new Rectangle();
     private final CodeEditorSettings.Listener settingsListener = new CodeEditorSettings.Listener() {
         @Override
         public void onSettingsChanged(CodeEditorSettings settings) {
@@ -569,10 +568,15 @@ public class CodeEditor extends Widget {
         return customClipArea;
     }
 
+    /**
+     * Sets a custom clip rectangle in actor-local coordinates (origin at the
+     * bottom-left of this editor). Enables clipping if it was disabled.
+     */
     public void setClipArea(float x, float y, float width, float height) {
         float normalizedWidth = Math.max(0f, width);
         float normalizedHeight = Math.max(0f, height);
         if (customClipArea
+            && clipAreaEnabled
             && Float.compare(clipAreaX, x) == 0
             && Float.compare(clipAreaY, y) == 0
             && Float.compare(clipAreaWidth, normalizedWidth) == 0
@@ -580,12 +584,14 @@ public class CodeEditor extends Widget {
             return;
         }
         customClipArea = true;
+        clipAreaEnabled = true;
         clipAreaX = x;
         clipAreaY = y;
         clipAreaWidth = normalizedWidth;
         clipAreaHeight = normalizedHeight;
     }
 
+    /** Clears a custom clip rectangle and returns to clipping the full editor bounds. */
     public void clearClipArea() {
         customClipArea = false;
     }
@@ -969,7 +975,12 @@ public class CodeEditor extends Widget {
                 background.draw(batch, getX(), getY(), getWidth(), getHeight());
             }
 
-            boolean clipped = clipAreaEnabled && beginEditorClip();
+            // Background unclipped; content scissored with expanded screen-space scissors.
+            boolean clipped = false;
+            if (clipAreaEnabled) {
+                batch.flush();
+                clipped = beginEditorClip();
+            }
             try {
                 drawRows(batch);
                 if (draggingSelectedText) {
@@ -979,7 +990,8 @@ public class CodeEditor extends Widget {
                 }
             } finally {
                 if (clipped) {
-                    clipEnd();
+                    batch.flush();
+                    endEditorClip();
                 }
             }
             if (getStage() == null) {
@@ -1449,6 +1461,54 @@ public class CodeEditor extends Widget {
         selectionAnchorColumn = 0;
         document.moveCursorTo(document.getLineCount() - 1, document.getLineLength(document.getLineCount() - 1));
         ensureCursorVisible();
+        refreshBlink();
+    }
+
+    public void selectWordAtCursor() {
+        int line = document.getCursorLine();
+        int column = document.getCursorColumn();
+        String text = document.getLine(line);
+        if (text.isEmpty()) {
+            clearSelection();
+            refreshBlink();
+            return;
+        }
+
+        int pivot = Math.min(column, Math.max(0, text.length() - 1));
+        if (pivot > 0 && pivot == text.length()) {
+            pivot--;
+        }
+        if (!isWordChar(text.charAt(pivot))) {
+            clearSelection();
+            refreshBlink();
+            return;
+        }
+
+        int start = pivot;
+        int end = pivot + 1;
+        while (start > 0 && isWordChar(text.charAt(start - 1))) {
+            start--;
+        }
+        while (end < text.length() && isWordChar(text.charAt(end))) {
+            end++;
+        }
+
+        selectionAnchorLine = line;
+        selectionAnchorColumn = start;
+        document.moveCursorTo(line, end);
+        ensureCursorVisible();
+        showTransientCaretHandle();
+        refreshBlink();
+    }
+
+    public void selectLineAtCursor() {
+        int line = document.getCursorLine();
+        int endColumn = document.getLineLength(line);
+        selectionAnchorLine = line;
+        selectionAnchorColumn = 0;
+        document.moveCursorTo(line, endColumn);
+        ensureCursorVisible();
+        showTransientCaretHandle();
         refreshBlink();
     }
 
@@ -3006,14 +3066,16 @@ public class CodeEditor extends Widget {
         float marginX = stageUnitsFromCentimetersX(0.3f);
         float marginY = stageUnitsFromCentimetersY(0.3f);
         float handleSize = style.selectionHandleRadius * 2f;
+        float touchRadius = getSelectionHandleTouchRadius();
         float left = handle.drawX;
         float right = handle.drawX + handleSize;
         float bottom = handle.drawY;
         float top = handle.drawY + handleSize;
-        return right >= -marginX
-            && left <= getWidth() + marginX
-            && top >= -marginY
-            && bottom <= getHeight() + marginY;
+        // Full actor bounds + margin. Handles hang below the line so expand bottom by handleSize.
+        return right >= -marginX - touchRadius
+            && left <= getWidth() + marginX + touchRadius
+            && top >= -marginY - handleSize
+            && bottom <= getHeight() + marginY + touchRadius;
     }
 
     private void attachSelectionHandleOverlay(Stage stage) {
@@ -3089,11 +3151,15 @@ public class CodeEditor extends Widget {
         return stageToLocalCoordinates(scratchVector);
     }
 
-    private boolean isStagePositionNearSelectionHandle(float stageX, float stageY) {
+    /**
+     * @param overlayLocalX Y coordinates in SelectionHandleOverlay local space
+     *                      (overlay is full-stage at 0,0 so this equals stage space).
+     */
+    private boolean isStagePositionNearSelectionHandle(float overlayLocalX, float overlayLocalY) {
         if (!shouldShowTouchHandles()) {
             return false;
         }
-        Vector2 local = stageToLocalHandleCoordinates(stageX, stageY);
+        Vector2 local = stageToLocalHandleCoordinates(overlayLocalX, overlayLocalY);
         return isNearAnyHandle(local.x, local.y);
     }
 
@@ -3211,14 +3277,18 @@ public class CodeEditor extends Widget {
         if (placement == null) {
             return null;
         }
-        float rowBottom = rowBottom(placement.row);
-        float anchorY = rowBottom + 2f;
-        float handleSize = style.selectionHandleRadius * 2f;
-        float drawX = endHandle ? placement.x : placement.x - handleSize;
+        float radius = style.selectionHandleRadius;
+        float handleSize = radius * 2f;
+        // Tip of handle attaches just under the caret baseline.
+        float anchorX = placement.x;
+        float anchorY = rowBottom(placement.row) + 2f;
+        // Start: square left of caret (TOP_RIGHT stem). End: square right of caret (TOP_LEFT stem).
+        float drawX = endHandle ? anchorX : anchorX - handleSize;
         float drawY = anchorY - handleSize;
-        float hitX = drawX + handleSize * 0.5f;
-        float hitY = drawY + handleSize * SELECTION_HANDLE_BULB_CENTER_Y_RATIO;
-        return new HandlePlacement(placement.x, anchorY, drawX, drawY, hitX, hitY);
+        // Must match drawCornerBubbleHandle circle center: (drawX + size/2, drawY + size/2).
+        float hitX = drawX + radius;
+        float hitY = drawY + radius;
+        return new HandlePlacement(anchorX, anchorY, drawX, drawY, hitX, hitY);
     }
 
     private HandlePlacement getCaretHandlePlacement() {
@@ -3226,14 +3296,15 @@ public class CodeEditor extends Widget {
         if (placement == null) {
             return null;
         }
-        float rowBottom = rowBottom(placement.row);
-        float anchorY = rowBottom + 2f;
-        float handleSize = style.selectionHandleRadius * 2f;
-        float drawX = placement.x - style.selectionHandleRadius;
+        float radius = style.selectionHandleRadius;
+        float handleSize = radius * 2f;
+        float anchorX = placement.x;
+        float anchorY = rowBottom(placement.row) + 2f;
+        float drawX = anchorX - radius;
         float drawY = anchorY - handleSize;
-        float hitX = placement.x;
-        float hitY = drawY + handleSize * 0.5f;
-        return new HandlePlacement(placement.x, anchorY, drawX, drawY, hitX, hitY);
+        float hitX = drawX + radius;
+        float hitY = drawY + radius;
+        return new HandlePlacement(anchorX, anchorY, drawX, drawY, hitX, hitY);
     }
 
     private boolean beginAnyHandleDrag(float x, float y) {
@@ -3248,20 +3319,27 @@ public class CodeEditor extends Widget {
 
         HandlePlacement start = getHandlePlacement(selection.startLine, selection.startColumn, false);
         HandlePlacement end = getHandlePlacement(selection.endLine, selection.endColumn, true);
-        if (isNearHandle(x, y, start)) {
+        boolean nearStart = isHandleVisibleWithinEditorBounds(start) && isNearHandle(x, y, start);
+        boolean nearEnd = isHandleVisibleWithinEditorBounds(end) && isNearHandle(x, y, end);
+        if (nearStart && nearEnd) {
+            nearStart = distanceSquaredToHandle(x, y, start) <= distanceSquaredToHandle(x, y, end);
+            nearEnd = !nearStart;
+        }
+        if (nearStart) {
             draggingStartHandle = true;
             draggingEndHandle = false;
             pendingTouchPress = false;
             longPressTriggered = false;
             handleDragFixedLine = selection.endLine;
             handleDragFixedColumn = selection.endColumn;
+            // Map finger -> selection tip (anchor), so the caret edge follows under the tip.
             handleDragPointerOffsetX = x - start.x;
             handleDragPointerOffsetY = y - start.y;
             touchScrollVelocityX = 0f;
             touchScrollVelocityY = 0f;
             return true;
         }
-        if (isNearHandle(x, y, end)) {
+        if (nearEnd) {
             draggingStartHandle = false;
             draggingEndHandle = true;
             pendingTouchPress = false;
@@ -3282,7 +3360,7 @@ public class CodeEditor extends Widget {
             return false;
         }
         HandlePlacement caret = getCaretHandlePlacement();
-        if (!isNearHandle(x, y, caret)) {
+        if (!isHandleVisibleWithinEditorBounds(caret) || !isNearHandle(x, y, caret)) {
             return false;
         }
         draggingCaretHandle = true;
@@ -3304,21 +3382,28 @@ public class CodeEditor extends Widget {
         if (handle == null) {
             return false;
         }
-        float handleSize = style.selectionHandleRadius * 2f;
-        float extraPadding = Math.max(
-            0f,
-            style.selectionHandleRadius * (style.selectionHandleTouchRadiusMultiplier - 1f)
+        // Only the visual bulb (and a small pad). Do NOT include the caret tip —
+        // a capsule to the tip made large areas of text steal handle drags.
+        float touchRadius = getSelectionHandleTouchRadius();
+        float dx = x - handle.hitX;
+        float dy = y - handle.hitY;
+        return dx * dx + dy * dy <= touchRadius * touchRadius;
+    }
+
+    private float getSelectionHandleTouchRadius() {
+        // Visual radius + modest pad. Cap multiplier so hit stays on the bulb, not half the line.
+        float visual = Math.max(1f, style.selectionHandleRadius);
+        float multiplier = Math.max(
+            1f,
+            Math.min(style.selectionHandleTouchRadiusMultiplier, SELECTION_HANDLE_TOUCH_RADIUS_MULTIPLIER_MAX)
         );
-        float left = handle.drawX;
-        float right = handle.drawX + handleSize;
-        float bottom = handle.drawY;
-        float top = handle.drawY + handleSize;
-        float nearestX = clamp(x, left, right);
-        float nearestY = clamp(y, bottom, top);
-        float dx = x - nearestX;
-        float dy = y - nearestY;
-        return dx * dx + dy * dy <= extraPadding * extraPadding
-            || (x >= left && x <= right && y >= bottom && y <= top);
+        return visual * multiplier;
+    }
+
+    private float distanceSquaredToHandle(float x, float y, HandlePlacement handle) {
+        float dx = x - handle.hitX;
+        float dy = y - handle.hitY;
+        return dx * dx + dy * dy;
     }
 
     private boolean isNearAnyHandle(float x, float y) {
@@ -4290,30 +4375,54 @@ public class CodeEditor extends Widget {
     }
 
     private boolean beginEditorClip() {
-        float clipX = getEditorClipAreaX();
-        float clipY = getEditorClipAreaY();
-        float clipWidth = getEditorClipAreaWidth();
-        float clipHeight = getEditorClipAreaHeight();
-        if (clipWidth <= 0f || clipHeight <= 0f) {
+        Stage stage = getStage();
+        if (stage == null) {
             return false;
         }
-        return clipBegin(clipX, clipY, clipWidth, clipHeight);
+        float x;
+        float y;
+        float width;
+        float height;
+        if (customClipArea) {
+            if (clipAreaWidth <= 0f || clipAreaHeight <= 0f) {
+                return false;
+            }
+            x = getX() + clipAreaX;
+            y = getY() + clipAreaY;
+            width = clipAreaWidth;
+            height = clipAreaHeight;
+        } else {
+            // Full actor bounds in current draw space (Group may promote child x/y).
+            x = getX();
+            y = getY();
+            width = getWidth();
+            height = getHeight();
+        }
+        if (width <= 0f || height <= 0f) {
+            return false;
+        }
+
+        // Expand in draw space first (glyph padding / antialias), then expand again after
+        // projection with floor/ceil so ScissorStack Math.round + f2i cannot shave edges.
+        float drawPad = Math.max(4f, lineHeight > 0f ? lineHeight * 0.2f : 4f);
+        clipLocalBounds.set(x - drawPad, y - drawPad, width + drawPad * 2f, height + drawPad * 2f);
+
+        Rectangle scissorBounds = Actor.POOLS.obtain(Rectangle.class);
+        stage.calculateScissors(clipLocalBounds, scissorBounds);
+        float left = (float) Math.floor(scissorBounds.x) - 2f;
+        float bottom = (float) Math.floor(scissorBounds.y) - 2f;
+        float right = (float) Math.ceil(scissorBounds.x + scissorBounds.width) + 2f;
+        float top = (float) Math.ceil(scissorBounds.y + scissorBounds.height) + 2f;
+        scissorBounds.set(left, bottom, Math.max(1f, right - left), Math.max(1f, top - bottom));
+        if (ScissorStack.pushScissors(scissorBounds)) {
+            return true;
+        }
+        Actor.POOLS.free(scissorBounds);
+        return false;
     }
 
-    private float getEditorClipAreaX() {
-        return getX() + (customClipArea ? clipAreaX : 0f);
-    }
-
-    private float getEditorClipAreaY() {
-        return getY() + (customClipArea ? clipAreaY : style.statusBarHeight);
-    }
-
-    private float getEditorClipAreaWidth() {
-        return customClipArea ? clipAreaWidth : getWidth();
-    }
-
-    private float getEditorClipAreaHeight() {
-        return customClipArea ? clipAreaHeight : getContentHeight();
+    private void endEditorClip() {
+        Actor.POOLS.free(ScissorStack.popScissors());
     }
 
     private float getGutterWidth() {
@@ -4882,10 +4991,13 @@ public class CodeEditor extends Widget {
     }
 
     private static final class HandlePlacement {
+        /** Caret/selection tip (local). */
         final float x;
         final float y;
+        /** Drawable bottom-left (local). */
         final float drawX;
         final float drawY;
+        /** Visual bulb center (local); must match drawCornerBubbleHandle. */
         final float hitX;
         final float hitY;
 
@@ -5337,7 +5449,8 @@ public class CodeEditor extends Widget {
                 style.scrollbarHitWidth = Math.max(style.scrollbarWidth * 2.5f, DEFAULT_SCROLLBAR_HIT_WIDTH);
                 style.scrollbarMinThumbSize = Math.max(24f, derivedScrollbarWidth * 3f);
                 style.selectionHandleRadius = derivedHandleRadius;
-                style.selectionHandleTouchRadiusMultiplier = Math.max(1.8f, derivedHandleRadius / 6f);
+                // Keep touch slightly larger than the visual bulb only (not radius-scaled huge).
+                style.selectionHandleTouchRadiusMultiplier = 1.25f;
                 style.magnifierWidth = derivedMagnifierWidth;
                 style.magnifierHeight = derivedMagnifierHeight;
                 style.magnifierContentPadding = derivedMagnifierPadding;
@@ -5491,17 +5604,35 @@ public class CodeEditor extends Widget {
                 int cornerMode,
                 Color color
             ) {
-                float radius = Math.min(width, height) * 0.5f;
+                // Square drawable: circle center = (x + w/2, y + h/2) == HandlePlacement.hitX/hitY.
+                float size = Math.min(width, height);
+                float radius = size * 0.5f;
                 float centerX = x + width * 0.5f;
                 float centerY = y + height * 0.5f;
-                drawCircle(batch, pixel, centerX, centerY, radius, color);
+                float top = y + height;
                 if (cornerMode == HANDLE_CORNER_TOP_LEFT) {
-                    drawRect(batch, pixel, x, centerY, width * 0.5f, height * 0.5f, color);
+                    // End: stem fills top-left quadrant toward caret.
+                    drawRect(batch, pixel, x, centerY, radius, top - centerY, color);
+                    drawCircle(batch, pixel, centerX, centerY, radius, color);
                 } else if (cornerMode == HANDLE_CORNER_TOP_RIGHT) {
-                    drawRect(batch, pixel, centerX, centerY, width * 0.5f, height * 0.5f, color);
+                    // Start: stem fills top-right quadrant toward caret.
+                    drawRect(batch, pixel, centerX, centerY, radius, top - centerY, color);
+                    drawCircle(batch, pixel, centerX, centerY, radius, color);
                 } else {
-                    float h= Math.round(Math.sqrt(width*width+height*height)/2);
-                    drawTriangle(batch, pixel, centerX,centerY+h, centerX-width*0.5f, centerY, centerX+width*0.5f, centerY, color);
+                    // Caret: teardrop tip at top-center, then circle.
+                    float halfBase = radius * 0.85f;
+                    drawTriangle(
+                        batch,
+                        pixel,
+                        centerX,
+                        top,
+                        centerX - halfBase,
+                        centerY,
+                        centerX + halfBase,
+                        centerY,
+                        color
+                    );
+                    drawCircle(batch, pixel, centerX, centerY, radius, color);
                 }
             }
 
