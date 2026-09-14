@@ -1,50 +1,63 @@
 package com.lzt841.editor.structure;
 
-import com.badlogic.gdx.utils.Array;
+/**
+ * Python-oriented structure provider based on indentation and ':' block starters.
+ *
+ * <p>Incremental: its only cross-line state is which triple-quoted string is open, if any. The indent
+ * widths that decide where a block ends live in the block stack, which the caller owns, so an edit above
+ * a block does not have to be understood by this class.
+ */
+public class PythonIndentCodeStructureProvider extends AbstractIncrementalStructureProvider {
 
-/** Python-oriented structure provider based on indentation and ':' block starters. */
-public class PythonIndentCodeStructureProvider implements CodeStructureProvider {
+    /** Inside a {@code """} string at the start of the line. */
+    private static final int STATE_TRIPLE_DOUBLE = 1;
+    /** Inside a {@code '''} string at the start of the line. */
+    private static final int STATE_TRIPLE_SINGLE = 2;
+
+    /** Reused per line; the scan is single-threaded and the object never escapes. */
+    private final PythonLineInfo scratchInfo = new PythonLineInfo();
+
+    /** @return this, so it can be set inline where the provider is constructed */
+    public PythonIndentCodeStructureProvider setSymbolProvider(CodeSymbolProvider symbolProvider) {
+        this.symbolProvider = symbolProvider;
+        return this;
+    }
+
     @Override
-    public CodeStructureInfo analyze(Array<String> lines) {
-        int[] indentLevels = new int[lines.size];
-        Array<CodeFoldRegion> regions = new Array<>();
-        Array<IndentFrame> stack = new Array<>();
-        PythonScanState state = new PythonScanState();
-        int lastContentLine = -1;
+    public int analyzeLine(CharSequence line, int startState, CodeStructureLineContext context) {
+        int indentWidth = countIndentWidth(line);
+        PythonLineInfo info = scratchInfo;
+        info.reset();
+        int endState = scanLine(line, startState, info);
 
-        for (int lineIndex = 0; lineIndex < lines.size; lineIndex++) {
-            String line = lines.get(lineIndex);
-            int indentWidth = countIndentWidth(line);
-            PythonLineInfo info = analyzeLine(line, state);
-
-            if (info.meaningful) {
-                while (stack.size > 0 && indentWidth <= stack.peek().indentWidth) {
-                    closeFrame(stack.pop(), lastContentLine, regions);
-                }
-                indentLevels[lineIndex] = stack.size;
-                if (info.blockStart) {
-                    stack.add(new IndentFrame(lineIndex, indentWidth, stack.size));
-                }
-                lastContentLine = lineIndex;
-            } else {
-                indentLevels[lineIndex] = stack.size;
+        if (info.meaningful) {
+            // A line at or left of the block's own indent ends it, and it ends at the last line that had
+            // content — not at this one, which belongs to the enclosing block.
+            while (context.getBlockDepth() > 0
+                && indentWidth <= context.getBlockKey(context.getBlockDepth() - 1)) {
+                context.closeBlock(context.getLastContentLine());
             }
+            // After the pops, so a de-denting line reports the depth it lands at rather than the one it
+            // came from.
+            context.setIndentLevel(context.getBlockDepth());
+            if (info.blockStart) {
+                context.openBlock(indentWidth);
+            }
+            // After the pops above, which need the previous content line as their end.
+            context.markContentLine();
         }
-
-        while (stack.size > 0) {
-            closeFrame(stack.pop(), lastContentLine, regions);
-        }
-
-        return new CodeStructureInfo(indentLevels, regions);
+        return endState;
     }
 
-    private void closeFrame(IndentFrame frame, int endLine, Array<CodeFoldRegion> regions) {
-        if (endLine > frame.startLine) {
-            regions.add(new CodeFoldRegion(frame.startLine, endLine, frame.depth));
+    @Override
+    public void finish(int endState, CodeStructureLineContext context) {
+        // Unlike a brace block, an indentation block genuinely ends when the file does.
+        while (context.getBlockDepth() > 0) {
+            context.closeBlock(context.getLastContentLine());
         }
     }
 
-    private int countIndentWidth(String line) {
+    private int countIndentWidth(CharSequence line) {
         int width = 0;
         for (int i = 0; i < line.length(); i++) {
             char c = line.charAt(i);
@@ -59,19 +72,20 @@ public class PythonIndentCodeStructureProvider implements CodeStructureProvider 
         return width;
     }
 
-    private PythonLineInfo analyzeLine(String line, PythonScanState state) {
-        PythonLineInfo info = new PythonLineInfo();
+    /** Classifies one line into {@code info} and returns the state the next line starts in. */
+    private int scanLine(CharSequence line, int startState, PythonLineInfo info) {
+        int state = startState;
         int index = 0;
 
         while (index < line.length()) {
-            if (state.inTripleString) {
-                int end = line.indexOf(state.tripleDelimiter, index);
+            if (state != START_STATE) {
+                char delimiter = state == STATE_TRIPLE_DOUBLE ? '"' : '\'';
+                int end = indexOfTriple(line, delimiter, index);
                 if (end < 0) {
-                    return info;
+                    return state;
                 }
-                index = end + state.tripleDelimiter.length();
-                state.inTripleString = false;
-                state.tripleDelimiter = null;
+                index = end + 3;
+                state = START_STATE;
                 continue;
             }
 
@@ -81,7 +95,7 @@ public class PythonIndentCodeStructureProvider implements CodeStructureProvider 
                 continue;
             }
             if (current == '#') {
-                return info;
+                return state;
             }
 
             int prefixLength = getStringPrefixLength(line, index);
@@ -92,12 +106,9 @@ public class PythonIndentCodeStructureProvider implements CodeStructureProvider 
                 if (quoteIndex + 2 < line.length()
                     && line.charAt(quoteIndex + 1) == quote
                     && line.charAt(quoteIndex + 2) == quote) {
-                    String delimiter = new String(new char[] {quote, quote, quote});
-                    int end = line.indexOf(delimiter, quoteIndex + 3);
+                    int end = indexOfTriple(line, quote, quoteIndex + 3);
                     if (end < 0) {
-                        state.inTripleString = true;
-                        state.tripleDelimiter = delimiter;
-                        return info;
+                        return quote == '"' ? STATE_TRIPLE_DOUBLE : STATE_TRIPLE_SINGLE;
                     }
                     index = end + 3;
                     continue;
@@ -112,10 +123,25 @@ public class PythonIndentCodeStructureProvider implements CodeStructureProvider 
         }
 
         info.blockStart = info.meaningful && info.lastCodeChar == ':';
-        return info;
+        return state;
     }
 
-    private int getStringPrefixLength(String line, int start) {
+    /**
+     * First index at or after {@code from} where three {@code quote} characters run consecutively, or -1.
+     *
+     * <p>Hand-written rather than {@code String.indexOf} so the scan accepts a {@link CharSequence} and
+     * allocates no delimiter string per line.
+     */
+    private static int indexOfTriple(CharSequence line, char quote, int from) {
+        for (int i = Math.max(0, from); i + 2 < line.length(); i++) {
+            if (line.charAt(i) == quote && line.charAt(i + 1) == quote && line.charAt(i + 2) == quote) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private int getStringPrefixLength(CharSequence line, int start) {
         if (!isIdentifierBoundary(line, start)) {
             return -1;
         }
@@ -133,7 +159,7 @@ public class PythonIndentCodeStructureProvider implements CodeStructureProvider 
         return -1;
     }
 
-    private boolean isIdentifierBoundary(String line, int index) {
+    private boolean isIdentifierBoundary(CharSequence line, int index) {
         if (index <= 0 || index > line.length()) {
             return true;
         }
@@ -141,7 +167,7 @@ public class PythonIndentCodeStructureProvider implements CodeStructureProvider 
         return !Character.isLetterOrDigit(previous) && previous != '_';
     }
 
-    private int readSingleQuotedString(String line, int start, char quote) {
+    private int readSingleQuotedString(CharSequence line, int start, char quote) {
         boolean escaped = false;
         int index = start + 1;
         while (index < line.length()) {
@@ -158,26 +184,15 @@ public class PythonIndentCodeStructureProvider implements CodeStructureProvider 
         return line.length();
     }
 
-    private static final class IndentFrame {
-        final int startLine;
-        final int indentWidth;
-        final int depth;
-
-        IndentFrame(int startLine, int indentWidth, int depth) {
-            this.startLine = startLine;
-            this.indentWidth = indentWidth;
-            this.depth = depth;
-        }
-    }
-
-    private static final class PythonScanState {
-        boolean inTripleString;
-        String tripleDelimiter;
-    }
-
     private static final class PythonLineInfo {
         boolean meaningful;
         boolean blockStart;
         char lastCodeChar;
+
+        void reset() {
+            meaningful = false;
+            blockStart = false;
+            lastCodeChar = 0;
+        }
     }
 }

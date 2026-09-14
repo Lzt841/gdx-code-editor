@@ -1,11 +1,17 @@
 package com.lzt841.editor.highlight;
 
-import com.badlogic.gdx.utils.ObjectSet;
+import com.badlogic.gdx.graphics.Color;
 import com.badlogic.gdx.utils.Array;
+import com.badlogic.gdx.utils.ObjectSet;
 import com.lzt841.editor.CodeEditor;
 
 /** Built-in highlighter for JavaScript and TypeScript-like code. */
-public class JavaScriptCodeHighlighter implements CodeHighlighter {
+public class JavaScriptCodeHighlighter extends AbstractIncrementalHighlighter {
+    /** Continuation state: the line begins inside a block comment. */
+    private static final int STATE_BLOCK_COMMENT = 1;
+    /** Continuation state: the line begins inside a back-tick template string. */
+    private static final int STATE_TEMPLATE_STRING = 2;
+
     private static final ObjectSet<String> KEYWORDS = ObjectSet.with(
         "await", "break", "case", "catch", "class", "const", "continue", "debugger",
         "default", "delete", "do", "else", "export", "extends", "finally", "for",
@@ -24,123 +30,138 @@ public class JavaScriptCodeHighlighter implements CodeHighlighter {
     );
 
     @Override
-    public Array<Array<CodeHighlightSpan>> highlight(Array<String> lines, CodeEditor.CodeEditorStyle style) {
-        Array<Array<CodeHighlightSpan>> result = new Array<>(lines.size);
-        boolean inBlockComment = false;
-        boolean inTemplateString = false;
+    public int highlightLine(
+        CharSequence line,
+        int startState,
+        CodeEditor.CodeEditorStyle style,
+        Array<CodeHighlightSpan> spans,
+        Array<CodeBracketIgnoreSpan> bracketIgnoreSpans
+    ) {
+        boolean wantSpans = spans != null && style != null;
+        boolean inBlockComment = startState == STATE_BLOCK_COMMENT;
+        boolean inTemplateString = startState == STATE_TEMPLATE_STRING;
+        int index = 0;
+        int length = line.length();
 
-        for (String line : lines) {
-            Array<CodeHighlightSpan> spans = new Array<>();
-            int index = 0;
-
-            while (index < line.length()) {
-                if (inBlockComment) {
-                    int end = line.indexOf("*/", index);
-                    if (end < 0) {
-                        HighlighterSupport.addSpan(spans, index, line.length(), style.commentColor);
-                        break;
+        while (index < length) {
+            if (inBlockComment) {
+                int end = HighlighterSupport.indexOf(line, "*/", index);
+                if (end < 0) {
+                    if (wantSpans) {
+                        HighlighterSupport.addSpan(spans, index, length, style.commentColor);
                     }
+                    HighlighterSupport.addIgnoreSpan(bracketIgnoreSpans, index, length);
+                    return STATE_BLOCK_COMMENT;
+                }
+                if (wantSpans) {
                     HighlighterSupport.addSpan(spans, index, end + 2, style.commentColor);
-                    index = end + 2;
-                    inBlockComment = false;
-                    continue;
                 }
-
-                if (inTemplateString) {
-                    int end = HighlighterSupport.readString(line, index, '`');
-                    HighlighterSupport.addSpan(spans, index, end, style.stringColor);
-                    inTemplateString = end >= line.length() && (line.isEmpty() || line.charAt(line.length() - 1) != '`');
-                    index = end;
-                    continue;
-                }
-
-                if (line.startsWith("//", index)) {
-                    HighlighterSupport.addSpan(spans, index, line.length(), style.commentColor);
-                    break;
-                }
-                if (line.startsWith("/*", index)) {
-                    int end = line.indexOf("*/", index + 2);
-                    if (end < 0) {
-                        HighlighterSupport.addSpan(spans, index, line.length(), style.commentColor);
-                        inBlockComment = true;
-                        break;
-                    }
-                    HighlighterSupport.addSpan(spans, index, end + 2, style.commentColor);
-                    index = end + 2;
-                    continue;
-                }
-
-                char c = line.charAt(index);
-                if (c == '"' || c == '\'') {
-                    int end = HighlighterSupport.readString(line, index, c);
-                    HighlighterSupport.addSpan(spans, index, end, style.stringColor);
-                    index = end;
-                    continue;
-                }
-                if (c == '`') {
-                    int end = HighlighterSupport.readString(line, index, '`');
-                    HighlighterSupport.addSpan(spans, index, end, style.stringColor);
-                    inTemplateString = end >= line.length() && (line.isEmpty() || line.charAt(line.length() - 1) != '`');
-                    index = end;
-                    continue;
-                }
-                if (HighlighterSupport.isNumberStart(line, index)) {
-                    int end = HighlighterSupport.readNumber(line, index);
-                    HighlighterSupport.addSpan(spans, index, end, style.numberColor);
-                    index = end;
-                    continue;
-                }
-                if (Character.isJavaIdentifierStart(c) || c == '$') {
-                    int end = HighlighterSupport.readIdentifier(line, index, "$");
-                    String token = line.substring(index, end);
-                    if (KEYWORDS.contains(token)) {
-                        HighlighterSupport.addSpan(spans, index, end, style.keywordColor);
-                    } else if (TYPES.contains(token)) {
-                        HighlighterSupport.addSpan(spans, index, end, style.typeColor);
-                    } else if (LITERALS.contains(token)) {
-                        HighlighterSupport.addSpan(spans, index, end, style.literalColor);
-                    }
-                    index = end;
-                    continue;
-                }
-                index++;
+                HighlighterSupport.addIgnoreSpan(bracketIgnoreSpans, index, end + 2);
+                index = end + 2;
+                inBlockComment = false;
+                continue;
             }
 
-            result.add(spans);
+            if (inTemplateString) {
+                int end = HighlighterSupport.readString(line, index, '`');
+                if (wantSpans) {
+                    HighlighterSupport.addSpan(spans, index, end, style.stringColor);
+                }
+                HighlighterSupport.addIgnoreSpan(bracketIgnoreSpans, index, end);
+                inTemplateString = templateStringContinues(line, end);
+                index = end;
+                continue;
+            }
+
+            if (HighlighterSupport.startsWith(line, "//", index)) {
+                if (wantSpans) {
+                    HighlighterSupport.addSpan(spans, index, length, style.commentColor);
+                }
+                HighlighterSupport.addIgnoreSpan(bracketIgnoreSpans, index, length);
+                return 0;
+            }
+            if (HighlighterSupport.startsWith(line, "/*", index)) {
+                int end = HighlighterSupport.indexOf(line, "*/", index + 2);
+                if (end < 0) {
+                    if (wantSpans) {
+                        HighlighterSupport.addSpan(spans, index, length, style.commentColor);
+                    }
+                    HighlighterSupport.addIgnoreSpan(bracketIgnoreSpans, index, length);
+                    return STATE_BLOCK_COMMENT;
+                }
+                if (wantSpans) {
+                    HighlighterSupport.addSpan(spans, index, end + 2, style.commentColor);
+                }
+                HighlighterSupport.addIgnoreSpan(bracketIgnoreSpans, index, end + 2);
+                index = end + 2;
+                continue;
+            }
+
+            char c = line.charAt(index);
+            if (c == '"' || c == '\'') {
+                int end = HighlighterSupport.readString(line, index, c);
+                if (wantSpans) {
+                    HighlighterSupport.addSpan(spans, index, end, style.stringColor);
+                }
+                HighlighterSupport.addIgnoreSpan(bracketIgnoreSpans, index, end);
+                index = end;
+                continue;
+            }
+            if (c == '`') {
+                int end = HighlighterSupport.readString(line, index, '`');
+                if (wantSpans) {
+                    HighlighterSupport.addSpan(spans, index, end, style.stringColor);
+                }
+                HighlighterSupport.addIgnoreSpan(bracketIgnoreSpans, index, end);
+                inTemplateString = templateStringContinues(line, end);
+                index = end;
+                continue;
+            }
+            if (HighlighterSupport.isNumberStart(line, index)) {
+                int end = HighlighterSupport.readNumber(line, index);
+                if (wantSpans) {
+                    HighlighterSupport.addSpan(spans, index, end, style.numberColor);
+                }
+                index = end;
+                continue;
+            }
+            if (Character.isJavaIdentifierStart(c) || c == '$') {
+                int end = HighlighterSupport.readIdentifier(line, index, "$");
+                if (wantSpans) {
+                    HighlighterSupport.addSpan(spans, index, end, colorForWord(line, index, end, style));
+                }
+                index = end;
+                continue;
+            }
+            index++;
         }
-        return result;
+
+        if (inBlockComment) {
+            return STATE_BLOCK_COMMENT;
+        }
+        return inTemplateString ? STATE_TEMPLATE_STRING : 0;
     }
 
-    @Override
-    public Array<Array<CodeBracketIgnoreSpan>> getBracketIgnoreSpans(Array<String> lines) {
-        Array<Array<CodeBracketIgnoreSpan>> result = new Array<>(lines.size);
-        boolean inTemplateString = false;
+    /**
+     * Whether a template string that was scanned up to {@code end} runs on to the next line. Keeps
+     * the original heuristic: the scan reached the end of the line without a closing back-tick.
+     */
+    private static boolean templateStringContinues(CharSequence line, int end) {
+        int length = line.length();
+        return end >= length && (length == 0 || line.charAt(length - 1) != '`');
+    }
 
-        for (String line : lines) {
-            Array<CodeBracketIgnoreSpan> spans = new Array<>();
-            int index = 0;
-            while (index < line.length()) {
-                if (inTemplateString) {
-                    int end = HighlighterSupport.readString(line, index, '`');
-                    HighlighterSupport.addIgnoreSpan(spans, index, end);
-                    inTemplateString = end >= line.length() && (line.isEmpty() || line.charAt(line.length() - 1) != '`');
-                    index = end;
-                    continue;
-                }
-
-                if (line.charAt(index) == '`') {
-                    int end = HighlighterSupport.readString(line, index, '`');
-                    HighlighterSupport.addIgnoreSpan(spans, index, end);
-                    inTemplateString = end >= line.length() && (line.isEmpty() || line.charAt(line.length() - 1) != '`');
-                    index = end;
-                    continue;
-                }
-
-                index++;
-            }
-            result.add(spans);
+    private static Color colorForWord(CharSequence line, int start, int end, CodeEditor.CodeEditorStyle style) {
+        String token = line.subSequence(start, end).toString();
+        if (KEYWORDS.contains(token)) {
+            return style.keywordColor;
         }
-
-        return result;
+        if (TYPES.contains(token)) {
+            return style.typeColor;
+        }
+        if (LITERALS.contains(token)) {
+            return style.literalColor;
+        }
+        return null;
     }
 }

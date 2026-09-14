@@ -5,7 +5,21 @@ import com.badlogic.gdx.backends.lwjgl3.Lwjgl3ApplicationConfiguration;
 
 /** Launches the desktop (LWJGL3) application. */
 public class Lwjgl3Launcher {
+    /**
+     * LWJGL encodes clipboard strings into a thread-local MemoryStack that defaults to 64 KB, which a
+     * large selection overflows with an OutOfMemoryError. 8 MB covers copying the whole of the demo's
+     * 100,000-line stress sample.
+     *
+     * <p>Set as a system property rather than through {@code Configuration.STACK_SIZE} so it applies
+     * before any LWJGL class is loaded, and set at the top of {@code main} so it is applied again in
+     * the relaunched JVM when {@link StartupHelper} restarts the process.
+     */
+    private static final String LWJGL_STACK_SIZE_KB = "8192";
+
     public static void main(String[] args) {
+        if (System.getProperty("org.lwjgl.system.stackSize") == null) {
+            System.setProperty("org.lwjgl.system.stackSize", LWJGL_STACK_SIZE_KB);
+        }
         if (StartupHelper.startNewJvmIfRequired()) return; // This handles macOS support and helps on Windows.
         createApplication();
     }

@@ -4,13 +4,20 @@ import com.badlogic.gdx.utils.Array;
 import com.lzt841.editor.CodeEditor;
 
 /** No-op highlighter for plain text editing. */
-public class PlainTextHighlighter implements CodeHighlighter {
+public class PlainTextHighlighter extends AbstractIncrementalHighlighter {
     @Override
-    public Array<Array<CodeHighlightSpan>> highlight(Array<String> lines, CodeEditor.CodeEditorStyle style) {
-        Array<Array<CodeHighlightSpan>> result = new Array<>(lines.size);
-        for (int i = 0; i < lines.size; i++) {
-            result.add(new Array<CodeHighlightSpan>(0));
-        }
-        return result;
+    public int highlightLine(
+        CharSequence line,
+        int startState,
+        CodeEditor.CodeEditorStyle style,
+        Array<CodeHighlightSpan> spans,
+        Array<CodeBracketIgnoreSpan> bracketIgnoreSpans
+    ) {
+        return START_STATE;
+    }
+
+    @Override
+    public int advanceState(CharSequence line, int startState, CodeEditor.CodeEditorStyle style) {
+        return START_STATE;
     }
 }

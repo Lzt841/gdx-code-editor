@@ -7,6 +7,8 @@ import com.lzt841.editor.input.CodeEditorInteractionMode;
 public class CodeEditorSettings {
     private final Array<Listener> listeners = new Array<>();
     private boolean wrapEnabled;
+    private boolean wrapContinuationIndentEnabled;
+    private int wrapContinuationIndentColumns;
     private boolean lineNumbersVisible = true;
     private boolean lineNumbersFixed = true;
     private boolean magnifierEnabled = true;
@@ -28,6 +30,40 @@ public class CodeEditorSettings {
             return;
         }
         this.wrapEnabled = wrapEnabled;
+        notifyChanged();
+    }
+
+    /** Whether wrapped rows align under the start of their line's text. Off by default. */
+    public boolean isWrapContinuationIndentEnabled() {
+        return wrapContinuationIndentEnabled;
+    }
+
+    /**
+     * Indents wrapped continuation rows under the start of their line's own text.
+     *
+     * <p>Changes how many rows an indented line occupies, so it defaults to off. See
+     * {@link CodeEditor#setWrapContinuationIndentEnabled(boolean)}.
+     */
+    public void setWrapContinuationIndentEnabled(boolean wrapContinuationIndentEnabled) {
+        if (this.wrapContinuationIndentEnabled == wrapContinuationIndentEnabled) {
+            return;
+        }
+        this.wrapContinuationIndentEnabled = wrapContinuationIndentEnabled;
+        notifyChanged();
+    }
+
+    /** Extra continuation-indent columns past the line's own leading whitespace. */
+    public int getWrapContinuationIndentColumns() {
+        return wrapContinuationIndentColumns;
+    }
+
+    /** Negative values are treated as zero. */
+    public void setWrapContinuationIndentColumns(int columns) {
+        int safe = Math.max(0, columns);
+        if (this.wrapContinuationIndentColumns == safe) {
+            return;
+        }
+        this.wrapContinuationIndentColumns = safe;
         notifyChanged();
     }
 

@@ -22,6 +22,44 @@ final class HighlighterSupport {
         spans.add(new CodeBracketIgnoreSpan(start, end));
     }
 
+    /** {@code String.startsWith(prefix, offset)} for any CharSequence. */
+    static boolean startsWith(CharSequence text, String prefix, int offset) {
+        int length = prefix.length();
+        if (offset < 0 || offset + length > text.length()) {
+            return false;
+        }
+        for (int i = 0; i < length; i++) {
+            if (text.charAt(offset + i) != prefix.charAt(i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** {@code String.indexOf(needle, from)} for any CharSequence; -1 when absent. */
+    static int indexOf(CharSequence text, String needle, int from) {
+        int limit = text.length() - needle.length();
+        for (int i = Math.max(0, from); i <= limit; i++) {
+            if (startsWith(text, needle, i)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /** Whether {@code text[start,end)} equals {@code candidate}, without allocating a substring. */
+    static boolean regionEquals(CharSequence text, int start, int end, String candidate) {
+        if (end - start != candidate.length()) {
+            return false;
+        }
+        for (int i = 0; i < candidate.length(); i++) {
+            if (text.charAt(start + i) != candidate.charAt(i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     static Array<Array<CodeBracketIgnoreSpan>> emptyIgnoreSpans(int lineCount) {
         Array<Array<CodeBracketIgnoreSpan>> result = new Array<>(lineCount);
         for (int i = 0; i < lineCount; i++) {
@@ -30,7 +68,7 @@ final class HighlighterSupport {
         return result;
     }
 
-    static int readString(String line, int start, char quote) {
+    static int readString(CharSequence line, int start, char quote) {
         boolean escaped = false;
         int index = start + 1;
         while (index < line.length()) {
@@ -47,11 +85,11 @@ final class HighlighterSupport {
         return line.length();
     }
 
-    static int readIdentifier(String line, int start) {
+    static int readIdentifier(CharSequence line, int start) {
         return readIdentifier(line, start, "");
     }
 
-    static int readIdentifier(String line, int start, String extraChars) {
+    static int readIdentifier(CharSequence line, int start, String extraChars) {
         int index = start;
         while (index < line.length()) {
             char c = line.charAt(index);
@@ -64,7 +102,7 @@ final class HighlighterSupport {
         return index;
     }
 
-    static int readNumber(String line, int start) {
+    static int readNumber(CharSequence line, int start) {
         int index = start;
         if (index >= line.length()) {
             return index;
@@ -148,7 +186,7 @@ final class HighlighterSupport {
         return consumeNumberSuffix(line, index);
     }
 
-    static boolean isNumberStart(String line, int index) {
+    static boolean isNumberStart(CharSequence line, int index) {
         if (index < 0 || index >= line.length()) {
             return false;
         }
@@ -159,7 +197,7 @@ final class HighlighterSupport {
         return c == '.' && index + 1 < line.length() && Character.isDigit(line.charAt(index + 1));
     }
 
-    static int skipWhitespace(String line, int start) {
+    static int skipWhitespace(CharSequence line, int start) {
         int index = start;
         while (index < line.length() && Character.isWhitespace(line.charAt(index))) {
             index++;
@@ -167,7 +205,7 @@ final class HighlighterSupport {
         return index;
     }
 
-    static boolean isIdentifierBoundary(String line, int index) {
+    static boolean isIdentifierBoundary(CharSequence line, int index) {
         if (index <= 0 || index > line.length()) {
             return true;
         }
@@ -175,7 +213,7 @@ final class HighlighterSupport {
         return !Character.isLetterOrDigit(c) && c != '_';
     }
 
-    private static int consumeNumberSuffix(String line, int start) {
+    private static int consumeNumberSuffix(CharSequence line, int start) {
         int index = start;
         while (index < line.length()) {
             char c = line.charAt(index);

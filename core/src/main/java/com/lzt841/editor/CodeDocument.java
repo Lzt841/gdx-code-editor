@@ -2,26 +2,57 @@ package com.lzt841.editor;
 
 import com.badlogic.gdx.utils.Array;
 
-import java.util.ArrayDeque;
-
-/** Mutable line-based document optimized for editor style operations. */
+/**
+ * Mutable line-based document optimized for editor style operations.
+ *
+ * <p>Undo history stores only the lines an edit actually touched, so a keystroke in a 100k line
+ * file costs one small record instead of a full text copy. Every mutation also appends a
+ * {@link LineEdit} to an edit journal; a view can replay the journal from the version it last
+ * synchronized to patch its own per-line caches instead of rebuilding them.
+ */
 public class CodeDocument {
+    /**
+     * @deprecated the indent width is configurable per document now; read
+     *     {@code getIndentStrategy().indentWidth} instead. Kept as the default only.
+     */
+    @Deprecated
     public static final int INDENT_SIZE = 4;
-    private static final int MAX_HISTORY_SIZE = 200;
+    /** Default undo step cap; see {@link #setMaxUndoEntries(int)}. */
+    public static final int DEFAULT_MAX_UNDO_ENTRIES = 400;
+    /** Default retained-text cap in characters; see {@link #setMaxUndoChars(int)}. */
+    public static final int DEFAULT_MAX_UNDO_CHARS = 8 << 20;
+    private static final int MAX_JOURNAL_SIZE = 512;
     private static final long MERGE_WINDOW_NANOS = 1_000_000_000L;
 
     private final Array<StringBuilder> lines = new Array<>();
-    private final ArrayDeque<DocumentState> undoStack = new ArrayDeque<>();
-    private final ArrayDeque<DocumentState> redoStack = new ArrayDeque<>();
+    private final Array<UndoEntry> undoStack = new Array<>();
+    private final Array<UndoEntry> redoStack = new Array<>();
+    private final Array<LineEdit> journal = new Array<>();
+    private final Array<String> cachedSnapshot = new Array<>();
+
     private int cursorLine;
     private int cursorColumn;
     private int version;
+    private int journalBaseVersion;
+    private int snapshotVersion = -1;
+    private int undoStackChars;
+    private int longestLineIndex;
+    private int longestLineLength;
+    /** Set when the champion was overwritten and the replacements did not beat it. See {@link #recomputeLongestLineAfterSplice(int, int)}. */
+    private boolean longestLineDirty;
     private EditKind lastEditKind = EditKind.NONE;
     private int lastEditCursorLine = -1;
     private int lastEditCursorColumn = -1;
     private long lastEditTimestampNanos;
+    private CodeIndentStrategy indentStrategy = CodeIndentStrategy.defaultStrategy();
     private int compoundEditDepth;
-    private boolean compoundEditRecorded;
+    private Array<UndoEntry> compoundEntries;
+    private int compoundCursorLine;
+    private int compoundCursorColumn;
+    /** Label for the group the outermost {@link #beginCompoundEdit(String)} opened, or null. */
+    private String compoundLabel;
+    private int maxUndoEntries = DEFAULT_MAX_UNDO_ENTRIES;
+    private int maxUndoChars = DEFAULT_MAX_UNDO_CHARS;
 
     public CodeDocument() {
         setText("");
@@ -30,67 +61,30 @@ public class CodeDocument {
     public void setText(String text) {
         applyText(text, 0, 0);
         clearHistory();
-    }
-
-    public boolean canUndo() {
-        return !undoStack.isEmpty();
-    }
-
-    public boolean canRedo() {
-        return !redoStack.isEmpty();
-    }
-
-    public boolean undo() {
-        if (undoStack.isEmpty()) {
-            return false;
-        }
-
-        resetEditState();
-        redoStack.push(captureState());
-        restoreState(undoStack.pop());
-        return true;
-    }
-
-    public boolean redo() {
-        if (redoStack.isEmpty()) {
-            return false;
-        }
-
-        resetEditState();
-        undoStack.push(captureState());
-        restoreState(redoStack.pop());
-        return true;
-    }
-
-    public void beginCompoundEdit() {
-        compoundEditDepth++;
-    }
-
-    public void endCompoundEdit() {
-        if (compoundEditDepth <= 0) {
-            return;
-        }
-        compoundEditDepth--;
-        if (compoundEditDepth == 0) {
-            if (compoundEditRecorded) {
-                finishEdit(EditKind.COMPOUND);
-            }
-            compoundEditRecorded = false;
-        }
+        journal.clear();
+        journalBaseVersion = version;
+        snapshotVersion = -1;
     }
 
     private void applyText(String text, int targetCursorLine, int targetCursorColumn) {
         lines.clear();
-        String normalized = text.replace("\r\n", "\n").replace('\r', '\n');
-        String[] split = normalized.split("\n", -1);
-        for (String line : split) {
-            lines.add(new StringBuilder(line));
+        String normalized = text == null ? "" : text.replace("\r\n", "\n").replace('\r', '\n');
+        int start = 0;
+        while (true) {
+            int newline = normalized.indexOf('\n', start);
+            if (newline < 0) {
+                lines.add(new StringBuilder(normalized.substring(start)));
+                break;
+            }
+            lines.add(new StringBuilder(normalized.substring(start, newline)));
+            start = newline + 1;
         }
         if (lines.isEmpty()) {
             lines.add(new StringBuilder());
         }
         cursorLine = clamp(targetCursorLine, 0, lines.size - 1);
         cursorColumn = clamp(targetCursorColumn, 0, lines.get(cursorLine).length());
+        recomputeLongestLine();
         touch();
     }
 
@@ -106,8 +100,36 @@ public class CodeDocument {
         return lines.get(line).toString();
     }
 
+    /**
+     * Returns the backing buffer for a line as a read-only sequence. Avoids the {@code String}
+     * allocation of {@link #getLine(int)}; the returned sequence is only valid until the next
+     * mutation.
+     */
+    public CharSequence getLineSequence(int line) {
+        return lines.get(line);
+    }
+
+    public int getLineLength(int line) {
+        return lines.get(line).length();
+    }
+
+    public char charAt(int line, int column) {
+        return lines.get(line).charAt(column);
+    }
+
+    /** Index of the line with the most characters, a cheap upper bound for horizontal extent. */
+    public int getLongestLineIndex() {
+        ensureLongestLine();
+        return longestLineIndex;
+    }
+
+    public int getLongestLineLength() {
+        ensureLongestLine();
+        return longestLineLength;
+    }
+
     public String getText() {
-        StringBuilder builder = new StringBuilder();
+        StringBuilder builder = new StringBuilder(estimateTextLength());
         for (int i = 0; i < lines.size; i++) {
             if (i > 0) {
                 builder.append('\n');
@@ -117,16 +139,53 @@ public class CodeDocument {
         return builder.toString();
     }
 
-    public int getLineLength(int line) {
-        return lines.get(line).length();
-    }
-
     public int getCursorLine() {
         return cursorLine;
     }
 
     public int getCursorColumn() {
         return cursorColumn;
+    }
+
+    /** Total character count including the newlines between lines. */
+    public int getTextLength() {
+        return estimateTextLength();
+    }
+
+    /** Converts a line/column pair to a document character offset. */
+    public int toOffset(int line, int column) {
+        int safeLine = clamp(line, 0, lines.size - 1);
+        int offset = 0;
+        for (int i = 0; i < safeLine; i++) {
+            offset += lines.get(i).length() + 1;
+        }
+        return offset + clamp(column, 0, lines.get(safeLine).length());
+    }
+
+    /** Converts a document character offset to a line index. */
+    public int lineAtOffset(int offset) {
+        int remaining = Math.max(0, offset);
+        for (int i = 0; i < lines.size; i++) {
+            int lineLength = lines.get(i).length();
+            if (remaining <= lineLength) {
+                return i;
+            }
+            remaining -= lineLength + 1;
+        }
+        return lines.size - 1;
+    }
+
+    /** Converts a document character offset to a column within {@link #lineAtOffset(int)}. */
+    public int columnAtOffset(int offset) {
+        int remaining = Math.max(0, offset);
+        for (int i = 0; i < lines.size; i++) {
+            int lineLength = lines.get(i).length();
+            if (remaining <= lineLength) {
+                return remaining;
+            }
+            remaining -= lineLength + 1;
+        }
+        return lines.get(lines.size - 1).length();
     }
 
     public void moveCursorTo(int line, int column) {
@@ -161,8 +220,11 @@ public class CodeDocument {
         }
     }
 
+    /** Toggles between column 0 and the first non-whitespace character. */
     public void moveCursorHome() {
-        int indent = countLeadingWhitespace(lines.get(cursorLine));
+        // Uses the strategy's definition of leading whitespace, which counts tabs; the old
+        // spaces-only count sent Home to column 0 on a tab-indented line.
+        int indent = indentStrategy.leadingWhitespaceLength(lines.get(cursorLine));
         cursorColumn = cursorColumn == indent ? 0 : indent;
         resetMergeState();
     }
@@ -173,11 +235,12 @@ public class CodeDocument {
     }
 
     public void insertChar(char character) {
-        recordUndoState(EditKind.INSERT);
+        int beforeLine = cursorLine;
+        int beforeColumn = cursorColumn;
+        recordUndo(EditKind.INSERT, beforeLine, beforeColumn, beforeLine, beforeLine, 1);
         lines.get(cursorLine).insert(cursorColumn, character);
         cursorColumn++;
-        touch();
-        finishEdit(EditKind.INSERT);
+        afterEdit(EditKind.INSERT, beforeLine, 1, 1);
     }
 
     public void insertText(String text) {
@@ -185,27 +248,47 @@ public class CodeDocument {
             return;
         }
 
-        EditKind kind = isMergeableInsert(text) ? EditKind.INSERT : EditKind.BULK_INSERT;
-        recordUndoState(kind);
         String normalized = text.replace("\r\n", "\n").replace('\r', '\n');
+        EditKind kind = normalized.indexOf('\n') < 0 ? EditKind.INSERT : EditKind.BULK_INSERT;
+        int beforeLine = cursorLine;
+        int beforeColumn = cursorColumn;
+        // The undo entry must know how many lines this insert will occupy, otherwise undoing it
+        // replaces only the first line and orphans the rest.
+        int newLineCount = 1;
+        for (int i = 0; i < normalized.length(); i++) {
+            if (normalized.charAt(i) == '\n') {
+                newLineCount++;
+            }
+        }
+        recordUndo(kind, beforeLine, beforeColumn, beforeLine, beforeLine, newLineCount);
+
         StringBuilder currentLine = lines.get(cursorLine);
         String suffix = currentLine.substring(cursorColumn);
         currentLine.setLength(cursorColumn);
 
-        String[] parts = normalized.split("\n", -1);
-        currentLine.append(parts[0]);
+        boolean firstSegment = true;
+        int segmentStart = 0;
         int lineIndex = cursorLine;
-
-        for (int i = 1; i < parts.length; i++) {
-            lineIndex++;
-            lines.insert(lineIndex, new StringBuilder(parts[i]));
+        while (true) {
+            int newline = normalized.indexOf('\n', segmentStart);
+            int segmentEnd = newline < 0 ? normalized.length() : newline;
+            if (firstSegment) {
+                currentLine.append(normalized, segmentStart, segmentEnd);
+                firstSegment = false;
+            } else {
+                lineIndex++;
+                lines.insert(lineIndex, new StringBuilder(normalized.substring(segmentStart, segmentEnd)));
+            }
+            if (newline < 0) {
+                break;
+            }
+            segmentStart = newline + 1;
         }
 
         cursorLine = lineIndex;
-        cursorColumn = lines.get(cursorLine).length();
-        lines.get(cursorLine).append(suffix);
-        touch();
-        finishEdit(kind);
+        cursorColumn = lines.get(lineIndex).length();
+        lines.get(lineIndex).append(suffix);
+        afterEdit(kind, beforeLine, 1, newLineCount);
     }
 
     public void deleteRange(int startLine, int startColumn, int endLine, int endColumn) {
@@ -226,15 +309,16 @@ public class CodeDocument {
             return;
         }
 
-        recordUndoState(EditKind.DELETE_RANGE);
+        int beforeLine = cursorLine;
+        int beforeColumn = cursorColumn;
+        recordUndo(EditKind.DELETE_RANGE, beforeLine, beforeColumn, startLine, endLine, 1);
+
         if (startLine == endLine) {
             lines.get(startLine).delete(startColumn, endColumn);
         } else {
-            String prefix = lines.get(startLine).substring(0, startColumn);
-            String suffix = lines.get(endLine).substring(endColumn);
-            lines.get(startLine).setLength(0);
-            lines.get(startLine).append(prefix).append(suffix);
-
+            StringBuilder head = lines.get(startLine);
+            head.setLength(startColumn);
+            head.append(lines.get(endLine), endColumn, lines.get(endLine).length());
             for (int line = endLine; line > startLine; line--) {
                 lines.removeIndex(line);
             }
@@ -242,8 +326,7 @@ public class CodeDocument {
 
         cursorLine = startLine;
         cursorColumn = startColumn;
-        touch();
-        finishEdit(EditKind.DELETE_RANGE);
+        afterEdit(EditKind.DELETE_RANGE, startLine, endLine - startLine + 1, 1);
     }
 
     public String getTextRange(int startLine, int startColumn, int endLine, int endColumn) {
@@ -266,40 +349,41 @@ public class CodeDocument {
         }
 
         StringBuilder builder = new StringBuilder();
-        builder.append(lines.get(startLine).substring(startColumn)).append('\n');
+        builder.append(lines.get(startLine), startColumn, lines.get(startLine).length()).append('\n');
         for (int line = startLine + 1; line < endLine; line++) {
             builder.append(lines.get(line)).append('\n');
         }
-        builder.append(lines.get(endLine).substring(0, endColumn));
+        builder.append(lines.get(endLine), 0, endColumn);
         return builder.toString();
     }
 
     public void insertNewLine() {
-        recordUndoState(EditKind.INSERT_NEWLINE);
+        int beforeLine = cursorLine;
+        int beforeColumn = cursorColumn;
+        recordUndo(EditKind.INSERT_NEWLINE, beforeLine, beforeColumn, beforeLine, beforeLine, 2);
+
         StringBuilder currentLine = lines.get(cursorLine);
-        String left = currentLine.substring(0, cursorColumn);
-        String right = currentLine.substring(cursorColumn);
-        int indent = countLeadingWhitespace(left);
+        String indentText = indentStrategy.indentForColumn(
+            indentStrategy.indentAfter(currentLine, cursorColumn));
 
-        if (left.trim().endsWith("{")) {
-            indent += INDENT_SIZE;
-        }
-
+        StringBuilder next = new StringBuilder(indentText.length() + currentLine.length() - cursorColumn);
+        next.append(indentText);
+        next.append(currentLine, cursorColumn, currentLine.length());
         currentLine.setLength(cursorColumn);
-        lines.insert(cursorLine + 1, new StringBuilder(spaces(indent)).append(right));
+        lines.insert(cursorLine + 1, next);
         cursorLine++;
-        cursorColumn = indent;
-        touch();
-        finishEdit(EditKind.INSERT_NEWLINE);
+        cursorColumn = indentText.length();
+        afterEdit(EditKind.INSERT_NEWLINE, beforeLine, 1, 2);
     }
 
     public void backspace() {
         if (cursorColumn > 0) {
-            recordUndoState(EditKind.BACKSPACE);
+            int beforeLine = cursorLine;
+            int beforeColumn = cursorColumn;
+            recordUndo(EditKind.BACKSPACE, beforeLine, beforeColumn, beforeLine, beforeLine, 1);
             lines.get(cursorLine).deleteCharAt(cursorColumn - 1);
             cursorColumn--;
-            touch();
-            finishEdit(EditKind.BACKSPACE);
+            afterEdit(EditKind.BACKSPACE, beforeLine, 1, 1);
             return;
         }
 
@@ -307,23 +391,26 @@ public class CodeDocument {
             return;
         }
 
-        recordUndoState(EditKind.BACKSPACE);
-        int previousLength = lines.get(cursorLine - 1).length();
-        lines.get(cursorLine - 1).append(lines.get(cursorLine));
+        int beforeLine = cursorLine;
+        int beforeColumn = cursorColumn;
+        int targetLine = cursorLine - 1;
+        recordUndo(EditKind.BACKSPACE, beforeLine, beforeColumn, targetLine, cursorLine, 1);
+        int previousLength = lines.get(targetLine).length();
+        lines.get(targetLine).append(lines.get(cursorLine));
         lines.removeIndex(cursorLine);
-        cursorLine--;
+        cursorLine = targetLine;
         cursorColumn = previousLength;
-        touch();
-        finishEdit(EditKind.BACKSPACE);
+        afterEdit(EditKind.BACKSPACE, targetLine, 2, 1);
     }
 
     public void deleteForward() {
         StringBuilder current = lines.get(cursorLine);
         if (cursorColumn < current.length()) {
-            recordUndoState(EditKind.DELETE_FORWARD);
+            int beforeLine = cursorLine;
+            int beforeColumn = cursorColumn;
+            recordUndo(EditKind.DELETE_FORWARD, beforeLine, beforeColumn, beforeLine, beforeLine, 1);
             current.deleteCharAt(cursorColumn);
-            touch();
-            finishEdit(EditKind.DELETE_FORWARD);
+            afterEdit(EditKind.DELETE_FORWARD, beforeLine, 1, 1);
             return;
         }
 
@@ -331,129 +418,632 @@ public class CodeDocument {
             return;
         }
 
-        recordUndoState(EditKind.DELETE_FORWARD);
+        int beforeLine = cursorLine;
+        int beforeColumn = cursorColumn;
+        recordUndo(EditKind.DELETE_FORWARD, beforeLine, beforeColumn, beforeLine, beforeLine + 1, 1);
         current.append(lines.get(cursorLine + 1));
         lines.removeIndex(cursorLine + 1);
-        touch();
-        finishEdit(EditKind.DELETE_FORWARD);
+        afterEdit(EditKind.DELETE_FORWARD, beforeLine, 2, 1);
     }
 
+    /**
+     * Removes one indent level before a just-typed closing brace, so it lines up with its opener.
+     *
+     * <p>Rewrites the whole leading whitespace rather than deleting a fixed number of characters,
+     * which is what makes it correct for tabs and for mixed tab/space indentation.
+     */
     public void dedentBeforeClosingBrace() {
         StringBuilder current = lines.get(cursorLine);
-        if (cursorColumn < INDENT_SIZE) {
+        if (!indentStrategy.shouldDedentBefore(current, cursorColumn, '}')) {
             return;
         }
 
-        for (int i = cursorColumn - INDENT_SIZE; i < cursorColumn; i++) {
-            if (current.charAt(i) != ' ') {
-                return;
-            }
-        }
+        int targetColumn = Math.max(0,
+            indentStrategy.visualColumn(current, cursorColumn) - indentStrategy.indentWidth);
+        String replacement = indentStrategy.indentForColumn(targetColumn);
 
-        for (int i = 0; i < cursorColumn - INDENT_SIZE; i++) {
-            if (!Character.isWhitespace(current.charAt(i))) {
-                return;
-            }
-        }
-
-        recordUndoState(EditKind.AUTO_DEDENT);
-        current.delete(cursorColumn - INDENT_SIZE, cursorColumn);
-        cursorColumn -= INDENT_SIZE;
-        touch();
-        finishEdit(EditKind.AUTO_DEDENT);
+        int beforeLine = cursorLine;
+        int beforeColumn = cursorColumn;
+        recordUndo(EditKind.AUTO_DEDENT, beforeLine, beforeColumn, beforeLine, beforeLine, 1);
+        current.delete(0, cursorColumn);
+        current.insert(0, replacement);
+        cursorColumn = replacement.length();
+        afterEdit(EditKind.AUTO_DEDENT, beforeLine, 1, 1);
     }
 
+    public CodeIndentStrategy getIndentStrategy() {
+        return indentStrategy;
+    }
+
+    public void setIndentStrategy(CodeIndentStrategy indentStrategy) {
+        this.indentStrategy = indentStrategy == null
+            ? CodeIndentStrategy.defaultStrategy()
+            : indentStrategy;
+    }
+
+    /**
+     * Indents or dedents whole lines by one level, as one undo step.
+     *
+     * <p>This is what Tab and Shift-Tab do with a multi-line selection. Blank lines are left alone when
+     * indenting so no trailing whitespace is introduced.
+     *
+     * @return true when any line changed
+     */
+    public boolean shiftLinesIndent(int fromLine, int toLine, boolean increase) {
+        int start = clamp(Math.min(fromLine, toLine), 0, lines.size - 1);
+        int end = clamp(Math.max(fromLine, toLine), 0, lines.size - 1);
+
+        boolean changed = false;
+        beginCompoundEdit();
+        try {
+            for (int line = start; line <= end; line++) {
+                StringBuilder text = lines.get(line);
+                // Indenting an empty line would only add trailing whitespace.
+                if (increase && text.length() == 0) {
+                    continue;
+                }
+                int whitespace = indentStrategy.leadingWhitespaceLength(text);
+                int column = indentStrategy.visualColumn(text, whitespace);
+                int target = increase
+                    ? column + indentStrategy.indentWidth
+                    : Math.max(0, column - indentStrategy.indentWidth);
+                if (target == column) {
+                    continue;
+                }
+                String replacement = indentStrategy.indentForColumn(target);
+                if (replacement.length() == whitespace && matchesPrefix(text, replacement)) {
+                    continue;
+                }
+
+                // Keep the caret the same distance into the text, not the same absolute column.
+                int caretOffsetInText = line == cursorLine ? Math.max(0, cursorColumn - whitespace) : -1;
+                recordUndo(EditKind.INDENT_LINES, cursorLine, cursorColumn, line, line, 1);
+                text.delete(0, whitespace);
+                text.insert(0, replacement);
+                if (caretOffsetInText >= 0) {
+                    cursorColumn = Math.min(text.length(), replacement.length() + caretOffsetInText);
+                }
+                afterEdit(EditKind.INDENT_LINES, line, 1, 1);
+                changed = true;
+            }
+        } finally {
+            endCompoundEdit();
+        }
+        if (changed) {
+            cursorLine = clamp(cursorLine, 0, lines.size - 1);
+            cursorColumn = clamp(cursorColumn, 0, lines.get(cursorLine).length());
+        }
+        return changed;
+    }
+
+    private static boolean matchesPrefix(CharSequence text, String prefix) {
+        if (text.length() < prefix.length()) {
+            return false;
+        }
+        for (int i = 0; i < prefix.length(); i++) {
+            if (text.charAt(i) != prefix.charAt(i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    public boolean canUndo() {
+        return undoStack.size > 0;
+    }
+
+    public boolean canRedo() {
+        return redoStack.size > 0;
+    }
+
+    /**
+     * Caps how many undo steps are kept. Values below 1 are raised to 1, because the newest entry is
+     * never dropped. Lowering the cap trims the history immediately rather than at the next edit.
+     */
+    public void setMaxUndoEntries(int entries) {
+        maxUndoEntries = Math.max(1, entries);
+        trimUndoStack();
+    }
+
+    public int getMaxUndoEntries() {
+        return maxUndoEntries;
+    }
+
+    /**
+     * Caps the retained text, counted the same way {@link #getUndoChars()} reports it. Values below 1
+     * are raised to 1. A single edit larger than the whole budget is still kept, since the newest entry
+     * is never dropped; the cap bounds the history, not one edit.
+     */
+    public void setMaxUndoChars(int chars) {
+        maxUndoChars = Math.max(1, chars);
+        trimUndoStack();
+    }
+
+    public int getMaxUndoChars() {
+        return maxUndoChars;
+    }
+
+    /** Undo steps currently on the stack. A compound group counts as one. */
+    public int getUndoEntryCount() {
+        return undoStack.size;
+    }
+
+    public int getRedoEntryCount() {
+        return redoStack.size;
+    }
+
+    /**
+     * Approximate characters retained by the undo stack, including per-entry overhead. This is the
+     * number {@link #setMaxUndoChars(int)} bounds, not an exact heap figure.
+     */
+    public int getUndoChars() {
+        return undoStackChars;
+    }
+
+    /** Label of the next undo step, or null when it has none or there is nothing to undo. */
+    public String getUndoLabel() {
+        return undoStack.size == 0 ? null : undoStack.peek().label;
+    }
+
+    /** Label of the next redo step, or null when it has none or there is nothing to redo. */
+    public String getRedoLabel() {
+        return redoStack.size == 0 ? null : redoStack.peek().label;
+    }
+
+    /** Drops undo and redo history without touching the text. */
+    public void clearUndoHistory() {
+        clearHistory();
+    }
+
+    public boolean undo() {
+        if (undoStack.size == 0) {
+            return false;
+        }
+        UndoEntry entry = undoStack.pop();
+        undoStackChars -= entry.chars();
+        UndoEntry inverse = applyEntry(entry, true);
+        redoStack.add(inverse);
+        resetEditState();
+        return true;
+    }
+
+    public boolean redo() {
+        if (redoStack.size == 0) {
+            return false;
+        }
+        UndoEntry entry = redoStack.pop();
+        UndoEntry inverse = applyEntry(entry, false);
+        // Deliberately not pushToUndoStack: that clears the redo stack, which would make one redo
+        // discard every remaining one. trimUndoStack is still needed, or lowering a budget and then
+        // redoing grows the stack past it with nothing to pull it back until the next edit.
+        undoStack.add(inverse);
+        undoStackChars += inverse.chars();
+        trimUndoStack();
+        resetEditState();
+        return true;
+    }
+
+    public void beginCompoundEdit() {
+        beginCompoundEdit(null);
+    }
+
+    /**
+     * Opens a compound edit that carries {@code label}, readable afterwards through
+     * {@link #getUndoLabel()} so a host can show "Undo Rename" rather than plain "Undo".
+     *
+     * <p>Only the outermost call's label is kept. An inner group cannot rename the step it is part of,
+     * which matters because the editor's own mutators open unlabelled groups of their own and would
+     * otherwise clear a label the caller set.
+     */
+    public void beginCompoundEdit(String label) {
+        if (compoundEditDepth == 0) {
+            compoundEntries = new Array<>();
+            compoundCursorLine = cursorLine;
+            compoundCursorColumn = cursorColumn;
+            compoundLabel = label;
+        }
+        compoundEditDepth++;
+    }
+
+    /** Whether a {@link #beginCompoundEdit()} group is open, at any nesting depth. */
+    public boolean isCompoundEditInProgress() {
+        return compoundEditDepth > 0;
+    }
+
+    public void endCompoundEdit() {
+        if (compoundEditDepth <= 0) {
+            return;
+        }
+        compoundEditDepth--;
+        if (compoundEditDepth > 0) {
+            return;
+        }
+
+        Array<UndoEntry> collected = compoundEntries;
+        String label = compoundLabel;
+        compoundEntries = null;
+        compoundLabel = null;
+        if (collected == null || collected.size == 0) {
+            return;
+        }
+        if (collected.size == 1) {
+            UndoEntry only = collected.first();
+            only.label = label;
+            pushToUndoStack(only);
+        } else {
+            UndoEntry composite = UndoEntry.composite(collected, compoundCursorLine, compoundCursorColumn);
+            composite.inverseCursorLine = cursorLine;
+            composite.inverseCursorColumn = cursorColumn;
+            composite.label = label;
+            pushToUndoStack(composite);
+        }
+        resetMergeState();
+    }
+
+    /**
+     * Applies {@code entry} and returns the entry that reverses this application, so undo and redo
+     * are the same operation with the stacks swapped.
+     */
+    private UndoEntry applyEntry(UndoEntry entry, boolean reverseOrder) {
+        if (entry.children != null) {
+            Array<UndoEntry> inverses = new Array<>(entry.children.size);
+            if (reverseOrder) {
+                for (int i = entry.children.size - 1; i >= 0; i--) {
+                    inverses.add(applyEntry(entry.children.get(i), true));
+                }
+            } else {
+                for (int i = 0; i < entry.children.size; i++) {
+                    inverses.add(applyEntry(entry.children.get(i), false));
+                }
+            }
+            cursorLine = clamp(entry.cursorLine, 0, lines.size - 1);
+            cursorColumn = clamp(entry.cursorColumn, 0, lines.get(cursorLine).length());
+            UndoEntry inverse = UndoEntry.composite(inverses, entry.inverseCursorLine, entry.inverseCursorColumn);
+            // Carried across, or the label would survive undo but vanish on redo.
+            inverse.label = entry.label;
+            return inverse;
+        }
+
+        int startLine = entry.startLine;
+        int replacedCount = Math.max(1, entry.insertedCount);
+        int endLine = Math.min(lines.size - 1, startLine + replacedCount - 1);
+
+        Array<String> displaced = new Array<>(endLine - startLine + 1);
+        for (int line = startLine; line <= endLine; line++) {
+            displaced.add(lines.get(line).toString());
+        }
+
+        splice(startLine, endLine, entry.removedLines);
+
+        cursorLine = clamp(entry.cursorLine, 0, lines.size - 1);
+        cursorColumn = clamp(entry.cursorColumn, 0, lines.get(cursorLine).length());
+
+        recomputeLongestLineAfterSplice(startLine, entry.removedLines.size);
+        journalReplace(startLine, displaced.size, entry.removedLines.size);
+        touch();
+
+        UndoEntry inverse = new UndoEntry(
+            startLine,
+            displaced,
+            entry.removedLines.size,
+            entry.inverseCursorLine,
+            entry.inverseCursorColumn,
+            entry.cursorLine,
+            entry.cursorColumn
+        );
+        inverse.label = entry.label;
+        return inverse;
+    }
+
+    /** Replaces lines {@code startLine..endLine} (inclusive) with {@code replacement}. */
+    private void splice(int startLine, int endLine, Array<String> replacement) {
+        int removeCount = endLine - startLine + 1;
+        int reuse = Math.min(removeCount, replacement.size);
+        for (int i = 0; i < reuse; i++) {
+            StringBuilder buffer = lines.get(startLine + i);
+            buffer.setLength(0);
+            buffer.append(replacement.get(i));
+        }
+        if (removeCount > replacement.size) {
+            for (int line = startLine + removeCount - 1; line >= startLine + replacement.size; line--) {
+                lines.removeIndex(line);
+            }
+        } else {
+            for (int i = reuse; i < replacement.size; i++) {
+                lines.insert(startLine + i, new StringBuilder(replacement.get(i)));
+            }
+        }
+        if (lines.isEmpty()) {
+            lines.add(new StringBuilder());
+        }
+    }
+
+    private void recordUndo(
+        EditKind kind,
+        int cursorLineBefore,
+        int cursorColumnBefore,
+        int startLine,
+        int endLine,
+        int insertedCount
+    ) {
+        if (compoundEditDepth == 0
+            && canMergeWithPreviousEdit(kind, cursorLineBefore, cursorColumnBefore, startLine, endLine, insertedCount)) {
+            return;
+        }
+
+        Array<String> removed = new Array<>(endLine - startLine + 1);
+        for (int line = startLine; line <= endLine; line++) {
+            removed.add(lines.get(line).toString());
+        }
+        UndoEntry entry = new UndoEntry(
+            startLine,
+            removed,
+            insertedCount,
+            cursorLineBefore,
+            cursorColumnBefore,
+            cursorLineBefore,
+            cursorColumnBefore
+        );
+
+        if (compoundEditDepth > 0) {
+            compoundEntries.add(entry);
+        } else {
+            pushToUndoStack(entry);
+            redoStack.clear();
+        }
+    }
+
+    private void pushToUndoStack(UndoEntry entry) {
+        undoStack.add(entry);
+        undoStackChars += entry.chars();
+        redoStack.clear();
+        trimUndoStack();
+    }
+
+    /**
+     * Drops the oldest entries until both budgets are met. The {@code size > 1} guard is deliberate: the
+     * newest entry is never dropped, so a single edit larger than the whole character budget still
+     * undoes once instead of leaving the user with no way back.
+     */
+    private void trimUndoStack() {
+        while (undoStack.size > 1 && (undoStack.size > maxUndoEntries || undoStackChars > maxUndoChars)) {
+            UndoEntry dropped = undoStack.removeIndex(0);
+            undoStackChars -= dropped.chars();
+        }
+    }
+
+    private void afterEdit(EditKind kind, int startLine, int removedCount, int insertedCount) {
+        UndoEntry pending = pendingEntryForCursor();
+        if (pending != null) {
+            pending.inverseCursorLine = cursorLine;
+            pending.inverseCursorColumn = cursorColumn;
+        }
+        recomputeLongestLineAfterSplice(startLine, insertedCount);
+        journalReplace(startLine, removedCount, insertedCount);
+        touch();
+        if (compoundEditDepth == 0) {
+            lastEditKind = kind;
+            lastEditCursorLine = cursorLine;
+            lastEditCursorColumn = cursorColumn;
+            lastEditTimestampNanos = System.nanoTime();
+        }
+    }
+
+    /** The entry whose post-edit cursor should track the newest mutation, if any. */
+    private UndoEntry pendingEntryForCursor() {
+        if (compoundEditDepth > 0) {
+            return compoundEntries == null || compoundEntries.size == 0 ? null : compoundEntries.peek();
+        }
+        return undoStack.size == 0 ? null : undoStack.peek();
+    }
+
+    private boolean canMergeWithPreviousEdit(
+        EditKind kind,
+        int cursorLineBefore,
+        int cursorColumnBefore,
+        int startLine,
+        int endLine,
+        int insertedCount
+    ) {
+        if (!kind.mergeable || lastEditKind != kind || undoStack.size == 0) {
+            return false;
+        }
+        // Only same-line, line-count-preserving edits may merge: the surviving entry keeps its own
+        // removedLines, so a merged edit that adds or removes lines would invert to the wrong shape.
+        if (startLine != endLine || insertedCount != 1) {
+            return false;
+        }
+        if (cursorLineBefore != lastEditCursorLine || cursorColumnBefore != lastEditCursorColumn) {
+            return false;
+        }
+        UndoEntry previous = undoStack.peek();
+        if (previous.children != null || previous.insertedCount != 1 || previous.removedLines.size != 1) {
+            return false;
+        }
+        // A named step is closed. Merging a later keystroke into it would silently put that keystroke
+        // under someone else's label, so "Undo Rename" would take back a character the rename never
+        // touched. endCompoundEdit already resets the merge state, so this only guards a labelled
+        // single-entry group; keeping it explicit means a future caller cannot reopen the hole.
+        if (previous.label != null) {
+            return false;
+        }
+        if (previous.startLine != startLine) {
+            return false;
+        }
+        return System.nanoTime() - lastEditTimestampNanos <= MERGE_WINDOW_NANOS;
+    }
+
+    /**
+     * Feeds every line replacement applied since {@code sinceVersion} to {@code visitor}, oldest
+     * first.
+     *
+     * @return {@code false} when the journal no longer reaches that far back, in which case the
+     *     caller must rebuild from scratch.
+     */
+    public boolean replayEditsSince(int sinceVersion, LineEditVisitor visitor) {
+        if (sinceVersion < journalBaseVersion || sinceVersion > version) {
+            return false;
+        }
+        if (sinceVersion == version) {
+            return true;
+        }
+        for (int i = 0; i < journal.size; i++) {
+            LineEdit edit = journal.get(i);
+            if (edit.version > sinceVersion) {
+                visitor.onLineEdit(edit.startLine, edit.removedCount, edit.insertedCount);
+            }
+        }
+        return true;
+    }
+
+    /** Oldest version the journal can still replay from. */
+    public int getJournalBaseVersion() {
+        return journalBaseVersion;
+    }
+
+    private void journalReplace(int startLine, int removedCount, int insertedCount) {
+        journal.add(new LineEdit(version + 1, startLine, removedCount, insertedCount));
+        while (journal.size > MAX_JOURNAL_SIZE) {
+            LineEdit dropped = journal.removeIndex(0);
+            journalBaseVersion = dropped.version;
+        }
+    }
+
+    /**
+     * Returns every line as a {@code String}, reusing a cached array that is patched from the edit
+     * journal instead of rebuilt. The returned array is owned by the document and is invalidated by
+     * the next mutation; callers that retain it must copy.
+     */
+    public Array<String> sharedLineSnapshot() {
+        if (snapshotVersion == version) {
+            return cachedSnapshot;
+        }
+        if (snapshotVersion < 0 || !patchSnapshot()) {
+            cachedSnapshot.clear();
+            cachedSnapshot.ensureCapacity(lines.size);
+            for (int i = 0; i < lines.size; i++) {
+                cachedSnapshot.add(lines.get(i).toString());
+            }
+        }
+        snapshotVersion = version;
+        return cachedSnapshot;
+    }
+
+    private boolean patchSnapshot() {
+        final int[] touched = {0};
+        boolean replayed = replayEditsSince(snapshotVersion, new LineEditVisitor() {
+            @Override
+            public void onLineEdit(int startLine, int removedCount, int insertedCount) {
+                touched[0] += Math.max(removedCount, insertedCount);
+                for (int line = startLine + removedCount - 1; line >= startLine + insertedCount; line--) {
+                    if (line < cachedSnapshot.size) {
+                        cachedSnapshot.removeIndex(line);
+                    }
+                }
+                for (int i = 0; i < insertedCount; i++) {
+                    int line = startLine + i;
+                    if (i < removedCount && line < cachedSnapshot.size) {
+                        continue;
+                    }
+                    if (line <= cachedSnapshot.size) {
+                        cachedSnapshot.insert(line, "");
+                    }
+                }
+                for (int i = 0; i < insertedCount; i++) {
+                    int line = startLine + i;
+                    if (line < cachedSnapshot.size && line < lines.size) {
+                        cachedSnapshot.set(line, lines.get(line).toString());
+                    }
+                }
+            }
+        });
+        if (!replayed) {
+            return false;
+        }
+        // A rebuild is cheaper than thousands of shifting inserts.
+        if (touched[0] > 4096) {
+            return false;
+        }
+        return cachedSnapshot.size == lines.size;
+    }
+
+    /** @deprecated prefer {@link #sharedLineSnapshot()}, which does not allocate per call. */
+    @Deprecated
     public Array<String> snapshotLines() {
         Array<String> copy = new Array<>(lines.size);
-        for (StringBuilder line : lines) {
-            copy.add(line.toString());
+        for (int i = 0; i < lines.size; i++) {
+            copy.add(lines.get(i).toString());
         }
         return copy;
     }
 
-    private int countLeadingWhitespace(CharSequence text) {
-        int count = 0;
-        while (count < text.length() && text.charAt(count) == ' ') {
-            count++;
+    /** Pays for a deferred rescan, at most once per read no matter how many edits preceded it. */
+    private void ensureLongestLine() {
+        if (longestLineDirty) {
+            recomputeLongestLine();
         }
-        return count;
+    }
+
+    private void recomputeLongestLine() {
+        longestLineDirty = false;
+        longestLineIndex = 0;
+        longestLineLength = 0;
+        for (int i = 0; i < lines.size; i++) {
+            int length = lines.get(i).length();
+            if (length > longestLineLength) {
+                longestLineLength = length;
+                longestLineIndex = i;
+            }
+        }
+    }
+
+    /**
+     * Keeps {@link #getLongestLineLength()} a valid upper bound without rescanning the document:
+     * grows for the lines just written, and otherwise defers the rescan to the next read.
+     *
+     * <p>Deferring rather than rescanning here is what keeps a large compound edit linear. Replace All
+     * walks its matches from the last line backwards, so once the champion sits above the cursor every
+     * remaining edit would "disturb" it; rescanning on the spot made the whole operation
+     * O(matches x lines), which is minutes on a 100k line document. Now the rescan happens once, when
+     * something actually asks for the width.
+     */
+    private void recomputeLongestLineAfterSplice(int startLine, int insertedCount) {
+        int endLine = Math.min(lines.size - 1, startLine + insertedCount - 1);
+        boolean championDisturbed = longestLineDirty || longestLineIndex >= startLine;
+        for (int line = startLine; line <= endLine; line++) {
+            int length = lines.get(line).length();
+            if (length > longestLineLength) {
+                longestLineLength = length;
+                longestLineIndex = line;
+                // A line longer than the stale record is the true champion either way, so a pending
+                // rescan is no longer needed.
+                championDisturbed = false;
+            }
+        }
+        longestLineDirty = championDisturbed;
+    }
+
+    private int estimateTextLength() {
+        int total = Math.max(0, lines.size - 1);
+        for (int i = 0; i < lines.size; i++) {
+            total += lines.get(i).length();
+        }
+        return total;
     }
 
     private static int clamp(int value, int min, int max) {
         return Math.max(min, Math.min(max, value));
     }
 
-    private static String spaces(int count) {
-        StringBuilder builder = new StringBuilder(count);
-        for (int i = 0; i < count; i++) {
-            builder.append(' ');
-        }
-        return builder.toString();
-    }
-
     private void clearHistory() {
         undoStack.clear();
         redoStack.clear();
-        resetEditState();
-    }
-
-    private void recordUndoState(EditKind kind) {
-        if (compoundEditDepth > 0) {
-            if (!compoundEditRecorded) {
-                pushUndoState();
-                compoundEditRecorded = true;
-            }
-            return;
-        }
-        if (canMergeWithPreviousEdit(kind)) {
-            return;
-        }
-        pushUndoState();
-    }
-
-    private void pushUndoState() {
-        undoStack.push(captureState());
-        while (undoStack.size() > MAX_HISTORY_SIZE) {
-            undoStack.removeLast();
-        }
-        redoStack.clear();
-    }
-
-    private boolean canMergeWithPreviousEdit(EditKind kind) {
-        if (!kind.mergeable || lastEditKind != kind) {
-            return false;
-        }
-        if (cursorLine != lastEditCursorLine || cursorColumn != lastEditCursorColumn) {
-            return false;
-        }
-        return System.nanoTime() - lastEditTimestampNanos <= MERGE_WINDOW_NANOS;
-    }
-
-    private void finishEdit(EditKind kind) {
-        if (compoundEditDepth > 0) {
-            return;
-        }
-        lastEditKind = kind;
-        lastEditCursorLine = cursorLine;
-        lastEditCursorColumn = cursorColumn;
-        lastEditTimestampNanos = System.nanoTime();
-    }
-
-    private DocumentState captureState() {
-        return new DocumentState(getText(), cursorLine, cursorColumn);
-    }
-
-    private void restoreState(DocumentState state) {
-        applyText(state.text, state.cursorLine, state.cursorColumn);
+        undoStackChars = 0;
         resetEditState();
     }
 
     private void touch() {
         version++;
-    }
-
-    private boolean isMergeableInsert(String text) {
-        return text.indexOf('\n') < 0 && text.indexOf('\r') < 0;
     }
 
     private void resetMergeState() {
@@ -466,7 +1056,8 @@ public class CodeDocument {
     private void resetEditState() {
         resetMergeState();
         compoundEditDepth = 0;
-        compoundEditRecorded = false;
+        compoundEntries = null;
+        compoundLabel = null;
     }
 
     private enum EditKind {
@@ -478,6 +1069,7 @@ public class CodeDocument {
         INSERT_NEWLINE(false),
         AUTO_DEDENT(false),
         BULK_INSERT(false),
+        INDENT_LINES(false),
         COMPOUND(false);
 
         final boolean mergeable;
@@ -487,15 +1079,97 @@ public class CodeDocument {
         }
     }
 
-    private static final class DocumentState {
-        final String text;
+    /** One line replacement, enough for a view to patch per-line caches. */
+    private static final class LineEdit {
+        final int version;
+        final int startLine;
+        final int removedCount;
+        final int insertedCount;
+
+        LineEdit(int version, int startLine, int removedCount, int insertedCount) {
+            this.version = version;
+            this.startLine = startLine;
+            this.removedCount = removedCount;
+            this.insertedCount = insertedCount;
+        }
+    }
+
+    /** Receives line replacements during {@link #replayEditsSince(int, LineEditVisitor)}. */
+    public interface LineEditVisitor {
+        /**
+         * @param startLine first replaced line
+         * @param removedCount lines that were present before the edit
+         * @param insertedCount lines present after the edit
+         */
+        void onLineEdit(int startLine, int removedCount, int insertedCount);
+    }
+
+    /**
+     * Stores only the lines an edit replaced. {@code insertedCount} says how many lines currently
+     * occupy that slot, so the inverse can be derived at undo time; that keeps merged keystrokes
+     * correct without rewriting the entry on every character.
+     */
+    private static final class UndoEntry {
+        final int startLine;
+        final Array<String> removedLines;
+        final int insertedCount;
+        final Array<UndoEntry> children;
+        /** Where the caret goes when this entry is applied. */
         final int cursorLine;
         final int cursorColumn;
+        /** Where the caret goes when the entry produced by applying this one is applied. */
+        int inverseCursorLine;
+        int inverseCursorColumn;
+        /** Caller-supplied name for this step, or null. Carried onto the inverse so it survives redo. */
+        String label;
 
-        DocumentState(String text, int cursorLine, int cursorColumn) {
-            this.text = text;
+        UndoEntry(
+            int startLine,
+            Array<String> removedLines,
+            int insertedCount,
+            int cursorLine,
+            int cursorColumn,
+            int inverseCursorLine,
+            int inverseCursorColumn
+        ) {
+            this.startLine = startLine;
+            this.removedLines = removedLines;
+            this.insertedCount = insertedCount;
+            this.children = null;
             this.cursorLine = cursorLine;
             this.cursorColumn = cursorColumn;
+            this.inverseCursorLine = inverseCursorLine;
+            this.inverseCursorColumn = inverseCursorColumn;
+        }
+
+        private UndoEntry(Array<UndoEntry> children, int cursorLine, int cursorColumn) {
+            this.startLine = children.size == 0 ? 0 : children.first().startLine;
+            this.removedLines = null;
+            this.insertedCount = 0;
+            this.children = children;
+            this.cursorLine = cursorLine;
+            this.cursorColumn = cursorColumn;
+            this.inverseCursorLine = cursorLine;
+            this.inverseCursorColumn = cursorColumn;
+        }
+
+        static UndoEntry composite(Array<UndoEntry> children, int cursorLine, int cursorColumn) {
+            return new UndoEntry(children, cursorLine, cursorColumn);
+        }
+
+        int chars() {
+            if (children != null) {
+                int total = 0;
+                for (int i = 0; i < children.size; i++) {
+                    total += children.get(i).chars();
+                }
+                return total;
+            }
+            int total = 16;
+            for (int i = 0; i < removedLines.size; i++) {
+                total += removedLines.get(i).length() + 8;
+            }
+            return total;
         }
     }
 }

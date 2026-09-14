@@ -1,11 +1,20 @@
 package com.lzt841.editor.highlight;
 
-import com.badlogic.gdx.utils.ObjectSet;
+import com.badlogic.gdx.graphics.Color;
 import com.badlogic.gdx.utils.Array;
+import com.badlogic.gdx.utils.ObjectSet;
 import com.lzt841.editor.CodeEditor;
 
 /** Built-in highlighter for Python source files. */
-public class PythonCodeHighlighter implements CodeHighlighter {
+public class PythonCodeHighlighter extends AbstractIncrementalHighlighter {
+    /** Continuation state: the line begins inside a {@code '''} string. */
+    private static final int STATE_TRIPLE_SINGLE = 1;
+    /** Continuation state: the line begins inside a {@code """} string. */
+    private static final int STATE_TRIPLE_DOUBLE = 2;
+
+    private static final String TRIPLE_SINGLE = "'''";
+    private static final String TRIPLE_DOUBLE = "\"\"\"";
+
     private static final ObjectSet<String> KEYWORDS = ObjectSet.with(
         "and", "as", "assert", "async", "await", "break", "class", "continue", "def",
         "del", "elif", "else", "except", "finally", "for", "from", "global", "if",
@@ -21,146 +30,135 @@ public class PythonCodeHighlighter implements CodeHighlighter {
     private static final ObjectSet<String> LITERALS = ObjectSet.with("True", "False", "None");
 
     @Override
-    public Array<Array<CodeHighlightSpan>> highlight(Array<String> lines, CodeEditor.CodeEditorStyle style) {
-        Array<Array<CodeHighlightSpan>> result = new Array<>(lines.size);
-        boolean inTripleString = false;
-        String tripleDelimiter = null;
+    public int highlightLine(
+        CharSequence line,
+        int startState,
+        CodeEditor.CodeEditorStyle style,
+        Array<CodeHighlightSpan> spans,
+        Array<CodeBracketIgnoreSpan> bracketIgnoreSpans
+    ) {
+        boolean wantSpans = spans != null && style != null;
+        String tripleDelimiter = delimiterForState(startState);
+        int index = 0;
+        int length = line.length();
 
-        for (String line : lines) {
-            Array<CodeHighlightSpan> spans = new Array<>();
-            int index = 0;
-
-            while (index < line.length()) {
-                if (inTripleString) {
-                    int end = line.indexOf(tripleDelimiter, index);
-                    if (end < 0) {
-                        HighlighterSupport.addSpan(spans, index, line.length(), style.stringColor);
-                        break;
+        while (index < length) {
+            if (tripleDelimiter != null) {
+                int end = HighlighterSupport.indexOf(line, tripleDelimiter, index);
+                if (end < 0) {
+                    if (wantSpans) {
+                        HighlighterSupport.addSpan(spans, index, length, style.stringColor);
                     }
+                    HighlighterSupport.addIgnoreSpan(bracketIgnoreSpans, index, length);
+                    return stateForDelimiter(tripleDelimiter);
+                }
+                if (wantSpans) {
                     HighlighterSupport.addSpan(spans, index, end + 3, style.stringColor);
-                    index = end + 3;
-                    inTripleString = false;
-                    tripleDelimiter = null;
-                    continue;
                 }
-
-                if (line.charAt(index) == '#') {
-                    HighlighterSupport.addSpan(spans, index, line.length(), style.commentColor);
-                    break;
-                }
-
-                int prefixLength = getStringPrefixLength(line, index);
-                if (prefixLength >= 0) {
-                    int quoteIndex = index + prefixLength;
-                    char quote = line.charAt(quoteIndex);
-                    if (quoteIndex + 2 < line.length()
-                        && line.charAt(quoteIndex + 1) == quote
-                        && line.charAt(quoteIndex + 2) == quote) {
-                        String delimiter = repeatQuote(quote);
-                        int end = line.indexOf(delimiter, quoteIndex + 3);
-                        if (end < 0) {
-                            HighlighterSupport.addSpan(spans, index, line.length(), style.stringColor);
-                            inTripleString = true;
-                            tripleDelimiter = delimiter;
-                            break;
-                        }
-                        HighlighterSupport.addSpan(spans, index, end + 3, style.stringColor);
-                        index = end + 3;
-                        continue;
-                    }
-                    int end = HighlighterSupport.readString(line, quoteIndex, quote);
-                    HighlighterSupport.addSpan(spans, index, end, style.stringColor);
-                    index = end;
-                    continue;
-                }
-
-                char c = line.charAt(index);
-                if (c == '@') {
-                    int end = HighlighterSupport.readIdentifier(line, index + 1, ".");
-                    HighlighterSupport.addSpan(spans, index, Math.max(index + 1, end), style.annotationColor);
-                    index = Math.max(index + 1, end);
-                    continue;
-                }
-                if (HighlighterSupport.isNumberStart(line, index)) {
-                    int end = HighlighterSupport.readNumber(line, index);
-                    HighlighterSupport.addSpan(spans, index, end, style.numberColor);
-                    index = end;
-                    continue;
-                }
-                if (Character.isJavaIdentifierStart(c)) {
-                    int end = HighlighterSupport.readIdentifier(line, index);
-                    String token = line.substring(index, end);
-                    if (KEYWORDS.contains(token)) {
-                        HighlighterSupport.addSpan(spans, index, end, style.keywordColor);
-                    } else if (TYPES.contains(token)) {
-                        HighlighterSupport.addSpan(spans, index, end, style.typeColor);
-                    } else if (LITERALS.contains(token)) {
-                        HighlighterSupport.addSpan(spans, index, end, style.literalColor);
-                    }
-                    index = end;
-                    continue;
-                }
-                index++;
+                HighlighterSupport.addIgnoreSpan(bracketIgnoreSpans, index, end + 3);
+                index = end + 3;
+                tripleDelimiter = null;
+                continue;
             }
 
-            result.add(spans);
-        }
-        return result;
-    }
+            if (line.charAt(index) == '#') {
+                if (wantSpans) {
+                    HighlighterSupport.addSpan(spans, index, length, style.commentColor);
+                }
+                HighlighterSupport.addIgnoreSpan(bracketIgnoreSpans, index, length);
+                return 0;
+            }
 
-    @Override
-    public Array<Array<CodeBracketIgnoreSpan>> getBracketIgnoreSpans(Array<String> lines) {
-        Array<Array<CodeBracketIgnoreSpan>> result = new Array<>(lines.size);
-        boolean inTripleString = false;
-        String tripleDelimiter = null;
-
-        for (String line : lines) {
-            Array<CodeBracketIgnoreSpan> spans = new Array<>();
-            int index = 0;
-            while (index < line.length()) {
-                if (inTripleString) {
-                    int end = line.indexOf(tripleDelimiter, index);
+            int prefixLength = getStringPrefixLength(line, index);
+            if (prefixLength >= 0) {
+                int quoteIndex = index + prefixLength;
+                char quote = line.charAt(quoteIndex);
+                if (quoteIndex + 2 < length
+                    && line.charAt(quoteIndex + 1) == quote
+                    && line.charAt(quoteIndex + 2) == quote) {
+                    String delimiter = quote == '\'' ? TRIPLE_SINGLE : TRIPLE_DOUBLE;
+                    int end = HighlighterSupport.indexOf(line, delimiter, quoteIndex + 3);
                     if (end < 0) {
-                        HighlighterSupport.addIgnoreSpan(spans, index, line.length());
-                        break;
+                        if (wantSpans) {
+                            HighlighterSupport.addSpan(spans, index, length, style.stringColor);
+                        }
+                        HighlighterSupport.addIgnoreSpan(bracketIgnoreSpans, index, length);
+                        return stateForDelimiter(delimiter);
                     }
-                    HighlighterSupport.addIgnoreSpan(spans, index, end + 3);
+                    if (wantSpans) {
+                        HighlighterSupport.addSpan(spans, index, end + 3, style.stringColor);
+                    }
+                    HighlighterSupport.addIgnoreSpan(bracketIgnoreSpans, index, end + 3);
                     index = end + 3;
-                    inTripleString = false;
-                    tripleDelimiter = null;
                     continue;
                 }
-
-                int prefixLength = getStringPrefixLength(line, index);
-                if (prefixLength >= 0) {
-                    int quoteIndex = index + prefixLength;
-                    char quote = line.charAt(quoteIndex);
-                    if (quoteIndex + 2 < line.length()
-                        && line.charAt(quoteIndex + 1) == quote
-                        && line.charAt(quoteIndex + 2) == quote) {
-                        String delimiter = repeatQuote(quote);
-                        int end = line.indexOf(delimiter, quoteIndex + 3);
-                        if (end < 0) {
-                            HighlighterSupport.addIgnoreSpan(spans, index, line.length());
-                            inTripleString = true;
-                            tripleDelimiter = delimiter;
-                            break;
-                        }
-                        HighlighterSupport.addIgnoreSpan(spans, index, end + 3);
-                        index = end + 3;
-                        continue;
-                    }
+                int end = HighlighterSupport.readString(line, quoteIndex, quote);
+                if (wantSpans) {
+                    HighlighterSupport.addSpan(spans, index, end, style.stringColor);
                 }
-
-                index++;
+                HighlighterSupport.addIgnoreSpan(bracketIgnoreSpans, index, end);
+                index = end;
+                continue;
             }
-            result.add(spans);
+
+            char c = line.charAt(index);
+            if (c == '@') {
+                int end = HighlighterSupport.readIdentifier(line, index + 1, ".");
+                int stop = Math.max(index + 1, end);
+                if (wantSpans) {
+                    HighlighterSupport.addSpan(spans, index, stop, style.annotationColor);
+                }
+                index = stop;
+                continue;
+            }
+            if (HighlighterSupport.isNumberStart(line, index)) {
+                int end = HighlighterSupport.readNumber(line, index);
+                if (wantSpans) {
+                    HighlighterSupport.addSpan(spans, index, end, style.numberColor);
+                }
+                index = end;
+                continue;
+            }
+            if (Character.isJavaIdentifierStart(c)) {
+                int end = HighlighterSupport.readIdentifier(line, index);
+                if (wantSpans) {
+                    HighlighterSupport.addSpan(spans, index, end, colorForWord(line, index, end, style));
+                }
+                index = end;
+                continue;
+            }
+            index++;
         }
 
-        return result;
+        return tripleDelimiter == null ? 0 : stateForDelimiter(tripleDelimiter);
     }
 
-    private int getStringPrefixLength(String line, int start) {
+    private static String delimiterForState(int state) {
+        if (state == STATE_TRIPLE_SINGLE) {
+            return TRIPLE_SINGLE;
+        }
+        return state == STATE_TRIPLE_DOUBLE ? TRIPLE_DOUBLE : null;
+    }
+
+    private static int stateForDelimiter(String delimiter) {
+        return TRIPLE_SINGLE.equals(delimiter) ? STATE_TRIPLE_SINGLE : STATE_TRIPLE_DOUBLE;
+    }
+
+    private static Color colorForWord(CharSequence line, int start, int end, CodeEditor.CodeEditorStyle style) {
+        String token = line.subSequence(start, end).toString();
+        if (KEYWORDS.contains(token)) {
+            return style.keywordColor;
+        }
+        if (TYPES.contains(token)) {
+            return style.typeColor;
+        }
+        if (LITERALS.contains(token)) {
+            return style.literalColor;
+        }
+        return null;
+    }
+
+    private static int getStringPrefixLength(CharSequence line, int start) {
         if (!HighlighterSupport.isIdentifierBoundary(line, start)) {
             return -1;
         }
@@ -176,9 +174,5 @@ public class PythonCodeHighlighter implements CodeHighlighter {
             index++;
         }
         return -1;
-    }
-
-    private String repeatQuote(char quote) {
-        return new String(new char[] {quote, quote, quote});
     }
 }
