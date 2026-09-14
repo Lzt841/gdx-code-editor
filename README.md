@@ -681,7 +681,16 @@ editor.setCursorOffset(offset);
 editor.scrollToLine(line);
 editor.scrollLineToCenter(line);
 editor.revealCursor();
+
+float scrollX = editor.getScrollX();
+float scrollY = editor.getScrollY();
+editor.setScrollX(scrollX);
+editor.setScrollY(scrollY);
+editor.setScroll(scrollX, scrollY);   // update both axes as one operation
 ```
+
+Scroll coordinates are pixel offsets. The setters clamp values to the current valid range, which
+makes `setScroll(scrollX, scrollY)` suitable for keeping two editors in sync in a diff view.
 
 ## Editing From Tooling
 

@@ -2033,10 +2033,39 @@ public class CodeEditor extends Widget {
         ensureCursorVisible();
     }
 
+    /**
+     * Sets the horizontal scroll offset in pixels, clamped to the current content bounds.
+     *
+     * <p>Use {@link #setScroll(float, float)} when synchronizing both axes so the editor never
+     * observes an intermediate coordinate.
+     */
+    public void setScrollX(float scrollX) {
+        ensureLayout();
+        this.scrollX = clamp(scrollX, getMinScrollX(), getMaxScrollX());
+    }
+
+    /** Sets the vertical scroll offset in pixels, clamped to the current content bounds. */
+    public void setScrollY(float scrollY) {
+        ensureLayout();
+        this.scrollY = clamp(scrollY, getMinScroll(), getMaxScroll());
+    }
+
+    /**
+     * Sets both scroll offsets in pixels as one update, which is the preferred operation for
+     * synchronizing diff panes.
+     */
+    public void setScroll(float scrollX, float scrollY) {
+        ensureLayout();
+        this.scrollX = clamp(scrollX, getMinScrollX(), getMaxScrollX());
+        this.scrollY = clamp(scrollY, getMinScroll(), getMaxScroll());
+    }
+
+    /** Horizontal scroll offset in pixels; {@code 0} is the left edge of the content. */
     public float getScrollX() {
         return scrollX;
     }
 
+    /** Vertical scroll offset in pixels; {@code 0} is the first visual row. */
     public float getScrollY() {
         return scrollY;
     }
