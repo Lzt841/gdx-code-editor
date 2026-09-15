@@ -213,6 +213,30 @@ public class CodeEditor extends Widget {
     private final Array<CodeEditorCaretListener> caretListeners = new Array<>();
     private final Array<CodeEditorInputInterceptor> inputInterceptors = new Array<>();
     private final Array<CodeEditorHoverListener> hoverListeners = new Array<>();
+    private final Array<CodeEditorScrollListener> scrollListeners = new Array<>();
+    /** Scratch copy used while notifying, so a listener may unregister from its own callback. */
+    private final Array<CodeEditorScrollListener> scrollListenerScratch = new Array<>();
+    /**
+     * Offset the previous scroll notification reported, or NaN before the first {@link #act(float)}.
+     *
+     * <p>The notifier compares offsets rather than instrumenting the places that move them, which is the
+     * same trade {@link #notifyCaretMovedIfNeeded()} makes and the reason wheel, scrollbar, keyboard,
+     * {@link #setScroll(float, float)} and pane synchronization all report without being wired up
+     * individually.
+     */
+    private float lastNotifiedScrollX = Float.NaN;
+    private float lastNotifiedScrollY = Float.NaN;
+    /** True from the frame the offset first moves until the first frame it stops. */
+    private boolean scrollInProgress;
+    /** Pan and fling state already reported, so each gesture edge fires exactly once. */
+    private boolean touchScrollDragNotified;
+    private boolean flingNotified;
+    /**
+     * Rows drawn with a segment index their layout did not have, and so drawn with the nearest segment
+     * it did. Always zero unless {@code countWrapRows} and {@code wrapLine} disagree; see
+     * {@link #getRowSegmentClampCount()}.
+     */
+    private long rowSegmentClampCount;
     /**
      * Per-line layout, materialized on demand by {@link #layoutFor(int)}. Entries are null until a
      * line is drawn or measured, and are evicted when the cache grows past
@@ -683,6 +707,37 @@ public class CodeEditor extends Widget {
     public void clearHoverListeners() {
         hoverListeners.clear();
         cancelHover();
+    }
+
+    /**
+     * Registers a listener for scroll movement and for the touch pan and fling gestures behind it.
+     *
+     * <p>Adding the first listener also clears the gesture state already reported, so a listener
+     * registered while the user is mid-pan or mid-fling is told about the gesture that is still running
+     * rather than only about the next one.
+     */
+    public void addScrollListener(CodeEditorScrollListener listener) {
+        if (listener == null || scrollListeners.contains(listener, true)) {
+            return;
+        }
+        if (scrollListeners.size == 0) {
+            // The offset may already be midway through a scroll nobody was listening to. Re-seed rather
+            // than report the next change as a delta from an origin this listener never saw.
+            lastNotifiedScrollX = Float.NaN;
+            lastNotifiedScrollY = Float.NaN;
+            scrollInProgress = false;
+            touchScrollDragNotified = false;
+            flingNotified = false;
+        }
+        scrollListeners.add(listener);
+    }
+
+    public void removeScrollListener(CodeEditorScrollListener listener) {
+        scrollListeners.removeValue(listener, true);
+    }
+
+    public void clearScrollListeners() {
+        scrollListeners.clear();
     }
 
     /** Seconds the pointer must rest before a hover fires. */
@@ -2070,6 +2125,60 @@ public class CodeEditor extends Widget {
         return scrollY;
     }
 
+    /**
+     * Whether a scroll is under way: true from the frame the offset first moves until the first frame it
+     * stops.
+     *
+     * <p>Covers every source, not only touch. A wheel tick, a scrollbar thumb drag, the editor scrolling
+     * itself to keep the caret visible, {@link #setScroll(float, float)}, pinch zoom and a linked diff
+     * pane all move the same offset and all report here. For the touch gestures specifically, see
+     * {@link #isTouchScrollDragging()} and {@link #isFlinging()}.
+     *
+     * <p>Maintained by {@link #act(float)}. On a widget that is not being acted on — off-stage, or inside
+     * a halted stage — it keeps whatever it last saw. The two touch queries read live state and carry no
+     * such caveat.
+     */
+    public boolean isScrolling() {
+        return scrollInProgress;
+    }
+
+    /**
+     * Whether a drag is panning the content right now, as opposed to a wheel, a scrollbar thumb or a
+     * programmatic move.
+     *
+     * <p>"Touch" is the gesture's name in this class, not a claim about the pointer: a mouse drag that
+     * started in the gutter pans the same way and sets the same state, because that is the state the
+     * fling and the axis lock are built on.
+     */
+    public boolean isTouchScrollDragging() {
+        return draggingTouchScroll;
+    }
+
+    /**
+     * Whether the content is coasting after a touch release.
+     *
+     * <p>False while a finger is still down, even though {@link #getTouchScrollVelocityX()} is non-zero
+     * then: the velocity is sampled throughout the drag precisely so it is ready the moment the finger
+     * lifts.
+     */
+    public boolean isFlinging() {
+        if (draggingTouchScroll || draggingScrollbar) {
+            return false;
+        }
+        return Math.abs(touchScrollVelocityX) >= TOUCH_FLING_MIN_SPEED
+            || Math.abs(touchScrollVelocityY) >= TOUCH_FLING_MIN_SPEED;
+    }
+
+    /** Velocity the current pan is tracking, in pixels per second; zero when nothing is panning. */
+    public float getTouchScrollVelocityX() {
+        return touchScrollVelocityX;
+    }
+
+    /** Velocity the current pan is tracking, in pixels per second; zero when nothing is panning. */
+    public float getTouchScrollVelocityY() {
+        return touchScrollVelocityY;
+    }
+
     /** Total height of all visual rows in pixels. */
     public float getContentHeightPixels() {
         ensureLayout();
@@ -3403,6 +3512,8 @@ public class CodeEditor extends Widget {
         if (!draggingTouchScroll && !draggingScrollbar) {
             applyTouchBounce(delta);
         }
+        // Last, so the offset compared is the one this frame settles on after the fling and the bounce.
+        notifyScrollListenersIfNeeded();
     }
 
     @Override
@@ -3987,10 +4098,21 @@ public class CodeEditor extends Widget {
      * once per width, not once per keystroke.
      */
     private void measureAllWrapRows(int lineCount, int wrapWidth) {
+        if (wrapWidth != wrapRowCountsWidth) {
+            // Every materialized layout was split at the previous width and now has the wrong number of
+            // segments for the rows this measure is about to hand it. ensureLayout usually discards them
+            // itself, but not on the paths that reach here without a geometry change: the deferred
+            // re-measure fires long after the resize that scheduled it, and a line-count mismatch while
+            // one is pending lands here too.
+            discardAllLineLayouts();
+        }
+        // Recorded before the loop rather than after, so a layout materialized part-way through — none
+        // does today, but the field is what layoutWrapWidth answers with — already wraps at the width
+        // being measured instead of the one being replaced.
+        wrapRowCountsWidth = wrapWidth;
         for (int line = 0; line < lineCount; line++) {
             wrapRowCounts[line] = countWrapRows(line, wrapWidth);
         }
-        wrapRowCountsWidth = wrapWidth;
         wrapRowCountsLineCount = lineCount;
         wrapRowsDirtyFrom = Integer.MAX_VALUE;
         wrapRowsDirtyTo = -1;
@@ -4250,6 +4372,34 @@ public class CodeEditor extends Widget {
     }
 
     /**
+     * Width every materialized {@link LineLayout} has to be split at, so the segments a layout has agree
+     * with the rows the mapping gives its line.
+     *
+     * <p>Deliberately <em>not</em> a fresh {@link #getWrapWidth()} sample. The row mapping is a prefix
+     * sum of {@link #countWrapRows(int, int)} results, and those were measured at
+     * {@link #wrapRowCountsWidth}; a layout split at any other width can end up with fewer segments than
+     * the mapping hands it rows, which is what made {@code drawRows} read a segment index with nothing
+     * behind it. Sampling live here is how the two drifted apart:
+     *
+     * <ul>
+     *   <li>The samples are taken at different moments, and above
+     *       {@link #WRAP_REMEASURE_SYNC_LINE_LIMIT} lines {@link #refreshWrapRowCounts(int)} keeps the
+     *       previous width's counts on purpose while a resize settles.
+     *   <li>{@link #getWrapWidth()} is not a function of the widget size alone — it subtracts the
+     *       scrollbar when one is showing, and whether one shows depends on {@link #totalVisualRows},
+     *       which the row mapping has just changed.
+     * </ul>
+     *
+     * <p>The fallback covers a layout materialized before any row mapping exists.
+     */
+    private int layoutWrapWidth() {
+        if (wrapRowCountsWidth > 0) {
+            return wrapRowCountsWidth;
+        }
+        return Math.max(1, Math.round(getWrapWidth()));
+    }
+
+    /**
      * Returns the layout for one line, building it if this is the first time it is needed. Callers
      * must not hold the result across an edit.
      */
@@ -4279,7 +4429,8 @@ public class CodeEditor extends Widget {
         buildLineContent(line, displayLine, layout);
         layout.ensurePrefixWidths(this);
         if (wrapEnabled) {
-            wrapLine(layout, Math.max(1, Math.round(getWrapWidth())));
+            // The mapping's width, not a fresh sample: see layoutWrapWidth.
+            wrapLine(layout, layoutWrapWidth());
         } else {
             layout.segmentStarts.clear();
             layout.segmentEnds.clear();
@@ -4908,6 +5059,28 @@ public class CodeEditor extends Widget {
     public int getVisualRowCount() {
         ensureLayout();
         return totalVisualRows;
+    }
+
+    /**
+     * How many rows have been drawn with a segment index their line's layout did not have, since
+     * construction or the last {@link #resetRowSegmentClampCount()}.
+     *
+     * <p>Always zero in a healthy editor. Anything else means {@link #countWrapRows(int, int)} and
+     * {@link #wrapLine(LineLayout, int)} disagreed about a line's row count — the condition that used to
+     * throw {@code IndexOutOfBoundsException} out of {@code drawRows}. The row is now drawn with the
+     * nearest segment the layout does have, so a non-zero value here is the same bug arriving as a
+     * glitch, and is worth reporting rather than swallowing.
+     *
+     * <p>Only meaningful once the editor has been drawn at least once, since that is what populates the
+     * visible rows.
+     */
+    public long getRowSegmentClampCount() {
+        return rowSegmentClampCount;
+    }
+
+    /** Clears {@link #getRowSegmentClampCount()}, so a caller can check one interaction at a time. */
+    public void resetRowSegmentClampCount() {
+        rowSegmentClampCount = 0L;
     }
 
     /**
@@ -6792,6 +6965,38 @@ public class CodeEditor extends Widget {
         style.cursor.draw(batch, getX() + placement.x, getY() + rowBottom + 3f, 1.5f, lineHeight - 6f);
     }
 
+    /**
+     * Segment index for a visual row, pinned to a segment the layout actually has, or {@code -1} for a
+     * layout with no segments at all.
+     *
+     * <p>{@code drawRows} takes the index from the row mapping and the segments from the layout, so any
+     * disagreement between {@link #countWrapRows(int, int)} and {@link #wrapLine(LineLayout, int)} about
+     * one line's row count used to surface as an {@link IndexOutOfBoundsException} out of
+     * {@code IntArray.get} — fatal to the frame, and to the application when nothing above catches it,
+     * for what is only one row drawn wrong.
+     *
+     * <p>Clamping keeps the frame alive and counts the event instead, so the underlying disagreement
+     * stays observable through {@link #getRowSegmentClampCount()} rather than becoming silent. It is a
+     * backstop, not the fix: the width the mapping and the layouts are built from is now shared, and a
+     * healthy editor never reaches this.
+     */
+    private int clampedSegment(LineLayout layout, int segment) {
+        int count = layout.segmentEnds.size;
+        if (count <= 0) {
+            rowSegmentClampCount++;
+            return -1;
+        }
+        if (segment < 0) {
+            rowSegmentClampCount++;
+            return 0;
+        }
+        if (segment >= count) {
+            rowSegmentClampCount++;
+            return count - 1;
+        }
+        return segment;
+    }
+
     private void drawRows(Batch batch) {
         int startRow = Math.max(0, (int) Math.floor(scrollY / lineHeight));
         int endRow = Math.min(totalVisualRows - 1, (int) Math.ceil((scrollY + getContentHeight()) / lineHeight));
@@ -6814,7 +7019,10 @@ public class CodeEditor extends Widget {
             }
 
             LineLayout layout = layoutFor(line);
-            int segment = row - visualRowStartOf(line);
+            int segment = clampedSegment(layout, row - visualRowStartOf(line));
+            if (segment < 0) {
+                continue;
+            }
             int start = layout.segmentStarts.get(segment);
             int end = layout.segmentEnds.get(segment);
             float rowBottom = getY() + rowBottom(row);
@@ -9311,6 +9519,90 @@ public class CodeEditor extends Widget {
     private void clampScroll() {
         scrollX = Math.max(getMinScrollX(), Math.min(scrollX, getMaxScrollX()));
         scrollY = Math.max(getMinScroll(), Math.min(scrollY, getMaxScroll()));
+    }
+
+    /**
+     * Reports scroll movement and the touch gesture edges since the previous frame.
+     *
+     * <p>Comparing offsets rather than instrumenting the places that move them is the same trade
+     * {@link #notifyCaretMovedIfNeeded()} makes, and it is what lets one callback cover wheel, scrollbar
+     * thumb, keyboard caret movement, {@link #setScroll(float, float)}, pinch zoom and pane
+     * synchronization without wiring up each of them. The cost is a frame of latency, and a change that
+     * is undone within one frame going unreported.
+     *
+     * <p>Runs at the end of {@link #act(float)}, after the fling and bounce steps, so the offset it reads
+     * is the one the frame settles on.
+     */
+    private void notifyScrollListenersIfNeeded() {
+        if (Float.isNaN(lastNotifiedScrollX) || Float.isNaN(lastNotifiedScrollY)) {
+            // First frame after construction, or after the first listener was added. Record where the
+            // offset is instead of announcing a scroll from an origin nobody saw.
+            lastNotifiedScrollX = scrollX;
+            lastNotifiedScrollY = scrollY;
+        }
+
+        boolean dragging = draggingTouchScroll;
+        boolean flinging = isFlinging();
+        boolean dragChanged = dragging != touchScrollDragNotified;
+        boolean flingChanged = flinging != flingNotified;
+
+        // One snapshot for the whole update. None of the callbacks below can re-enter this method:
+        // setScroll only moves the offset, which the next frame picks up.
+        scrollListenerScratch.clear();
+        scrollListenerScratch.addAll(scrollListeners);
+
+        if (dragChanged || flingChanged) {
+            touchScrollDragNotified = dragging;
+            flingNotified = flinging;
+            // Pan first, then fling, so a release that coasts arrives as finished-dragging followed by
+            // started-coasting.
+            if (dragChanged) {
+                for (int i = 0; i < scrollListenerScratch.size; i++) {
+                    CodeEditorScrollListener listener = scrollListenerScratch.get(i);
+                    if (dragging) {
+                        listener.onTouchScrollStarted(this);
+                    } else {
+                        listener.onTouchScrollFinished(this, flinging);
+                    }
+                }
+            }
+            if (flingChanged) {
+                for (int i = 0; i < scrollListenerScratch.size; i++) {
+                    CodeEditorScrollListener listener = scrollListenerScratch.get(i);
+                    if (flinging) {
+                        listener.onFlingStarted(this, touchScrollVelocityX, touchScrollVelocityY);
+                    } else {
+                        listener.onFlingFinished(this);
+                    }
+                }
+            }
+        }
+
+        if (scrollX != lastNotifiedScrollX || scrollY != lastNotifiedScrollY) {
+            float deltaX = scrollX - lastNotifiedScrollX;
+            float deltaY = scrollY - lastNotifiedScrollY;
+            lastNotifiedScrollX = scrollX;
+            lastNotifiedScrollY = scrollY;
+            boolean starting = !scrollInProgress;
+            scrollInProgress = true;
+            // Two passes rather than one, so every listener sees the start of the scroll before any of
+            // them sees the movement itself.
+            if (starting) {
+                for (int i = 0; i < scrollListenerScratch.size; i++) {
+                    scrollListenerScratch.get(i).onScrollStarted(this, scrollX, scrollY);
+                }
+            }
+            for (int i = 0; i < scrollListenerScratch.size; i++) {
+                scrollListenerScratch.get(i).onScrollChanged(this, scrollX, scrollY, deltaX, deltaY);
+            }
+        } else if (scrollInProgress && !dragging && !flinging) {
+            // A finger held still mid-pan pauses the scroll; it does not end it. Waiting for the drag and
+            // the fling to be over keeps one gesture to one start and end pair.
+            scrollInProgress = false;
+            for (int i = 0; i < scrollListenerScratch.size; i++) {
+                scrollListenerScratch.get(i).onScrollFinished(this, scrollX, scrollY);
+            }
+        }
     }
 
     private void resetPreferredColumn() {

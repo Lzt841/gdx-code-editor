@@ -21,6 +21,7 @@ The library is designed for in-app script editors, config editors, lightweight I
 - Rainbow brackets and rainbow guides
 - Touch and mouse interaction modes
 - Touch handles, long press, inertial scrolling, pinch zoom
+- Scroll state queries and a listener, covering touch pan, fling and every other scroll source
 - Right-click / long-press integration hooks
 - Read-only and disabled modes
 - Rebindable keyboard shortcuts through a named-action keymap
@@ -38,7 +39,7 @@ The library is designed for in-app script editors, config editors, lightweight I
   - code structure analysis
   - interaction behavior
   - auto-edit behaviour on typing, Backspace and Enter
-  - content, caret and hover observation
+  - content, caret, hover and scroll observation
   - keyboard interception
   - key chord to named action mapping
   - navigation (definition, references, rename)
@@ -496,6 +497,19 @@ count; on documents over 20,000 lines that re-measure is deferred until the widt
 dragging a window edge does not stall. Wrap mode also keeps per-line row arrays that the non-wrapped
 path skips entirely, since without wrapping and folding visual row N is simply line N.
 
+**The width the row counts were measured at is the width lines are wrapped at.** The two are not
+allowed to be sampled separately, because the row mapping is a prefix sum of the counts and a layout
+split at a different width would have a different number of segments than the mapping gives it rows.
+While a deferred re-measure is pending on a large document the two are therefore both at the *previous*
+width, so the text keeps its old wrapping for the ~0.15 s the resize takes to settle rather than
+reflowing every frame — the scrollbar and the scroll extent stay consistent with it the whole way.
+
+`getRowSegmentClampCount()` should be zero. It counts rows drawn with a segment index their line's
+layout did not have, which is the shape of a disagreement between `countWrapRows` and `wrapLine`. The
+editor draws such a row with the nearest segment it does have instead of throwing, so a non-zero value
+is that bug arriving as a visible glitch you can report, not as an `IndexOutOfBoundsException` that
+takes the frame down.
+
 **Continuation indent is off by default**, because it changes how many rows an indented line occupies
 and so would move the scroll extent and the click mapping of an existing caller. When on, wrapped
 rows of a line are indented to the start of that line's own text, plus any extra columns you ask for,
@@ -624,6 +638,7 @@ editor.isWrapRemeasurePending();      // a wrap re-measure is waiting for the wi
 editor.isStructureAnalysisPending();
 editor.getVisualRowCount();           // rows the scroll extent is measured in
 editor.getVisualRowsForLine(line);    // 1 unless the line wraps, 0 if it is folded away
+editor.getRowSegmentClampCount();     // must be 0; see "Large Documents"
 ```
 
 The one to watch is `getHighlightResyncLine()`. While you type it should stay at or near the line count.
@@ -691,6 +706,74 @@ editor.setScroll(scrollX, scrollY);   // update both axes as one operation
 
 Scroll coordinates are pixel offsets. The setters clamp values to the current valid range, which
 makes `setScroll(scrollX, scrollY)` suitable for keeping two editors in sync in a diff view.
+
+## Scroll State
+
+Whether the editor is scrolling, and what is driving it:
+
+```java
+editor.isScrolling();              // any source at all: wheel, thumb, caret move, setScroll, pinch, a linked pane
+editor.isTouchScrollDragging();    // a finger is panning right now
+editor.isFlinging();               // coasting after a touch release
+
+editor.getTouchScrollVelocityX();  // pixels per second, zero when nothing is panning
+editor.getTouchScrollVelocityY();
+```
+
+`isScrolling()` lags by a frame and covers every scroll source, because it is decided by comparing the
+offset each frame rather than by hooking each thing that moves it. `isTouchScrollDragging()` and
+`isFlinging()` read live state, and answer immediately.
+
+To be told rather than to poll:
+
+```java
+editor.addScrollListener(new CodeEditorScrollListener() {
+    @Override
+    public void onScrollChanged(CodeEditor editor, float scrollX, float scrollY,
+                                float deltaX, float deltaY) {
+    }
+
+    @Override
+    public void onScrollStarted(CodeEditor editor, float scrollX, float scrollY) {
+    }
+
+    @Override
+    public void onScrollFinished(CodeEditor editor, float scrollX, float scrollY) {
+    }
+
+    @Override
+    public void onTouchScrollStarted(CodeEditor editor) {
+    }
+
+    @Override
+    public void onTouchScrollFinished(CodeEditor editor, boolean continuesIntoFling) {
+    }
+
+    @Override
+    public void onFlingStarted(CodeEditor editor, float velocityX, float velocityY) {
+    }
+
+    @Override
+    public void onFlingFinished(CodeEditor editor) {
+    }
+});
+```
+
+Only `onScrollChanged` is abstract; the rest are defaults, so a listener that just wants to know the
+offset moved implements one method. Everything is reported once per frame, so a burst of wheel events
+inside a frame arrives as one `onScrollChanged` carrying the summed delta.
+
+`onScrollStarted` / `onScrollFinished` bracket a scroll, and are not emitted while a pan or fling is
+still going: a finger held still mid-pan pauses the scroll rather than ending it. Within a frame the
+gestures are reported before the offset, so a release that coasts arrives as `onTouchScrollFinished`,
+`onFlingStarted`, then the movement the fling produced.
+
+The offset deltas are for the whole editor, not for the user: a fling, a `setScroll` from a diff pane
+and a caret move that scrolls into view all report the same way. Use `isTouchScrollDragging()` at the
+time of the callback if you need to tell them apart.
+
+A widget that is not being acted on — off-stage, or inside a halted stage — reports nothing, since the
+comparison happens in `act()`. `isScrolling()` keeps its last value there too.
 
 ## Editing From Tooling
 
