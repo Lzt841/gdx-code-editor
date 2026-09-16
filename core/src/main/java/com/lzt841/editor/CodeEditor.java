@@ -3645,7 +3645,12 @@ public class CodeEditor extends Widget {
     private void ensureLayout() {
         int wrapWidth = wrapEnabled ? Math.max(1, Math.round(getWrapWidth())) : -1;
         boolean geometryChanged = wrapWidth != analyzedWrapWidth || wrapEnabled != analyzedWrapEnabled;
-        if (document.getVersion() == analyzedVersion && !geometryChanged && !rowMappingDirty && !searchDirty) {
+        // lineLayouts is indexed by line, so it must be exactly the document's length. It is maintained
+        // in step with the version, so this holds whenever the version has not moved — but a helper that
+        // empties the array without repairing it breaks the mapping silently, and every line then draws
+        // as the empty layout. Refusing to take the fast path here is what turns that into a rebuild.
+        if (document.getVersion() == analyzedVersion && !geometryChanged && !rowMappingDirty && !searchDirty
+            && lineLayouts.size == document.getLineCount()) {
             return;
         }
         if (layoutSyncInProgress) {
@@ -3953,6 +3958,8 @@ public class CodeEditor extends Widget {
      * so an unpaired call leaves {@code lineLayouts} empty and every line then draws as the empty
      * layout. {@link #invalidateLayout()} does force the resize, but it also resets the lexer state
      * cache and the wrap measurements, and a recolour changes neither the lexing nor the text width.
+     * This helper is also what {@link #measureAllWrapRows(int, int)} uses for that reason: it runs from
+     * the deferred wrap re-measure, outside ensureLayout, where a discard would go unrepaired.
      */
     private void recolorAllLineLayouts() {
         for (int i = 0; i < lineLayouts.size; i++) {
@@ -4104,7 +4111,14 @@ public class CodeEditor extends Widget {
             // itself, but not on the paths that reach here without a geometry change: the deferred
             // re-measure fires long after the resize that scheduled it, and a line-count mismatch while
             // one is pending lands here too.
-            discardAllLineLayouts();
+            //
+            // recolor rather than discard: this also runs from updateWrapRemeasureDebounce, which does
+            // not pair the call with resizeLineArrays the way ensureLayout does. Clearing the array
+            // there leaves it empty, and the next ensureLayout returns early — the width has settled and
+            // the version has not moved — so nothing resizes it again and every line then draws as the
+            // empty layout until an edit bumps the version. Keeping the length makes the rebuild lazy
+            // instead: layoutFor materializes each line at the width just measured.
+            recolorAllLineLayouts();
         }
         // Recorded before the loop rather than after, so a layout materialized part-way through — none
         // does today, but the field is what layoutWrapWidth answers with — already wraps at the width
