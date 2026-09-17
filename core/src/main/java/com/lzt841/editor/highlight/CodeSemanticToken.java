@@ -76,9 +76,11 @@ public class CodeSemanticToken {
     public final int modifiers;
     /** Free slot for the producer; the editor never reads it. */
     public final Object userData;
+    /** How this occurrence is drawn, or null for an undecorated run. */
+    public final CodeTextStyle style;
 
     public CodeSemanticToken(int line, int startColumn, int endColumn, CodeSemanticTokenType type) {
-        this(line, startColumn, endColumn, type, null, NO_MODIFIERS, null);
+        this(line, startColumn, endColumn, type, null, NO_MODIFIERS, null, null);
     }
 
     public CodeSemanticToken(
@@ -88,7 +90,7 @@ public class CodeSemanticToken {
         CodeSemanticTokenType type,
         Color color
     ) {
-        this(line, startColumn, endColumn, type, color, NO_MODIFIERS, null);
+        this(line, startColumn, endColumn, type, color, NO_MODIFIERS, null, null);
     }
 
     public CodeSemanticToken(
@@ -100,6 +102,24 @@ public class CodeSemanticToken {
         int modifiers,
         Object userData
     ) {
+        this(line, startColumn, endColumn, type, color, modifiers, userData, null);
+    }
+
+    /**
+     * With a {@link CodeTextStyle}. The editor never derives a style from {@link #modifiers} — mapping
+     * {@link #MODIFIER_DEPRECATED} to a strike-through is a theming choice the producer makes, the same
+     * way it decides the colour — so this is the only route to a decorated semantic token.
+     */
+    public CodeSemanticToken(
+        int line,
+        int startColumn,
+        int endColumn,
+        CodeSemanticTokenType type,
+        Color color,
+        int modifiers,
+        Object userData,
+        CodeTextStyle style
+    ) {
         this.line = line;
         this.startColumn = startColumn;
         this.endColumn = endColumn;
@@ -107,16 +127,17 @@ public class CodeSemanticToken {
         this.color = color;
         this.modifiers = modifiers;
         this.userData = userData;
+        this.style = style;
+    }
+
+    /** This token on a different line, for callers shifting a batch after an edit of their own. */
+    public CodeSemanticToken movedTo(int newLine) {
+        return new CodeSemanticToken(newLine, startColumn, endColumn, type, color, modifiers, userData, style);
     }
 
     /** Whether every bit in {@code modifierMask} is set. */
     public boolean hasModifiers(int modifierMask) {
         return (modifiers & modifierMask) == modifierMask;
-    }
-
-    /** This token on a different line, for callers shifting a batch after an edit of their own. */
-    public CodeSemanticToken movedTo(int newLine) {
-        return new CodeSemanticToken(newLine, startColumn, endColumn, type, color, modifiers, userData);
     }
 
     /** Whether {@code column} falls inside this token. */

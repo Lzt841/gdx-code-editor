@@ -17,6 +17,7 @@ import com.badlogic.gdx.scenes.scene2d.Actor;
 import com.badlogic.gdx.scenes.scene2d.InputEvent;
 import com.badlogic.gdx.scenes.scene2d.InputListener;
 import com.badlogic.gdx.scenes.scene2d.Stage;
+import com.badlogic.gdx.scenes.scene2d.ui.Cell;
 import com.badlogic.gdx.scenes.scene2d.ui.Label;
 import com.badlogic.gdx.scenes.scene2d.ui.ScrollPane;
 import com.badlogic.gdx.scenes.scene2d.ui.Table;
@@ -40,6 +41,8 @@ import com.lzt841.editor.CodeKeyStroke;
 import com.lzt841.editor.CodeIndentStrategy;
 import com.lzt841.editor.CodeLineMark;
 import com.lzt841.editor.CodeEditorTextRange;
+import com.lzt841.editor.InlineImageHit;
+import com.lzt841.editor.InlineImageListener;
 import com.lzt841.editor.completion.CodeCompletionController;
 import com.lzt841.editor.completion.CodeCompletionInsertFormat;
 import com.lzt841.editor.completion.CodeCompletionItem;
@@ -82,6 +85,8 @@ public class Main extends ApplicationAdapter {
     private Stage stage;
     private CodeEditor editor;
     private Table root;
+    private Table sidebarTable;
+    private Cell<ScrollPane> sidebarCell;
 
     private TextButton.TextButtonStyle debugButtonStyle;
     private Label.LabelStyle debugLabelStyle;
@@ -192,6 +197,9 @@ public class Main extends ApplicationAdapter {
 
     private DemoProfile[] profiles;
     private int profileIndex;
+    private final RichTextHighlighter richTextHighlighter = new RichTextHighlighter();
+    private RichTextImageProvider imageProvider;
+    private InlineImageListener imageListener;
     private String lastEventText = "Ready";
     private Table popupMenu;
     private Table editorFrame;
@@ -241,10 +249,10 @@ public class Main extends ApplicationAdapter {
                     + "  len=" + event.getTextLength();
             }
         });
-        applyProfile(0);
+        applyProfile(initialProfileIndex());
 
         ScrollPane sidebar = createSidebar();
-        root.add(sidebar).minWidth(300f).prefWidth(300f).top().fillY();
+        sidebarCell = root.add(sidebar).minWidth(300f).prefWidth(300f).top().fillY();
 
         editorFrame = new Table();
         editorFrame.setBackground(new TextureRegionDrawable(new TextureRegion(whitePixel))
@@ -296,11 +304,18 @@ public class Main extends ApplicationAdapter {
             if (customClipInsetEnabled) {
                 applyCustomClipInset();
             }
+            // The width cap is a share of the stage, so a smaller window has to re-measure the sidebar or
+            // it keeps a width the new stage can no longer afford.
+            adaptSidebarWidth();
         }
     }
 
     @Override
     public void dispose() {
+        // The atlas belongs to the rich-text profile and is not freed by anything else.
+        if (imageProvider != null) {
+            imageProvider.dispose();
+        }
         stage.dispose();
         whitePixel.dispose();
         font.dispose();
@@ -1047,6 +1062,7 @@ public class Main extends ApplicationAdapter {
         pane.setFadeScrollBars(false);
         pane.setScrollingDisabled(true, false);
         pane.setOverscroll(false, true);
+        sidebarTable = sidebar;
         return pane;
     }
 
@@ -1326,6 +1342,38 @@ public class Main extends ApplicationAdapter {
                 + "Tips: double-click word, drag handles, toggle custom clip, long-press for menu."
         );
         eventLabel.setText(lastEventText);
+        adaptSidebarWidth();
+    }
+
+    /**
+     * Widens or narrows the debug sidebar to fit whatever its buttons and labels currently say, because a
+     * Scene2D button does not wrap and a fixed 300px cell clips every label that runs longer than that —
+     * the toggle rows are the ones that grow, since a state name lands in the text on every refresh.
+     *
+     * <p>The button texts change on every refresh and the wrapped info labels report a preferred width of
+     * zero, so the table's own preferred width is what has to be measured, and it is only current after an
+     * invalidate: reading a cached value would keep the sidebar at its startup width forever.
+     */
+    private void adaptSidebarWidth() {
+        if (sidebarTable == null || sidebarCell == null || stage == null) {
+            return;
+        }
+        sidebarTable.invalidate();
+        float width = sidebarTable.getPrefWidth();
+        // The vertical scrollbar sits over the content's right edge, so leave it room rather than let the
+        // knob cover the tail of the longest button.
+        width += 14f;
+        // A pathological label should not eat the stage: cap the sidebar under half of it so the editor
+        // beside it stays usable.
+        float cap = Math.max(320f, stage.getWidth() * 0.45f);
+        if (width > cap) {
+            width = cap;
+        }
+        if (Math.abs(sidebarCell.getPrefWidth() - width) > 0.5f) {
+            sidebarCell.prefWidth(width);
+            sidebarCell.minWidth(width);
+            root.invalidate();
+        }
     }
 
     /**
@@ -2126,8 +2174,21 @@ public class Main extends ApplicationAdapter {
             new DemoProfile("Python", "Indent structure + Python highlight", BuiltinCodeHighlighters.python(), new PythonIndentCodeStructureProvider(), createPythonDemo()),
             new DemoProfile("JSON", "Brace structure + JSON highlight", BuiltinCodeHighlighters.json(), new BraceCodeStructureProvider(), createJsonDemo()),
             new DemoProfile("XML", "Brace structure + XML highlight", BuiltinCodeHighlighters.xml(), new BraceCodeStructureProvider(), createXmlDemo()),
-            new DemoProfile("Plain Text", "Brace structure disabled-like plain text", BuiltinCodeHighlighters.plainText(), new BraceCodeStructureProvider(), createPlainTextDemo())
+            new DemoProfile("Plain Text", "Brace structure disabled-like plain text", BuiltinCodeHighlighters.plainText(), new BraceCodeStructureProvider(), createPlainTextDemo()),
+            new DemoProfile("Rich Text", "Markers, gradients and inline images", richTextHighlighter, new BraceCodeStructureProvider(), createRichTextDemo(), true)
         };
+    }
+
+    /**
+     * The sample to open with, from {@code -Dprofile=n} when given, so a demo can be deep-linked (and
+     * screenshotted) without clicking through the sidebar.
+     */
+    private int initialProfileIndex() {
+        try {
+            return Math.max(0, Math.min(Integer.getInteger("profile", 0), profiles.length - 1));
+        } catch (NumberFormatException ignored) {
+            return 0;
+        }
     }
 
     private void applyProfile(int index) {
@@ -2136,6 +2197,23 @@ public class Main extends ApplicationAdapter {
         editor.setHighlighter(profile.highlighter);
         editor.setStructureProvider(profile.structureProvider);
         editor.setText(profile.text);
+        // The image atlas belongs to the one profile that uses it: swapped out here rather than left
+        // loaded for the other languages, whose text contains no image columns anyway. The listener goes
+        // with it, so clicking a diagnostic icon in another sample does nothing instead of reporting an
+        // image that is no longer installed.
+        if (profile.richText) {
+            if (imageProvider == null) {
+                imageProvider = new RichTextImageProvider(editor.getLineHeight());
+            }
+            if (imageListener == null) {
+                imageListener = createImageListener();
+            }
+            editor.setInlineImageProvider(imageProvider);
+            editor.setInlineImageListener(imageListener);
+        } else if (imageProvider != null) {
+            editor.setInlineImageProvider(null);
+            editor.setInlineImageListener(null);
+        }
         if (searchField != null) {
             searchField.setText(editor.getSearchText());
         }
@@ -2494,6 +2572,51 @@ public class Main extends ApplicationAdapter {
             + "4. Verify fold toggle and syntax switching.\n";
     }
 
+    /**
+     * Reports inline-image interaction into the same event line every other demo input uses, so the
+     * sample is self-describing: click an icon, and the label says what the editor handed a listener.
+     * Returns true from the click so the caret does not move into the image column.
+     */
+    private InlineImageListener createImageListener() {
+        return new InlineImageListener() {
+            @Override
+            public boolean onImageClicked(CodeEditor editor, InlineImageHit hit, float localX, float localY) {
+                lastEventText = "Image clicked at " + (hit.line + 1) + ":" + (hit.column + 1);
+                return true;
+            }
+
+            @Override
+            public void onImageHover(CodeEditor editor, InlineImageHit hit, float localX, float localY) {
+                lastEventText = "Image hovered at " + (hit.line + 1) + ":" + (hit.column + 1);
+            }
+
+            @Override
+            public void onImageHoverEnd(CodeEditor editor, InlineImageHit hit) {
+                lastEventText = "Image hover ended at " + (hit.line + 1) + ":" + (hit.column + 1);
+            }
+        };
+    }
+
+    private String createRichTextDemo() {
+        return ""
+            + "# Rich text, rendered from spans\n"
+            + "Every marker below is one CodeTextStyle on one CodeHighlightSpan.\n"
+            + "Bold is a second draw pass: **this whole phrase is fake bold**.\n"
+            + "Italic shears the projection: @@this one leans@@ around the baseline.\n"
+            + "Strikethrough for the deprecated: ~~do not call this method any more~~.\n"
+            + "A background for marked text: ==this region is tinted== end to end.\n"
+            + "A plain underline: __underlined identifier__, and a wavy one: !!suspicious spelling!!.\n"
+            + "A double underline: ;;this one is doubly emphasised;;.\n"
+            + "A dashed underline: --this one is broken into dashes--, a dotted one: ..this into dots..\n"
+            + "Decorations span tabs and wrapping: __underlined\tacross a tab__ here.\n"
+            + "\n"
+            + "Inline images replace a column, so cursor and hit-test follow:\n"
+            + "status ★ pass    ☆ pending    ✔ verified    ✖ failed\n"
+            + "play ▶ next      ◀ previous    ♥ hearts      ♠ spades\n"
+            + "Real emoji are surrogate pairs, and render as one column: 😀 🚀 🎉 done.\n"
+            + "Every image column is measured like a glyph, and is clickable: try one.\n";
+    }
+
     private final class DebugInteractionListener implements CodeEditorInteractionListener {
         @Override
         public boolean onLongPress(CodeEditor editor, CodeEditorInteractionContext context) {
@@ -2524,13 +2647,20 @@ public class Main extends ApplicationAdapter {
         final CodeHighlighter highlighter;
         final CodeStructureProvider structureProvider;
         final String text;
+        /** Installs the rich-text demo's image provider when this profile is active. */
+        final boolean richText;
 
         DemoProfile(String name, String description, CodeHighlighter highlighter, CodeStructureProvider structureProvider, String text) {
+            this(name, description, highlighter, structureProvider, text, false);
+        }
+
+        DemoProfile(String name, String description, CodeHighlighter highlighter, CodeStructureProvider structureProvider, String text, boolean richText) {
             this.name = name;
             this.description = description;
             this.highlighter = highlighter;
             this.structureProvider = structureProvider;
             this.text = text;
+            this.richText = richText;
         }
     }
 }

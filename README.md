@@ -33,6 +33,10 @@ The library is designed for in-app script editors, config editors, lightweight I
 - Line marks for breakpoints, bookmarks and change bars
 - Configurable indent strategy, block indent and Shift-Tab dedent
 - Diagnostics with squiggles and gutter marks
+- Rich text on any highlight span: bold, italic, strikethrough, background, gradient, and plain, double,
+  wavy, dashed or dotted underlines, which compose across overlapping spans
+- Inline images in place of a glyph — icons or real emoji, including supplementary characters — measured
+  like any other column, and clickable and hoverable through a listener
 - Caret geometry and coordinate-mapping queries for custom overlays
 - Public extension points for:
   - syntax highlighting (whole-document or incremental)
@@ -228,6 +232,159 @@ identifiers is worse than painting none. And on a token handed back by `getSeman
 the `line` you asked for is authoritative while the token's own `line` field may lag: surviving tokens
 are moved by slot, not rewritten, because rewriting would allocate a fresh token for every one below
 the edit on every keystroke.
+
+## Rich Text
+
+Everything in this section is drawn by the editor's own `BitmapFont`, so a style is never a font change:
+bold is a second draw pass offset by a pixel, italic is a sheared projection matrix, and every underline
+is a filled quad. That is why decorations live in a flag bag rather than per-run fonts — a `BitmapFont`
+has one colour, so colour and decoration are separate axes, and a style never has to fight the font's own
+metrics.
+
+### Styling a span
+
+A `CodeHighlightSpan` may carry a `CodeTextStyle`: an `int` of OR-able flags plus up to seven optional
+colours. Null style means plain text, which is what every pre-existing constructor still produces.
+
+```java
+spans.add(new CodeHighlightSpan(start, end, errorColor,
+    new CodeTextStyle(CodeTextStyle.STRIKETHROUGH | CodeTextStyle.UNDERLINE_WAVY, squiggleColor)));
+```
+
+A semantic token carries the same thing, so a language server can decorate a symbol without a second
+highlighting pass — the eight-argument `CodeSemanticToken` constructor is the only route to a decorated
+semantic token, since the editor never derives a style from its modifiers:
+
+```java
+tokens.add(new CodeSemanticToken(3, 8, 13, CodeSemanticTokenType.METHOD, null,
+    CodeSemanticToken.MODIFIER_DEPRECATED, null,
+    new CodeTextStyle(CodeTextStyle.STRIKETHROUGH)));
+```
+
+| Flag | Effect |
+| --- | --- |
+| `BOLD` | second draw pass, offset right by `CodeEditorStyle.fakeBoldOffset` |
+| `ITALIC` | drawn under a sheared projection matrix around the baseline |
+| `STRIKETHROUGH` | line through the middle of the run |
+| `UNDERLINE` | plain line under the run |
+| `UNDERLINE_DOUBLE` | two parallel lines |
+| `UNDERLINE_WAVY` | squiggle, the same algorithm as a diagnostic |
+| `UNDERLINE_DASHED` | broken line, alternating dashes and gaps |
+| `UNDERLINE_DOTTED` | round dots |
+| `BACKGROUND` | tints the run's row extent, when `backgroundColor` is set |
+| `GRADIENT` | interpolates the text colour to `gradientEndColor` across the run |
+
+Overlapping spans OR their flags together, so a bold span inside an italic span is both, and a linter's
+squiggle survives a background another layer tinted. Colours do not compose the same way: each is taken
+from the first style that supplies it, so an inner span's underline colour wins over an outer one that
+only set a background. No flag requires its colour — a `BACKGROUND` with `backgroundColor` null draws
+nothing rather than guessing one, a `GRADIENT` without `gradientEndColor` falls back to a flat fill, and
+an underline without `underlineColor` uses the span's text colour.
+
+Each decoration kind can also name a colour of its own — `strikethroughColor`, `wavyUnderlineColor`,
+`dashedUnderlineColor`, `dottedUnderlineColor` — set with the matching `with…` method so a style stays a
+one-liner:
+
+```java
+CodeTextStyle squiggle = new CodeTextStyle(CodeTextStyle.UNDERLINE_WAVY)
+    .withWavyUnderlineColor(errorColor);
+```
+
+Each of these falls back to `underlineColor` before the text colour, so `underlineColor` is still the one
+slot to set when every line a span draws should be one colour, and a per-kind colour overrides only its
+own decoration. Two layers can therefore disagree without a conflict: a spell checker's red wavy line
+keeps its colour under a yellow background another span tinted.
+
+`UNDERLINE_DOUBLE`, `UNDERLINE_WAVY`, `UNDERLINE_DASHED` and `UNDERLINE_DOTTED` subsume `UNDERLINE`: all
+four draw their own line at the plain underline's exact y, so the pair would be an overdraw rather than
+two lines — and with the theme's values that is what a plain-plus-wavy run looks like, a solid band where
+a squiggle should be. Dash and dot patterns are aligned within a run, not across runs — the same property
+as the squiggle, for the same reason: aligning across runs would need a measurement of every run on the
+row before the first one could be drawn.
+
+`GRADIENT` is a horizontal interpolation drawn as solid-colour bands of `CodeEditorStyle.gradientBandWidth`,
+which is what a single-colour `BitmapFont` can produce: a band is one `font.draw` call in one colour, so
+a narrower band is a smoother gradient at a linear cost and no allocation.
+
+The geometry knobs for every decoration are in `CodeEditorStyle` — `underlineOffset` and
+`underlineThickness`, `doubleUnderlineGap`, `wavyUnderlineStep` / `wavyUnderlineAmplitude`,
+`dashedUnderlineDashLength` / `dashedUnderlineGap`, `dottedUnderlineDotSize` / `dottedUnderlineGap`,
+`strikethroughOffset`, `fakeBoldOffset`. The theme builder derives all of them from the font line height,
+and a thickness or size of 0 disables that one decoration rather than the run.
+
+### Inline images
+
+Install an `InlineImageProvider` and the editor asks it for a column before it measures or draws that
+column. What it returns replaces the glyph entirely — the image's width *is* the column's advance — so
+wrapping, cursor placement, click hit-testing and text alignment all follow without a special case
+anywhere else in the editor.
+
+```java
+editor.setInlineImageProvider(new InlineImageProvider() {
+    @Override
+    public InlineImage imageAt(int line, int column, CharSequence lineText) {
+        return emojiAtlas.lookup(lineText.charAt(column));   // null draws the character as a glyph
+    }
+});
+```
+
+The provider is called during measurement, not just during drawing, and the answer is not cached, so a
+provider must be O(1) — a re-measure walks every line in the document, visible or not, and the longest
+line is measured for the scroll extent even off screen. Changing the answer later means calling
+`setInlineImageProvider` again, even with the same instance, since the editor holds no state between
+calls.
+
+**Supplementary characters.** A codepoint above U+FFFF is two Java `char`s. Answer from the *high*
+surrogate and return null from the low one, and the pair collapses onto a single column whose advance is
+the image's width; the low surrogate is then neither measured nor drawn, and a pair the provider does not
+answer for stays two glyphs. `column` and `lineText` are the high surrogate's, so a lookup on the codepoint
+via `Character.toCodePoint(char, char)` is the right shape.
+
+An `InlineImage` is a `TextureRegion` plus a width, a height and a baseline offset, so an icon can sit on
+the baseline like a glyph or hang from it like a reaction emoji.
+
+### Clickable and hoverable images
+
+An image column is measured exactly like a glyph, so the editor's own click handling resolves it to a
+cursor position and moves the caret — the right default for text, and useless for an icon that is a
+button. An `InlineImageListener` gets the call *before* the caret moves:
+
+```java
+editor.setInlineImageListener(new InlineImageListener() {
+    @Override
+    public boolean onImageClicked(CodeEditor editor, InlineImageHit hit, float localX, float localY) {
+        showReactionPicker(hit.line, hit.column);
+        return true;   // consume: the caret stays put and any selection is kept
+    }
+
+    @Override
+    public void onImageHover(CodeEditor editor, InlineImageHit hit, float localX, float localY) {
+    }
+
+    @Override
+    public void onImageHoverEnd(CodeEditor editor, InlineImageHit hit) {
+    }
+});
+```
+
+Returning true consumes the click; returning false lets the press fall through to the ordinary text
+behaviour, which is the right answer for a decorative image. A consumed click does not consume the drag
+or the double-click that follow a single click — those are separate gestures, and a double-click on an
+image still selects the word around it.
+
+An `InlineImageHit` carries the `line` and `column` the image sits at plus the image itself, because a
+listener needs the position to look the thing up in its own model — an emoji reaction needs the message
+it belongs to, a diagnostic icon needs the error it stands for — and the image alone does not carry that.
+
+Hover fires on entry and again on exit, not continuously; both report the position being left, so a
+listener can tear down exactly what it built. Replacing the listener or the provider fires
+`onImageHoverEnd` for an image already hovered, so a tooltip cannot outlive the thing it describes. Image
+hover has no delay, because it is a hit test rather than an intent inference — the text hover's delay is
+unaffected. There is no image hover while the pointer is down, and none in password mode, where no image
+is drawn.
+
+For a query rather than a callback, `getInlineImageAt(x, y)` resolves local coordinates the way a click
+does and reports the image there, or null outside the text area and in password mode.
 
 ## Structure Providers
 
@@ -441,7 +598,6 @@ A match has to lie entirely inside the range; one that straddles either end is s
 fixed set of coordinates rather than a live view of the selection, so it does not follow later edits —
 a Replace All inside it shifts text, so re-establish it if you need it again. Regex anchors are not
 affected by the range: `^` still means the start of the line, not the start of the selection.
-- tab characters in `setText(...)` content are measured and rendered consistently
 
 ## Content Change Listener
 
@@ -1348,6 +1504,13 @@ Run the desktop demo from the repository:
 ./gradlew lwjgl3:run
 ```
 
+The sidebar switches between language samples. **Rich Text** is the one that exercises everything above:
+its highlighter parses inline markers into `CodeTextStyle` flags — `**bold**`, `@@italic@@`, `~~strike~~`,
+`==background==`, `__underline__`, `!!wavy!!`, `;;double;;`, `--dashed--` and `..dotted..` — and its image
+provider replaces a handful of symbol characters and three real emoji with tiles cut from `libgdx.png`.
+Every image column is clickable, and clicks, hover and hover-end land on the status line the way the other
+interaction callbacks do, so you can see what a listener receives without writing one.
+
 Windows:
 
 ```powershell
@@ -1399,6 +1562,7 @@ pressing **Rename** rewrites every occurrence as one undo step. Try it on `value
   cached array instead of allocating a `String` per line
 - the built-in highlighters now report strings and comments as bracket-ignore ranges, so rainbow
   brackets and bracket matching no longer count brackets inside literals
+- tab characters in `setText(...)` content are measured and rendered consistently
 
 ## License
 

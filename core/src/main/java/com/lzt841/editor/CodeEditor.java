@@ -10,6 +10,8 @@ import com.badlogic.gdx.graphics.g2d.Batch;
 import com.badlogic.gdx.graphics.g2d.BitmapFont;
 import com.badlogic.gdx.graphics.g2d.GlyphLayout;
 import com.badlogic.gdx.graphics.g2d.TextureRegion;
+import com.badlogic.gdx.math.MathUtils;
+import com.badlogic.gdx.math.Matrix4;
 import com.badlogic.gdx.math.Rectangle;
 import com.badlogic.gdx.math.Vector2;
 import com.badlogic.gdx.math.Vector3;
@@ -38,6 +40,7 @@ import com.lzt841.editor.highlight.CodeBracketIgnoreSpan;
 import com.lzt841.editor.highlight.CodeHighlightSpan;
 import com.lzt841.editor.highlight.CodeSemanticToken;
 import com.lzt841.editor.highlight.CodeSemanticTokenType;
+import com.lzt841.editor.highlight.CodeTextStyle;
 import com.lzt841.editor.highlight.IncrementalCodeHighlighter;
 import com.lzt841.editor.highlight.JavaCodeHighlighter;
 import com.lzt841.editor.input.CodeEditorInteractionContext;
@@ -327,6 +330,28 @@ public class CodeEditor extends Widget {
     /** Whether any mark has an icon, which is what reserves the gutter's icon column. */
     private boolean anyLineMarkHasIcon;
     private final Color scratchTintColor = new Color();
+    /** Sampled colour of the current gradient band; reused because a gradient run draws one per band. */
+    private final Color scratchGradientColor = new Color();
+    /**
+     * The three matrices a fake italic needs: the projection as it was, the same projection sheared, and
+     * the shear itself. All three are reused rather than allocated per italic run.
+     */
+    private final Matrix4 scratchOriginalProjection = new Matrix4();
+    private final Matrix4 scratchShearedProjection = new Matrix4();
+    private final Matrix4 scratchShearMatrix = new Matrix4();
+    /**
+     * A region over the style's white pixel, cached because the only draw overloads that rotate take a
+     * region rather than a texture, and a diagonal stroke of a wave is one per half period.
+     */
+    private TextureRegion cachedWhitePixelRegion;
+    private InlineImageProvider inlineImageProvider;
+    private InlineImageListener inlineImageListener;
+    /**
+     * The image the pointer currently rests on, or null. Kept as the whole hit rather than just the
+     * position so {@link InlineImageListener#onImageHoverEnd} reports exactly what
+     * {@link InlineImageListener#onImageHover} handed out.
+     */
+    private InlineImageHoverState hoveredImage;
     private CodeEditorPosition hoverPosition;
     private float hoverPointerX;
     private float hoverPointerY;
@@ -663,6 +688,62 @@ public class CodeEditor extends Widget {
         invalidateLayout();
     }
 
+    public InlineImageProvider getInlineImageProvider() {
+        return inlineImageProvider;
+    }
+
+    /**
+     * Sets the provider that replaces characters with inline images, or null to draw every column as a
+     * glyph.
+     *
+     * <p>Changes the measured width of any line that has images, which is why the whole layout is
+     * invalidated rather than the visible rows: wrapping, the row mapping, and the scrollbar all derive
+     * from measurements that are now wrong.
+     */
+    public void setInlineImageProvider(InlineImageProvider inlineImageProvider) {
+        this.inlineImageProvider = inlineImageProvider;
+        // The provider is what makes a hovered image exist, so take the hover away with it rather than
+        // leaving a listener with an image the next mouse move will belatedly retract.
+        cancelImageHover();
+        invalidateLayout();
+    }
+
+    public InlineImageListener getInlineImageListener() {
+        return inlineImageListener;
+    }
+
+    /**
+     * Sets the listener that receives clicks and hover on inline images, or null to let those fall
+     * through to the editor's normal text handling.
+     *
+     * <p>Replacing the listener fires {@link InlineImageListener#onImageHoverEnd} for an image already
+     * hovered, so the old listener does not keep a tooltip or highlight it can no longer clear.
+     */
+    public void setInlineImageListener(InlineImageListener inlineImageListener) {
+        cancelImageHover();
+        this.inlineImageListener = inlineImageListener;
+    }
+
+    /**
+     * The inline image under the pointer at these local coordinates, or null if there is none.
+     *
+     * <p>Resolves the position the way a click does — same row mapping, same continuation-indent
+     * adjustment — and asks the provider about it, so an image reported here is the one a click on the
+     * same spot would offer to {@link InlineImageListener#onImageClicked}. A click in the right half of
+     * an image column resolves to the trailing surrogate of the pair, which is corrected back to the
+     * image's own column.
+     *
+     * <p>Never asks the provider in password mode, where no image is ever drawn, and returns null outside
+     * the text area — the gutter, the scrollbar strip, and anywhere left of the text — rather than
+     * reporting the nearest image, which is what the position lookup would clamp such a point to.
+     */
+    public InlineImageHit getInlineImageAt(float x, float y) {
+        if (inlineImageProvider == null || passwordMode) {
+            return null;
+        }
+        return findInlineImageAt(x, y);
+    }
+
     public CodeEditorInteractionMode getInteractionMode() {
         return interactionMode;
     }
@@ -759,15 +840,23 @@ public class CodeEditor extends Widget {
      * position. Called from {@code mouseMoved}, so it must stay cheap.
      */
     private void updateHoverTarget(float localX, float localY) {
-        if (hoverListeners.size == 0) {
+        boolean textHoverWanted = hoverListeners.size > 0;
+        // An image hover is a hit test, not an inference about intent, so it runs whenever a listener
+        // asks for it — even with no text-hover listeners registered at all.
+        boolean imageHoverWanted = inlineImageListener != null && inlineImageProvider != null && !passwordMode;
+        if (!textHoverWanted && !imageHoverWanted) {
             return;
         }
         hoverPointerX = localX;
         hoverPointerY = localY;
+        updateImageHover(localX, localY, imageHoverWanted);
+        if (!textHoverWanted) {
+            return;
+        }
 
         CodeEditorPosition position = getPositionAtLocal(localX, localY, false);
         if (position == null) {
-            cancelHover();
+            cancelAllHover();
             return;
         }
         if (hoverPosition != null
@@ -793,6 +882,16 @@ public class CodeEditor extends Widget {
         hoverPosition = null;
     }
 
+    /**
+     * Both hover kinds, for the paths where the pointer left the widget or the content moved under it.
+     * Listener bookkeeping ({@link #removeHoverListener}) uses plain {@link #cancelHover()} instead, so
+     * dropping the last text-hover listener does not also retract an image hover the pointer still holds.
+     */
+    private void cancelAllHover() {
+        cancelHover();
+        cancelImageHover();
+    }
+
     /** Advances the hover timer and fires once the pointer has been still long enough. */
     private void updateHover(float delta) {
         if (!hoverPending || hoverListeners.size == 0 || hoverPosition == null) {
@@ -814,6 +913,103 @@ public class CodeEditor extends Widget {
         for (int i = 0; i < hoverListeners.size; i++) {
             hoverListeners.get(i).onHoverEnd(this);
         }
+    }
+
+    /**
+     * Tracks the image under the pointer and fires the image-hover callbacks as it changes.
+     *
+     * <p>Fires immediately on entering an image and immediately on leaving it — there is no delay to
+     * wait out, because unlike a text hover this is a hit test, not an inference that the user paused.
+     * Only a change of line or column re-fires, so resting on one image reports it exactly once, and the
+     * pointer coordinates are refreshed without re-firing while it stays put.
+     */
+    private void updateImageHover(float localX, float localY, boolean wanted) {
+        InlineImageHit hit = wanted ? findInlineImageAt(localX, localY) : null;
+        if (hit == null) {
+            cancelImageHover();
+            return;
+        }
+        if (hoveredImage != null && hoveredImage.samePosition(hit)) {
+            hoveredImage.pointerX = localX;
+            hoveredImage.pointerY = localY;
+            return;
+        }
+        cancelImageHover();
+        hoveredImage = new InlineImageHoverState(hit, localX, localY);
+        inlineImageListener.onImageHover(this, hit, localX, localY);
+    }
+
+    private void cancelImageHover() {
+        if (hoveredImage == null) {
+            return;
+        }
+        InlineImageHit ended = hoveredImage.hit;
+        hoveredImage = null;
+        if (inlineImageListener != null) {
+            inlineImageListener.onImageHoverEnd(this, ended);
+        }
+    }
+
+    /**
+     * The image at these local coordinates, or null. Shared by the public hit test, the click offer, and
+     * the hover tracker so all three agree on what "on the image" means.
+     *
+     * <p>Resolves the position without clamping to the nearest row, so a point outside the text area
+     * answers null instead of the closest image the pointer never touched.
+     */
+    private InlineImageHit findInlineImageAt(float x, float y) {
+        if (inlineImageProvider == null || passwordMode) {
+            return null;
+        }
+        // Rejected here rather than inside getCodePointAt, which maps a point left of the text onto
+        // column 0 and one past a scrollbar-strip click onto a mid-line column. Without this a pointer
+        // swept down the gutter would fire hover for an image on every row it passed.
+        if (x + scrollX - getTextStartX() < 0f || isInsideGutter(x) || isInVerticalScrollbarHitArea(x, y)) {
+            return null;
+        }
+        // The containment lookup, not the caret's nearest-boundary one: a click anywhere in an image
+        // column resolves to that image, and the character after an image is not absorbed into it.
+        CodePoint point = getCodePointAt(x, y, false, true);
+        if (point == null) {
+            return null;
+        }
+        LineLayout layout = layoutFor(point.line);
+        CharSequence text = layout.text;
+        int column = point.column;
+        if (column < 0 || column >= text.length()) {
+            return null;
+        }
+        InlineImage image = inlineImageProvider.imageAt(point.line, column, text);
+        if (image == null) {
+            // A supplementary pair's extent ends on its zero-width low surrogate, so the image is one
+            // column back. Any other column here means the click was on plain text, which is not an
+            // image however it is drawn.
+            if (isTrailingImageSurrogate(point.line, text, column)) {
+                column--;
+                image = inlineImageProvider.imageAt(point.line, column, text);
+            }
+            if (image == null) {
+                return null;
+            }
+        }
+        return new InlineImageHit(point.line, column, image);
+    }
+
+    /**
+     * Offers a click to the image under the pointer.
+     *
+     * <p>Called from {@code touchDown} before the caret is placed, and again from each single-click
+     * branch of {@code touchUp}, so a consumed click stops the caret from moving at press time and a
+     * release that is really the first half of a double-click can still be recognised. A double-click
+     * selects the word and a drag still drags. Returns true when the listener took it, which is those
+     * branches' cue to do nothing.
+     */
+    private boolean consumeImageClick(float x, float y) {
+        if (inlineImageListener == null || inlineImageProvider == null || passwordMode) {
+            return false;
+        }
+        InlineImageHit hit = findInlineImageAt(x, y);
+        return hit != null && inlineImageListener.onImageClicked(this, hit, x, y);
     }
 
     /**
@@ -1493,6 +1689,8 @@ public class CodeEditor extends Widget {
             return;
         }
         this.passwordMode = passwordMode;
+        // No image is drawn in this mode, so one the pointer is resting on stops existing.
+        cancelAllHover();
         invalidateLayout();
         invalidateHierarchy();
     }
@@ -4179,7 +4377,7 @@ public class CodeEditor extends Widget {
         // Continuation rows are narrower by the indent they are pushed right by. wrapLine applies the
         // identical subtraction from the identical helper; if these two ever drift the row count stops
         // matching the drawn segments.
-        float continuationIndent = continuationIndentWidth(text, wrapWidth);
+        float continuationIndent = continuationIndentWidth(line, text, wrapWidth);
         int rows = 0;
         int segmentStart = 0;
         float absoluteWidth = 0f;
@@ -4191,12 +4389,7 @@ public class CodeEditor extends Widget {
             int index = segmentStart;
             while (index < length) {
                 char current = text.charAt(index);
-                if (current == '\t') {
-                    absoluteWidth += getTabAdvanceAtWidth(absoluteWidth);
-                } else {
-                    char next = index + 1 < length ? text.charAt(index + 1) : 0;
-                    absoluteWidth += glyphAdvance(current, next);
-                }
+                absoluteWidth += advanceForColumn(line, text, index, absoluteWidth);
                 if (absoluteWidth - segmentStartWidth > available) {
                     break;
                 }
@@ -4224,7 +4417,7 @@ public class CodeEditor extends Widget {
             // The inner loop may have run past the break, so re-walk from this segment's start, whose
             // width is known, up to the next one. Each character is therefore visited at most twice
             // overall, keeping this linear in the line length rather than quadratic in the row count.
-            absoluteWidth = advanceWidth(text, segmentStart, nextStart, segmentStartWidth);
+            absoluteWidth = advanceWidth(line, text, segmentStart, nextStart, segmentStartWidth);
             segmentStartWidth = absoluteWidth;
             segmentStart = nextStart;
         }
@@ -4244,7 +4437,7 @@ public class CodeEditor extends Widget {
      * room per row and the row count explodes; the clamp is expressed against the same {@code int}
      * {@code wrapWidth} both callers hold, so it cannot round differently between them.
      */
-    private float continuationIndentWidth(CharSequence text, int wrapWidth) {
+    private float continuationIndentWidth(int line, CharSequence text, int wrapWidth) {
         if (!wrapContinuationIndentEnabled) {
             return 0f;
         }
@@ -4253,7 +4446,7 @@ public class CodeEditor extends Widget {
             indentEnd++;
         }
         // Measured from absolute zero, because a tab's advance depends on where it starts.
-        float width = advanceWidth(text, 0, indentEnd, 0f);
+        float width = advanceWidth(line, text, 0, indentEnd, 0f);
         if (wrapContinuationIndentColumns > 0) {
             // A plain multiple of the space advance, not a measured run: allocating a string here would
             // cost one allocation per line on a full re-measure, and spaces have no tab stops to thread.
@@ -4270,20 +4463,15 @@ public class CodeEditor extends Widget {
 
     /**
      * Advances {@code startWidth}, the width of {@code text[0, from)}, over {@code text[from, to)}.
-     * Tab stops depend on the absolute width, which is why this threads it through rather than summing
-     * the range on its own.
+     * Tab stops and inline-image columns depend on the absolute width and the line, which is why this
+     * threads both through rather than summing the range on its own — it delegates every column to
+     * {@link #advanceForColumn}, so a row counted here is the same width as the segment drawn for it.
      */
-    private float advanceWidth(CharSequence text, int from, int to, float startWidth) {
+    private float advanceWidth(int line, CharSequence text, int from, int to, float startWidth) {
         float width = startWidth;
         int stop = Math.min(to, text.length());
         for (int i = Math.max(0, from); i < stop; i++) {
-            char current = text.charAt(i);
-            if (current == '\t') {
-                width += getTabAdvanceAtWidth(width);
-            } else {
-                char next = i + 1 < text.length() ? text.charAt(i + 1) : 0;
-                width += glyphAdvance(current, next);
-            }
+            width += advanceForColumn(line, text, i, width);
         }
         return width;
     }
@@ -4434,14 +4622,14 @@ public class CodeEditor extends Widget {
         }
 
         String displayLine = getDisplayLineText(document.getLine(line));
-        LineLayout layout = new LineLayout(displayLine, safeIndentLevel(indentLevels, line), EMPTY_TOKENS);
+        LineLayout layout = new LineLayout(line, displayLine, safeIndentLevel(indentLevels, line), EMPTY_TOKENS);
         // Published before it is filled in, so an indirect re-entry for this same line sees a usable
         // (if momentarily empty) layout rather than recursing forever.
         lineLayouts.set(line, layout);
         materializedLineCount++;
 
         buildLineContent(line, displayLine, layout);
-        layout.ensurePrefixWidths(this);
+        layout.ensurePrefixWidths(this, layout.line);
         if (wrapEnabled) {
             // The mapping's width, not a fresh sample: see layoutWrapWidth.
             wrapLine(layout, layoutWrapWidth());
@@ -5328,7 +5516,7 @@ public class CodeEditor extends Widget {
             if (color == null) {
                 continue;
             }
-            target.add(new CodeHighlightSpan(start, end, color));
+            target.add(new CodeHighlightSpan(start, end, color, token.style));
         }
     }
 
@@ -5380,18 +5568,18 @@ public class CodeEditor extends Widget {
      * the lexer state at that line, which for a line far from the caret means scanning everything in
      * between. The horizontal extent only needs glyph advances, so this walks them directly and
      * allocates nothing.
+     *
+     * <p>The display text, not the document text: {@link #layoutFor} builds every layout from
+     * {@link #getDisplayLineText(String)}, so the widths this compares against were measured on the
+     * masked string. Measuring the raw one here would take the '*' characters for whatever the real line
+     * has — a tab, a wide glyph, an image column — and the extent would stop matching the scroll range
+     * the drawn rows imply as soon as password mode changed a width.
      */
     private float measureLineWidth(int line) {
-        CharSequence text = document.getLineSequence(line);
+        CharSequence text = getDisplayLineText(document.getLine(line));
         float width = 0f;
         for (int i = 0; i < text.length(); i++) {
-            char current = text.charAt(i);
-            if (current == '\t') {
-                width += getTabAdvanceAtWidth(width);
-            } else {
-                char next = i + 1 < text.length() ? text.charAt(i + 1) : 0;
-                width += glyphAdvance(current, next);
-            }
+            width += advanceForColumn(line, text, i, width);
         }
         return width;
     }
@@ -5417,7 +5605,7 @@ public class CodeEditor extends Widget {
     private void wrapLine(LineLayout layout, int wrapWidth) {
         layout.segmentStarts.clear();
         layout.segmentEnds.clear();
-        layout.ensurePrefixWidths(this);
+        layout.ensurePrefixWidths(this, layout.line);
 
         String text = layout.text;
         if (text.isEmpty()) {
@@ -5428,7 +5616,7 @@ public class CodeEditor extends Widget {
 
         // Same value countWrapRows subtracts, from the same helper, so the two agree on the row count.
         // Cached on the layout because the draw and hit-test paths need the same number as an x offset.
-        layout.continuationIndent = continuationIndentWidth(text, wrapWidth);
+        layout.continuationIndent = continuationIndentWidth(layout.line, text, wrapWidth);
         int segmentStart = 0;
         int rows = 0;
         while (segmentStart < text.length()) {
@@ -5480,6 +5668,13 @@ public class CodeEditor extends Widget {
      * is not a claim that bracket colouring matters more, it is that the two do not compete — semantic
      * tokens cover identifiers and literals, brackets are punctuation — so on the rare overlap the
      * narrower, single-character span is the one the user asked for explicitly.
+     *
+     * <p><b>Styles compose, colours do not.</b> Text colour still picks one winner by priority, because
+     * two colours cannot occupy one glyph. Decorations can: a strike-through and an underline and a
+     * background are independent layers, so their flags OR across every span covering a segment. Each
+     * optional style colour still picks its own winner, so a high-priority underline cannot evict a
+     * low-priority span's background. The result is that a segment carries either null or a single
+     * {@link CodeTextStyle} built from whichever spans touch it.
      */
     private Array<HighlightToken> buildHighlightTokens(
         String text,
@@ -5530,13 +5725,66 @@ public class CodeEditor extends Widget {
 
             Color selectedColor = null;
             int selectedPriority = Integer.MIN_VALUE;
+            int composedFlags = 0;
+            Color underlineColor = null;
+            int underlinePriority = Integer.MIN_VALUE;
+            Color backgroundColor = null;
+            int backgroundPriority = Integer.MIN_VALUE;
+            Color gradientEndColor = null;
+            int gradientPriority = Integer.MIN_VALUE;
+            Color strikethroughColor = null;
+            int strikethroughPriority = Integer.MIN_VALUE;
+            Color wavyUnderlineColor = null;
+            int wavyUnderlinePriority = Integer.MIN_VALUE;
+            Color dashedUnderlineColor = null;
+            int dashedUnderlinePriority = Integer.MIN_VALUE;
+            Color dottedUnderlineColor = null;
+            int dottedUnderlinePriority = Integer.MIN_VALUE;
             for (int s = 0; s < spans.size; s++) {
                 ColorSpan span = spans.get(s);
                 // Spans are appended in ascending start order per source, but the two sources
                 // interleave, so this cannot break early on start alone.
-                if (start >= span.start && start < span.end && span.priority >= selectedPriority) {
+                if (!(start >= span.start && start < span.end)) {
+                    continue;
+                }
+                if (span.priority >= selectedPriority) {
                     selectedColor = span.color;
                     selectedPriority = span.priority;
+                }
+                CodeTextStyle spanStyle = span.style;
+                if (spanStyle == null) {
+                    continue;
+                }
+                // OR is all a decoration flag needs; each optional colour keeps its own priority race
+                // so independent layers stay independent.
+                composedFlags |= spanStyle.flags;
+                if (spanStyle.underlineColor != null && span.priority >= underlinePriority) {
+                    underlineColor = spanStyle.underlineColor;
+                    underlinePriority = span.priority;
+                }
+                if (spanStyle.backgroundColor != null && span.priority >= backgroundPriority) {
+                    backgroundColor = spanStyle.backgroundColor;
+                    backgroundPriority = span.priority;
+                }
+                if (spanStyle.gradientEndColor != null && span.priority >= gradientPriority) {
+                    gradientEndColor = spanStyle.gradientEndColor;
+                    gradientPriority = span.priority;
+                }
+                if (spanStyle.strikethroughColor != null && span.priority >= strikethroughPriority) {
+                    strikethroughColor = spanStyle.strikethroughColor;
+                    strikethroughPriority = span.priority;
+                }
+                if (spanStyle.wavyUnderlineColor != null && span.priority >= wavyUnderlinePriority) {
+                    wavyUnderlineColor = spanStyle.wavyUnderlineColor;
+                    wavyUnderlinePriority = span.priority;
+                }
+                if (spanStyle.dashedUnderlineColor != null && span.priority >= dashedUnderlinePriority) {
+                    dashedUnderlineColor = spanStyle.dashedUnderlineColor;
+                    dashedUnderlinePriority = span.priority;
+                }
+                if (spanStyle.dottedUnderlineColor != null && span.priority >= dottedUnderlinePriority) {
+                    dottedUnderlineColor = spanStyle.dottedUnderlineColor;
+                    dottedUnderlinePriority = span.priority;
                 }
             }
 
@@ -5544,14 +5792,41 @@ public class CodeEditor extends Widget {
                 continue;
             }
 
+            CodeTextStyle composedStyle = composedFlags == 0
+                ? null
+                : new CodeTextStyle(
+                    composedFlags, underlineColor, backgroundColor, gradientEndColor,
+                    strikethroughColor, wavyUnderlineColor, dashedUnderlineColor, dottedUnderlineColor
+                );
+
             HighlightToken previous = tokens.size == 0 ? null : tokens.peek();
-            if (previous != null && previous.end == start && sameColor(previous.color, selectedColor)) {
-                tokens.set(tokens.size - 1, new HighlightToken(previous.start, end, previous.color));
+            if (previous != null && previous.end == start
+                && sameColor(previous.color, selectedColor)
+                && sameStyle(previous.style, composedStyle)) {
+                tokens.set(tokens.size - 1, new HighlightToken(previous.start, end, previous.color, previous.style));
             } else {
-                tokens.add(new HighlightToken(start, end, selectedColor));
+                tokens.add(new HighlightToken(start, end, selectedColor, composedStyle));
             }
         }
         return tokens;
+    }
+
+    /** Value equality for styles, so adjacent styled segments merge into one draw call. */
+    private static boolean sameStyle(CodeTextStyle first, CodeTextStyle second) {
+        if (first == second) {
+            return true;
+        }
+        if (first == null || second == null) {
+            return false;
+        }
+        return first.flags == second.flags
+            && sameColor(first.underlineColor, second.underlineColor)
+            && sameColor(first.backgroundColor, second.backgroundColor)
+            && sameColor(first.gradientEndColor, second.gradientEndColor)
+            && sameColor(first.strikethroughColor, second.strikethroughColor)
+            && sameColor(first.wavyUnderlineColor, second.wavyUnderlineColor)
+            && sameColor(first.dashedUnderlineColor, second.dashedUnderlineColor)
+            && sameColor(first.dottedUnderlineColor, second.dottedUnderlineColor);
     }
 
     private void collectColorSpans(Array<ColorSpan> target, Array<CodeHighlightSpan> source, int lineLength, int priority) {
@@ -5565,7 +5840,7 @@ public class CodeEditor extends Widget {
             int safeStart = Math.max(0, Math.min(span.start, lineLength));
             int safeEnd = Math.max(safeStart, Math.min(span.end, lineLength));
             if (safeStart < safeEnd) {
-                target.add(new ColorSpan(safeStart, safeEnd, span.color, priority));
+                target.add(new ColorSpan(safeStart, safeEnd, span.color, priority, span.style));
             }
         }
     }
@@ -6442,10 +6717,22 @@ public class CodeEditor extends Widget {
         }
 
         if (!isWordChar(line.charAt(pivot))) {
-            document.moveCursorTo(point.line, pivot);
-            clearSelection();
-            refreshBlink();
-            return;
+            // A double-click on an inline image still selects the word around it. Any other non-word
+            // character keeps its existing behaviour of parking the caret, but an image replaced the
+            // glyph the user clicked through, so the word beside it is what the double-click was about.
+            if (imageColumnAt(point.line, line, pivot) < 0) {
+                document.moveCursorTo(point.line, pivot);
+                clearSelection();
+                refreshBlink();
+                return;
+            }
+            pivot = nearestWordChar(line, pivot);
+            if (pivot < 0) {
+                document.moveCursorTo(point.line, point.column);
+                clearSelection();
+                refreshBlink();
+                return;
+            }
         }
 
         int start = pivot;
@@ -7049,7 +7336,7 @@ public class CodeEditor extends Widget {
             drawSelection(batch, selection, layout, line, start, end, rowBottom, rowX);
             drawBracketHighlight(batch, bracketMatch, layout, line, segment, start, end, rowBottom, rowX);
 
-            drawStyledRange(batch, layout, start, end, rowX, baseline);
+            drawStyledRange(batch, layout, start, end, rowX, baseline, rowBottom);
             drawDiagnosticsForRow(batch, layout, line, start, end, rowBottom, rowX);
 
             FoldRegion region = foldRegionsByStart.get(line);
@@ -7076,7 +7363,7 @@ public class CodeEditor extends Widget {
                 if (collapsedDisplay.hasSuffix()) {
                     float suffixX = badgeX + measureText(collapsedText);
                     drawCollapsedFoldSuffixDecorations(batch, selection, bracketMatch, collapsedDisplay, suffixX, rowBottom);
-                    drawCollapsedFoldSuffix(batch, collapsedDisplay, suffixX, baseline);
+                    drawCollapsedFoldSuffix(batch, collapsedDisplay, suffixX, baseline, rowBottom);
                 }
             }
         }
@@ -7132,31 +7419,18 @@ public class CodeEditor extends Widget {
     /**
      * Draws a zig-zag underline from a run of small quads. Uses the style's white pixel, the same
      * texture the theme builder already creates for the other decorations.
+     *
+     * <p>Delegates to {@link #drawWavyLine}, which is the same algorithm parameterised by the style's
+     * decoration knobs — a diagnostic squiggle and a wavy underline are one shape drawn at two sizes.
      */
     private void drawSquiggle(Batch batch, float x, float y, float width, Color color) {
-        if (width <= 0f || color == null) {
-            return;
-        }
-        float step = Math.max(1f, style.diagnosticSquiggleStep);
-        float amplitude = Math.max(1f, style.diagnosticSquiggleAmplitude);
-        float thickness = Math.max(1f, style.diagnosticSquiggleThickness);
-        Color previous = batch.getColor();
-        float previousR = previous.r;
-        float previousG = previous.g;
-        float previousB = previous.b;
-        float previousA = previous.a;
-        batch.setColor(color);
-        int segments = (int) Math.ceil(width / step);
-        for (int i = 0; i < segments; i++) {
-            float segmentX = x + i * step;
-            float segmentWidth = Math.min(step, x + width - segmentX);
-            if (segmentWidth <= 0f) {
-                break;
-            }
-            float segmentY = (i & 1) == 0 ? y : y + amplitude;
-            batch.draw(style.whitePixelTexture, segmentX, segmentY, segmentWidth, thickness);
-        }
-        batch.setColor(previousR, previousG, previousB, previousA);
+        drawWavyLine(
+            batch, x, y, width,
+            style.diagnosticSquiggleStep,
+            style.diagnosticSquiggleAmplitude,
+            style.diagnosticSquiggleThickness,
+            color
+        );
     }
 
     private void drawCollapsedFoldPlaceholderSelection(
@@ -7364,7 +7638,13 @@ public class CodeEditor extends Widget {
         return measureText(collapsedText) + style.foldBadgeHorizontalPadding;
     }
 
-    private void drawCollapsedFoldSuffix(Batch batch, CollapsedFoldDisplay display, float x, float baseline) {
+    private void drawCollapsedFoldSuffix(
+        Batch batch,
+        CollapsedFoldDisplay display,
+        float x,
+        float baseline,
+        float rowBottom
+    ) {
         if (display == null || !display.hasSuffix()) {
             return;
         }
@@ -7380,7 +7660,8 @@ public class CodeEditor extends Widget {
             display.suffixStart,
             display.suffixEnd,
             x,
-            baseline
+            baseline,
+            rowBottom
         );
     }
 
@@ -7443,7 +7724,15 @@ public class CodeEditor extends Widget {
         return scratchTintColor;
     }
 
-    private void drawStyledRange(Batch batch, LineLayout layout, int start, int end, float x, float baseline) {
+    private void drawStyledRange(
+        Batch batch,
+        LineLayout layout,
+        int start,
+        int end,
+        float x,
+        float baseline,
+        float rowBottom
+    ) {
         Color baseColor = disabled ? style.disabledFontColor : style.fontColor;
         int cursor = start;
         for (HighlightToken token : layout.tokens) {
@@ -7453,45 +7742,521 @@ public class CodeEditor extends Widget {
 
             if (cursor < token.start) {
                 int plainEnd = Math.min(token.start, end);
-                drawText(batch, layout, cursor, plainEnd, x, baseline, baseColor);
+                drawText(batch, layout, cursor, plainEnd, x, baseline, rowBottom, baseColor, null);
                 x += layout.measureRange(cursor, plainEnd);
             }
 
             int tokenStart = Math.max(token.start, start);
             int tokenEnd = Math.min(token.end, end);
-            drawText(batch, layout, tokenStart, tokenEnd, x, baseline, disabled ? baseColor : token.color);
+            drawText(
+                batch,
+                layout,
+                tokenStart,
+                tokenEnd,
+                x,
+                baseline,
+                rowBottom,
+                disabled ? baseColor : token.color,
+                disabled ? null : token.style
+            );
             x += layout.measureRange(tokenStart, tokenEnd);
             cursor = tokenEnd;
         }
 
         if (cursor < end) {
-            drawText(batch, layout, cursor, end, x, baseline, baseColor);
+            drawText(batch, layout, cursor, end, x, baseline, rowBottom, baseColor, null);
         }
     }
 
-    private void drawText(Batch batch, LineLayout layout, int start, int end, float x, float y, Color color) {
-        String text = layout.text;
+    private void drawText(
+        Batch batch,
+        LineLayout layout,
+        int start,
+        int end,
+        float x,
+        float y,
+        float rowBottom,
+        Color color,
+        CodeTextStyle textStyle
+    ) {
         if (start >= end) {
             return;
         }
-        style.font.setColor(color);
-        int runStart = start;
-        float runX = x;
-        for (int i = start; i < end; i++) {
-            if (text.charAt(i) != '\t') {
-                continue;
+        layout.ensurePrefixWidths(this, layout.line);
+        // PLAIN carries no flags, so passing it through the same loop costs one comparison per run and
+        // keeps the styled path the only path — no second implementation of the tab split to drift from.
+        CodeTextStyle runStyle = textStyle != null ? textStyle : CodeTextStyle.PLAIN;
+        boolean drawingImages = inlineImageProvider != null && !passwordMode;
+        if (runStyle.flags == CodeTextStyle.NONE && !drawingImages) {
+            style.font.setColor(color);
+            String text = layout.text;
+            int runStart = start;
+            float runX = x;
+            for (int i = start; i < end; i++) {
+                if (text.charAt(i) != '\t') {
+                    continue;
+                }
+                if (runStart < i) {
+                    style.font.draw(batch, text, runX, y, runStart, i, 0f, Align.left, false);
+                    runX += layout.measureRange(runStart, i);
+                }
+                runX += layout.measureRange(i, i + 1);
+                runStart = i + 1;
             }
-            if (runStart < i) {
-                style.font.draw(batch, text, runX, y, runStart, i, 0f, Align.left, false);
-                runX += layout.measureRange(runStart, i);
+            if (runStart < end) {
+                style.font.draw(batch, text, runX, y, runStart, end, 0f, Align.left, false);
             }
-            runX += layout.measureRange(i, i + 1);
-            runStart = i + 1;
+            return;
         }
-        if (runStart < end) {
-            style.font.draw(batch, text, runX, y, runStart, end, 0f, Align.left, false);
+
+        // Background and decorations span the whole token, including its tab and image columns, so they
+        // are drawn here rather than per stretch; a gradient title with an emoji in it gets one
+        // unbroken underline instead of one either side of the image.
+        float rangeWidth = layout.measureRange(start, end);
+        if (runStyle.hasFlags(CodeTextStyle.BACKGROUND) && runStyle.backgroundColor != null) {
+            float inset = style.decorationBackgroundInset;
+            fillQuad(batch, x, rowBottom + inset, rangeWidth, lineHeight - inset * 2f, runStyle.backgroundColor);
+        }
+
+        boolean italic = runStyle.hasFlags(CodeTextStyle.ITALIC) && style.fakeItalicShear != 0f;
+        if (italic) {
+            batch.flush();
+            // The projection is saved and restored around the shear, and the shear is applied to a copy,
+            // so a run that throws or returns early cannot leave the editor drawing sideways.
+            scratchOriginalProjection.set(batch.getProjectionMatrix());
+            scratchShearMatrix.idt();
+            // x' = x + shear * (y - baseline): the shift is zero on the baseline, so the caret column and
+            // the text below it stay put, and only the tops of the glyphs lean right.
+            scratchShearMatrix.val[Matrix4.M01] = style.fakeItalicShear;
+            scratchShearMatrix.val[Matrix4.M03] = -style.fakeItalicShear * y;
+            scratchShearedProjection.set(scratchOriginalProjection);
+            scratchShearedProjection.mul(scratchShearMatrix);
+            batch.setProjectionMatrix(scratchShearedProjection);
+        }
+        String text = layout.text;
+        try {
+            int runStart = start;
+            float runX = x;
+            for (int i = start; i < end; i++) {
+                char current = text.charAt(i);
+                if (current == '\t') {
+                    if (runStart < i) {
+                        drawTextGlyphs(batch, layout, runStart, i, runX, y, color, runStyle);
+                        runX += layout.measureRange(runStart, i);
+                    }
+                    runX += layout.measureRange(i, i + 1);
+                    runStart = i + 1;
+                    continue;
+                }
+                InlineImage image = drawingImages ? inlineImageProvider.imageAt(layout.line, i, text) : null;
+                if (image == null && drawingImages && isTrailingImageSurrogate(layout.line, text, i)) {
+                    if (runStart < i) {
+                        drawTextGlyphs(batch, layout, runStart, i, runX, y, color, runStyle);
+                        runX += layout.measureRange(runStart, i);
+                    }
+                    // The pair's image was drawn one column back and this column has no advance, so there is
+                    // nothing to draw here but the missing-glyph box a BitmapFont would produce for a lone
+                    // low surrogate — which would sit on top of the icon. Close the run and skip it.
+                    runX += layout.measureRange(i, i + 1);
+                    runStart = i + 1;
+                    continue;
+                }
+                if (image != null) {
+                    if (runStart < i) {
+                        drawTextGlyphs(batch, layout, runStart, i, runX, y, color, runStyle);
+                        runX += layout.measureRange(runStart, i);
+                    }
+                    if (italic) {
+                        // The shear is a projection change, not a per-call parameter, so an image drawn
+                        // while it is active is slanted along with the text: the shear shifts x by
+                        // shear*(y-baseline) and an image spans a range of y. Draw it under the un-sheared
+                        // projection and put the shear back afterwards, so an icon inside an italic run
+                        // stands upright while the glyphs around it lean. Both flushes are load-bearing:
+                        // the batch must submit what it has before the matrix it was queued under changes.
+                        batch.flush();
+                        batch.setProjectionMatrix(scratchOriginalProjection);
+                    }
+                    drawInlineImage(batch, image, runX, y, rowBottom);
+                    if (italic) {
+                        batch.flush();
+                        batch.setProjectionMatrix(scratchShearedProjection);
+                    }
+                    runX += layout.measureRange(i, i + 1);
+                    runStart = i + 1;
+                }
+            }
+            if (runStart < end) {
+                drawTextGlyphs(batch, layout, runStart, end, runX, y, color, runStyle);
+            }
+        } finally {
+            if (italic) {
+                batch.flush();
+                batch.setProjectionMatrix(scratchOriginalProjection);
+            }
+        }
+
+        if (runStyle.hasAnyFlag(
+            CodeTextStyle.UNDERLINE | CodeTextStyle.UNDERLINE_DOUBLE | CodeTextStyle.UNDERLINE_DASHED
+                | CodeTextStyle.UNDERLINE_DOTTED
+                | CodeTextStyle.UNDERLINE_WAVY | CodeTextStyle.STRIKETHROUGH
+        )) {
+            drawRunDecorations(batch, x, rangeWidth, rowBottom, color, runStyle);
         }
     }
+
+    /**
+     * Draws the glyphs of one tab-free, image-free stretch: plain or gradient text, then the fake-bold
+     * second pass. The italic shear is applied by the caller, so an image drawn between two stretches is
+     * never sheared with the text around it.
+     */
+    private void drawTextGlyphs(
+        Batch batch,
+        LineLayout layout,
+        int runStart,
+        int runEnd,
+        float runX,
+        float baseline,
+        Color color,
+        CodeTextStyle runStyle
+    ) {
+        if (runStyle.hasFlags(CodeTextStyle.GRADIENT) && runStyle.gradientEndColor != null) {
+            drawGradientTextRun(batch, layout, runStart, runEnd, runX, baseline, color, runStyle);
+            if (runStyle.hasFlags(CodeTextStyle.BOLD) && style.fakeBoldOffset != 0f) {
+                // The second pass must repeat the gradient rather than draw the run in one flat colour:
+                // a solid overlay a couple of pixels off covers the bands at every glyph's left edge, which
+                // leaves a gradient heading looking neither bold nor gradient.
+                drawGradientTextRun(
+                    batch, layout, runStart, runEnd, runX + style.fakeBoldOffset, baseline, color, runStyle
+                );
+            }
+        } else {
+            style.font.setColor(color);
+            style.font.draw(batch, layout.text, runX, baseline, runStart, runEnd, 0f, Align.left, false);
+            if (runStyle.hasFlags(CodeTextStyle.BOLD) && style.fakeBoldOffset != 0f) {
+                // A second pass one pixel right is all a single-weight bitmap font can do for bold. It is
+                // visibly not a bold cut at large sizes, which is why the knob exists.
+                style.font.setColor(color);
+                style.font.draw(
+                    batch, layout.text, runX + style.fakeBoldOffset, baseline,
+                    runStart, runEnd, 0f, Align.left, false
+                );
+            }
+        }
+    }
+
+    /**
+     * Draws one inline image at its column. The x is where the prefix widths put the column, and the
+     * width is the same number, so an image is always centred on the space the editor measured for it.
+     *
+     * <p>Vertically the image is centred on the band the font's own ink occupies — from the cap height down
+     * to the descent line — which is what makes it line up with the letters beside it. The y the text
+     * path passes in is not the baseline: a {@link BitmapFont} positions a draw call at the top of its
+     * capital letters, so the baseline is {@code y - capHeight}, and the descent line is
+     * {@code baseline + getDescent()}. The row's padding is deliberately not part of the anchor: an image
+     * hung from the baseline instead sits high, because the descent of a CJK font like the demo's
+     * Microsoft YaHei is small while its accent room is large, and a near-full-height image then tops out
+     * above the capitals with its centre well above the text's.
+     *
+     * <p>An image taller than the row is scaled to fit with its aspect ratio held, and the centred position
+     * is clamped to the row, so no image can paint the row above or below.
+     */
+    private void drawInlineImage(Batch batch, InlineImage image, float x, float capTop, float rowBottom) {
+        if (image == null || image.region == null) {
+            return;
+        }
+        Color previous = batch.getColor();
+        // Text drawing leaves the batch colour alone, but a decoration just before this may have set one;
+        // an image has its own colours and must not inherit the last underline's.
+        batch.setColor(Color.WHITE);
+        // The font's scale is set for the whole draw call, so its metrics are already in editor pixels.
+        float capHeight = style.font.getCapHeight();
+        float fontBaseline = capTop - capHeight;
+        // getDescent() is negative below the baseline; a font that reports a positive one would make the
+        // band wider than the ink, so it is clamped rather than trusted.
+        float descent = Math.min(0f, style.font.getDescent());
+        float inkCentre = fontBaseline + (capHeight + descent) / 2f;
+        float drawWidth = image.width;
+        float drawHeight = image.height;
+        float rowTop = rowBottom + lineHeight;
+        if (drawHeight > lineHeight && drawHeight > 0f) {
+            float scale = lineHeight / drawHeight;
+            drawHeight = lineHeight;
+            drawWidth = image.width * scale;
+        }
+        float drawY = inkCentre - drawHeight / 2f - image.baselineOffset;
+        if (drawY < rowBottom) {
+            drawY = rowBottom;
+        } else if (drawY + drawHeight > rowTop) {
+            drawY = rowTop - drawHeight;
+        }
+        batch.draw(image.region, x, drawY, drawWidth, drawHeight);
+        batch.setColor(previous);
+    }
+
+    /**
+     * Draws a run as solid-colour bands interpolated between the token's colour and its gradient end.
+     *
+     * <p>libGDX's {@link BitmapFont} has no per-glyph colour hook — {@link com.badlogic.gdx.graphics.g2d.Glyph}
+     * carries geometry and texture coordinates only — so the gradient is a series of sub-range draws,
+     * each with the font set to one colour. Band columns are found by walking the prefix widths forward,
+     * which is linear across the whole run rather than a binary search per band.
+     *
+     * <p><b>Known limitation: the ramp restarts at a tab or image column.</b> {@link #drawText} splits a
+     * token at those columns and calls this per stretch, and each stretch derives its own band count and
+     * samples colour from its own left edge, so a gradient heading with an emoji in it runs back toward
+     * the start colour on the far side of the icon. A continuous ramp needs the token's total width and
+     * this stretch's offset in it — two values the split loop has, but does not yet hand down. The
+     * decorations are drawn across the whole token, so only the colour ramp is affected.
+     */
+    private void drawGradientTextRun(
+        Batch batch,
+        LineLayout layout,
+        int runStart,
+        int runEnd,
+        float runX,
+        float baseline,
+        Color startColor,
+        CodeTextStyle runStyle
+    ) {
+        float[] widths = layout.prefixWidths;
+        String text = layout.text;
+        float runStartWidth = widths[runStart];
+        float runWidth = widths[runEnd] - runStartWidth;
+        if (runWidth <= 0f) {
+            return;
+        }
+        int bandCount = Math.max(1, (int) Math.ceil(runWidth / Math.max(1f, style.gradientBandWidth)));
+        Color endColor = runStyle.gradientEndColor;
+        int bandStart = runStart;
+        int column = runStart;
+        for (int band = 0; band < bandCount; band++) {
+            float targetWidth = runWidth * (band + 1) / bandCount;
+            while (column < runEnd && widths[column + 1] - runStartWidth < targetWidth) {
+                column++;
+            }
+            if (band == bandCount - 1) {
+                // The width walk stops one column short of the end because the last prefix width equals
+                // the target rather than exceeding it; clamping here is what makes the bands tile the run.
+                column = runEnd;
+            } else if (column < runEnd && Character.isLowSurrogate(text.charAt(column))) {
+                // A boundary between the two chars of a surrogate pair would split one glyph across two
+                // colours. Backing it up leaves the pair whole in the next band; a pair that starts at
+                // bandStart is then absorbed there, which is the same absorption as an over-wide glyph.
+                column = Math.max(bandStart, column - 1);
+            }
+            if (column <= bandStart) {
+                // A glyph wider than a band absorbs several bands; nothing to draw for the empty ones.
+                continue;
+            }
+            // Sample at the band's middle so each drawn segment is the colour its centre should have.
+            float sample = (band + 0.5f) / bandCount;
+            style.font.setColor(scratchGradientColor.set(startColor).lerp(endColor, sample));
+            // Each band starts where the previous one ended in x, not at the run's left edge — the
+            // prefix widths are the only source of truth for where a column is, so a band that skipped
+            // an over-wide glyph must skip its width too, and the draw call has no other way to know.
+            float bandX = runX + widths[bandStart] - runStartWidth;
+            style.font.draw(batch, text, bandX, baseline, bandStart, column, 0f, Align.left, false);
+            bandStart = column;
+        }
+    }
+
+    /**
+     * The lines a style draws over its run: plain, double, wavy, dashed and dotted underlines, and a
+     * strike-through.
+     *
+     * <p>Each decoration picks its own colour when the style names one, then falls back to
+     * {@link CodeTextStyle#underlineColor} — the shared slot a producer sets when every line it draws
+     * should be one colour — and only then to the run's text colour, so a span that only sets a
+     * background or a gradient can still underline in a colour that belongs to it.
+     */
+    private void drawRunDecorations(
+        Batch batch,
+        float x,
+        float width,
+        float rowBottom,
+        Color textColor,
+        CodeTextStyle runStyle
+    ) {
+        Color shared = runStyle.underlineColor != null ? runStyle.underlineColor : textColor;
+        Color strikethroughColor = runStyle.strikethroughColor != null
+            ? runStyle.strikethroughColor
+            : shared;
+        if (runStyle.hasFlags(CodeTextStyle.STRIKETHROUGH) && style.strikethroughThickness > 0f) {
+            fillQuad(
+                batch, x, rowBottom + lineHeight * 0.5f + style.strikethroughOffset,
+                width, style.strikethroughThickness, strikethroughColor
+            );
+        }
+        if (runStyle.hasFlags(CodeTextStyle.UNDERLINE)
+            && style.underlineThickness > 0f
+            // A fancier underline draws its own line at this exact y, so the flag pair is a redundant
+            // overdraw rather than two lines in the same place. Each of the other kinds subsumes plain —
+            // wavy included, whose theme-derived offset and thickness are the plain one's values.
+            && !runStyle.hasAnyFlag(
+                CodeTextStyle.UNDERLINE_DOUBLE
+                    | CodeTextStyle.UNDERLINE_WAVY
+                    | CodeTextStyle.UNDERLINE_DASHED
+                    | CodeTextStyle.UNDERLINE_DOTTED)) {
+            fillQuad(batch, x, rowBottom + style.underlineOffset, width, style.underlineThickness, shared);
+        }
+        if (runStyle.hasFlags(CodeTextStyle.UNDERLINE_DOUBLE)) {
+            float thickness = style.doubleUnderlineThickness > 0f
+                ? style.doubleUnderlineThickness
+                : style.underlineThickness;
+            if (thickness > 0f) {
+                fillQuad(batch, x, rowBottom + style.underlineOffset, width, thickness, shared);
+                fillQuad(
+                    batch, x, rowBottom + style.underlineOffset - style.doubleUnderlineGap,
+                    width, thickness, shared
+                );
+            }
+        }
+        if (runStyle.hasFlags(CodeTextStyle.UNDERLINE_DASHED) && style.dashedUnderlineThickness > 0f) {
+            Color dashedColor = runStyle.dashedUnderlineColor != null
+                ? runStyle.dashedUnderlineColor
+                : shared;
+            drawDashedLine(
+                batch, x, rowBottom + style.dashedUnderlineOffset, width,
+                style.dashedUnderlineDashLength, style.dashedUnderlineGap,
+                style.dashedUnderlineThickness, dashedColor
+            );
+        }
+        if (runStyle.hasFlags(CodeTextStyle.UNDERLINE_DOTTED) && style.dottedUnderlineThickness > 0f) {
+            // A dot is a dash whose length and gap are the same size, which is why the two decorations
+            // share one helper: the only difference between them is what the producer called the knob.
+            Color dottedColor = runStyle.dottedUnderlineColor != null
+                ? runStyle.dottedUnderlineColor
+                : shared;
+            drawDashedLine(
+                batch, x, rowBottom + style.dottedUnderlineOffset, width,
+                style.dottedUnderlineDotSize, style.dottedUnderlineGap,
+                style.dottedUnderlineThickness, dottedColor
+            );
+        }
+        if (runStyle.hasFlags(CodeTextStyle.UNDERLINE_WAVY) && style.wavyUnderlineThickness > 0f) {
+            Color wavyColor = runStyle.wavyUnderlineColor != null
+                ? runStyle.wavyUnderlineColor
+                : shared;
+            drawWavyLine(
+                batch, x, rowBottom + style.wavyUnderlineOffset, width,
+                style.wavyUnderlineStep, style.wavyUnderlineAmplitude, style.wavyUnderlineThickness, wavyColor
+            );
+        }
+    }
+
+    private void fillQuad(Batch batch, float x, float y, float width, float height, Color color) {
+        if (width <= 0f || height <= 0f || color == null || style.whitePixelTexture == null) {
+            return;
+        }
+        Color previous = batch.getColor();
+        batch.setColor(color);
+        batch.draw(style.whitePixelTexture, x, y, width, height);
+        batch.setColor(previous);
+    }
+
+    /**
+     * The style's white pixel as a region, so a stroke can be drawn rotated. Recreated only when the style
+     * hands over a different texture, which happens once per theme rather than per frame.
+     */
+    private TextureRegion whitePixelRegion() {
+        if (cachedWhitePixelRegion == null || cachedWhitePixelRegion.getTexture() != style.whitePixelTexture) {
+            cachedWhitePixelRegion = style.whitePixelTexture == null
+                ? null
+                : new TextureRegion(style.whitePixelTexture);
+        }
+        return cachedWhitePixelRegion;
+    }
+
+    private void drawWavyLine(
+        Batch batch,
+        float x,
+        float y,
+        float width,
+        float step,
+        float amplitude,
+        float thickness,
+        Color color
+    ) {
+        TextureRegion whitePixel = whitePixelRegion();
+        if (width <= 0f || color == null || whitePixel == null) {
+            return;
+        }
+        float period = Math.max(4f, step);
+        float safeAmplitude = Math.max(0f, amplitude);
+        float safeThickness = Math.max(1f, thickness);
+        Color previous = batch.getColor();
+        batch.setColor(color);
+        // The wave is a cosine sampled often enough that a chord is under two pixels. The peaks of a
+        // two-chord zig-zag are what makes a wavy underline read as jagged — the eye sees the corner
+        // where the zig meets the zag — and short chords round the peaks off without the wave having
+        // corners of its own. A flat wave (amplitude 0) still draws as one straight line.
+        int chordsPerPeriod = Math.max(6, Math.round(period / 2f));
+        float chord = period / chordsPerPeriod;
+        float previousX = x;
+        float previousY = y;
+        int chords = (int) Math.ceil(width / chord);
+        for (int i = 1; i <= chords; i++) {
+            float sampleX = Math.min(x + width, x + i * chord);
+            float t = (sampleX - x) / period;
+            float sampleY = y + safeAmplitude * (1f - (float) Math.cos(t * Math.PI * 2f)) / 2f;
+            float dx = sampleX - previousX;
+            float dy = sampleY - previousY;
+            float length = (float) Math.sqrt(dx * dx + dy * dy);
+            if (length > 0f) {
+                float angle = MathUtils.radiansToDegrees * (float) Math.atan2(dy, dx);
+                batch.draw(
+                    whitePixel, previousX, previousY - safeThickness / 2f,
+                    0f, safeThickness / 2f, length, safeThickness, 1f, 1f, angle
+                );
+            }
+            previousX = sampleX;
+            previousY = sampleY;
+        }
+        batch.setColor(previous);
+    }
+
+    /**
+     * A line broken into equal marks separated by equal gaps, which is both a dashed and a dotted
+     * underline: the caller decides the mark length, and a dot is a mark as long as it is tall.
+     *
+     * <p>The pattern starts at the run's left edge and is not aligned across runs, so two adjacent spans
+     * with the same dashed style draw their dashes out of phase. That is intentional — aligning them
+     * would need the run's column offset, which this drawing layer does not have, and a diagnostic
+     * squiggle has the same property.
+     */
+    private void drawDashedLine(
+        Batch batch,
+        float x,
+        float y,
+        float width,
+        float markLength,
+        float gap,
+        float thickness,
+        Color color
+    ) {
+        if (width <= 0f || color == null || style.whitePixelTexture == null) {
+            return;
+        }
+        float safeMark = Math.max(1f, markLength);
+        float safeGap = Math.max(0f, gap);
+        float safeThickness = Math.max(1f, thickness);
+        // A mark and a gap is one cycle of the pattern; the last mark is clipped where the run ends, so
+        // a short run shows a partial mark rather than overrunning the next column.
+        float cycle = safeMark + safeGap;
+        Color previous = batch.getColor();
+        batch.setColor(color);
+        int marks = (int) Math.ceil(width / cycle);
+        for (int i = 0; i < marks; i++) {
+            float markX = x + i * cycle;
+            float markWidth = Math.min(safeMark, x + width - markX);
+            if (markWidth <= 0f) {
+                break;
+            }
+            batch.draw(style.whitePixelTexture, markX, y, markWidth, safeThickness);
+        }
+        batch.setColor(previous);
+    }
+
 
     private float getTextBaseline(float rowBottom) {
         return rowBottom + lineHeight + style.textBaselineOffset;
@@ -8208,14 +8973,27 @@ public class CodeEditor extends Widget {
     }
 
     private CodePoint getCodePointAt(float x, float y, boolean clampY) {
+        return getCodePointAt(x, y, clampY, false);
+    }
+
+    /**
+     * Column lookup for a pointer event. {@code imageHit} trades the caret's nearest-boundary rounding
+     * for containment — see {@link #containingColumnForX} — because an image column is one thing the
+     * user can click anywhere on.
+     */
+    private CodePoint getCodePointAt(float x, float y, boolean clampY, boolean imageHit) {
         int row = clampY ? rowAtClamped(y) : rowAt(y);
         if (row < 0 || row >= totalVisualRows) {
             return null;
         }
-        return getCodePointAtRowX(row, Math.max(0f, x + scrollX - getTextStartX()));
+        return getCodePointAtRowX(row, Math.max(0f, x + scrollX - getTextStartX()), imageHit);
     }
 
     private CodePoint getCodePointAtRowX(int row, float localX) {
+        return getCodePointAtRowX(row, localX, false);
+    }
+
+    private CodePoint getCodePointAtRowX(int row, float localX, boolean imageHit) {
         if (row < 0 || row >= totalVisualRows) {
             return null;
         }
@@ -8245,7 +9023,10 @@ public class CodeEditor extends Widget {
         // Undo the continuation indent before asking which character this x falls on. A negative result
         // means the click landed in the indent gutter, and findColumnForX clamps it to the segment start,
         // which is what clicking left of the text should do.
-        int column = findColumnForX(layout, start, end, localX - segmentIndentOffset(layout, segment));
+        float segmentLocalX = localX - segmentIndentOffset(layout, segment);
+        int column = imageHit
+            ? containingColumnForX(layout, start, end, segmentLocalX)
+            : findColumnForX(layout, start, end, segmentLocalX);
         return new CodePoint(line, column);
     }
 
@@ -9231,6 +10012,34 @@ public class CodeEditor extends Widget {
         return low;
     }
 
+    /**
+     * The column whose extent contains this x, without {@link #findColumnForX}'s nearest-boundary
+     * rounding.
+     *
+     * <p>Placing a caret rounds a click to whichever boundary is closer — the left half of a glyph puts
+     * the caret before it, the right half after — and that is right for text. It is wrong for an image,
+     * whose column is one thing the user clicks anywhere on: the right half of an image column must
+     * resolve to that image rather than to the character after it, and the left half of the character
+     * after an image must not be absorbed into it. So the whole extent belongs to the column, and a
+     * click past the last column returns {@code end}, as the caret lookup does.
+     *
+     * <p>A supplementary pair's image is the exception that needs the caller's surrogate correction: the
+     * low surrogate's extent is empty, so the pair's range ends on its column and this returns it.
+     *
+     * <p>Linear rather than a binary search, because this runs once per pointer event for an image hit
+     * test only, and the shared binary search would need a second comparison rule to keep the rounding
+     * out of it.
+     */
+    private int containingColumnForX(LineLayout layout, int start, int end, float targetX) {
+        float base = layout.prefixWidths[start];
+        for (int column = start; column < end; column++) {
+            if (targetX < layout.prefixWidths[column + 1] - base) {
+                return column;
+            }
+        }
+        return end;
+    }
+
     private float measureRange(String text, int start, int end) {
         return measureText(text.substring(start, Math.min(end, text.length())));
     }
@@ -9323,6 +10132,101 @@ public class CodeEditor extends Widget {
         char current = text.charAt(index);
         char next = index + 1 < text.length() ? text.charAt(index + 1) : 0;
         return glyphAdvance(current, next);
+    }
+
+    /**
+     * The advance of one column, accounting for tabs, inline images, and ordinary glyphs.
+     *
+     * <p>This is the single place the three independent measurement paths —
+     * {@link LineLayout#ensurePrefixWidths}, {@link #countWrapRows}, {@link #measureLineWidth} — ask what
+     * a column is worth. They used to each open-code tab-or-glyph, which was harmless while those were
+     * the only two kinds of column; an image column is a third, and three copies of it would have meant
+     * three chances for the wrap row count and the drawn segments to disagree, which silently corrupts
+     * the visual-row mapping. Every consumer now reads the same answer, so cursor placement and
+     * hit-testing, which both go through the prefix widths this produces, are correct for images for
+     * free.
+     *
+     * <p>Keep it O(1) and allocation-free: it runs once per column per measurement, and a large file
+     * measures a lot of columns.
+     */
+    private float advanceForColumn(int line, CharSequence text, int index, float currentWidth) {
+        char current = text.charAt(index);
+        if (current == '\t') {
+            return getTabAdvanceAtWidth(currentWidth);
+        }
+        if (inlineImageProvider != null && !passwordMode) {
+            InlineImage image = inlineImageProvider.imageAt(line, index, text);
+            if (image != null) {
+                return Math.max(0f, image.width);
+            }
+            if (isTrailingImageSurrogate(line, text, index)) {
+                // The image drawn at the high surrogate of this pair already covers both columns, so the
+                // low one adds nothing. Giving it an advance as well would push everything after the
+                // emoji one image-width right of where the image ends.
+                return 0f;
+            }
+        }
+        char next = index + 1 < text.length() ? text.charAt(index + 1) : 0;
+        return glyphAdvance(current, next);
+    }
+
+    /**
+     * Whether {@code index} is the low surrogate of a pair whose high surrogate is an image column.
+     *
+     * <p>A supplementary-plane character is two {@code char}s in a Java string, but one column in this
+     * editor when a provider turns it into an image: the pair collapses onto the high surrogate, which
+     * is where the image is drawn and where the cursor lands. This is what makes that collapse hold —
+     * without it the low surrogate would be measured, drawn, and clickable as a column of its own.
+     *
+     * <p>Asks the provider about the high surrogate rather than assuming any surrogate pair is an image:
+     * a non-BMP character the provider does not answer for is still two glyphs, and must keep its width.
+     *
+     * <p>Known limitation: cursor movement still stops on the trailing column. It is zero-width, so the
+     * caret does not visibly move, but Left/Right takes two keystrokes to cross one emoji. Collapsing it
+     * fully is a document-layer change — the cursor column is a {@code CodeDocument} concept — and is
+     * out of scope for the rendering work this belongs to.
+     */
+    private boolean isTrailingImageSurrogate(int line, CharSequence text, int index) {
+        if (inlineImageProvider == null || passwordMode) {
+            return false;
+        }
+        if (index <= 0 || !Character.isLowSurrogate(text.charAt(index))) {
+            return false;
+        }
+        if (!Character.isHighSurrogate(text.charAt(index - 1))) {
+            return false;
+        }
+        return inlineImageProvider.imageAt(line, index - 1, text) != null;
+    }
+
+    /**
+     * The column an image occupies here, or -1. A hit test may resolve to the pair's trailing surrogate,
+     * in which case the image is one column back.
+     */
+    private int imageColumnAt(int line, CharSequence text, int column) {
+        if (inlineImageProvider == null || passwordMode) {
+            return -1;
+        }
+        if (column >= 0 && column < text.length()
+            && inlineImageProvider.imageAt(line, column, text) != null) {
+            return column;
+        }
+        return isTrailingImageSurrogate(line, text, column) ? column - 1 : -1;
+    }
+
+    /** Index of the word character nearest to {@code from}, preferring the one to its left, or -1. */
+    private int nearestWordChar(String line, int from) {
+        for (int i = from - 1; i >= 0; i--) {
+            if (isWordChar(line.charAt(i))) {
+                return i;
+            }
+        }
+        for (int i = from + 1; i < line.length(); i++) {
+            if (isWordChar(line.charAt(i))) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     /** Advance for a character pair, cached. A {@code next} of 0 means no following character. */
@@ -10013,6 +10917,7 @@ public class CodeEditor extends Widget {
     }
 
     private static final class LineLayout {
+        final int line;
         final String text;
         final int indentLevel;
         /** Assigned after construction by {@code buildLineContent}, which fills the ignore ranges too. */
@@ -10029,7 +10934,8 @@ public class CodeEditor extends Widget {
          */
         float continuationIndent;
 
-        LineLayout(String text, int indentLevel, Array<HighlightToken> tokens) {
+        LineLayout(int line, String text, int indentLevel, Array<HighlightToken> tokens) {
+            this.line = line;
             this.text = text;
             this.indentLevel = indentLevel;
             this.tokens = tokens;
@@ -10037,7 +10943,7 @@ public class CodeEditor extends Widget {
 
         /** Placeholder returned for out-of-range lines so callers never see null. */
         static LineLayout empty() {
-            LineLayout layout = new LineLayout("", 0, new Array<HighlightToken>(0));
+            LineLayout layout = new LineLayout(-1, "", 0, new Array<HighlightToken>(0));
             layout.prefixWidths = new float[] {0f};
             layout.segmentStarts.add(0);
             layout.segmentEnds.add(0);
@@ -10058,17 +10964,13 @@ public class CodeEditor extends Widget {
             return Math.max(0, segmentEnds.size - 1);
         }
 
-        void ensurePrefixWidths(CodeEditor editor) {
+        void ensurePrefixWidths(CodeEditor editor, int line) {
             if (prefixWidths != null && prefixWidths.length == text.length() + 1) {
                 return;
             }
             prefixWidths = new float[text.length() + 1];
             for (int i = 0; i < text.length(); i++) {
-                char current = text.charAt(i);
-                float advance = current == '\t'
-                    ? editor.getTabAdvanceAtWidth(prefixWidths[i])
-                    : editor.glyphAdvance(text, i);
-                prefixWidths[i + 1] = prefixWidths[i] + advance;
+                prefixWidths[i + 1] = prefixWidths[i] + editor.advanceForColumn(line, text, i, prefixWidths[i]);
             }
         }
 
@@ -10084,12 +10986,19 @@ public class CodeEditor extends Widget {
         final int end;
         final Color color;
         final int priority;
+        /** Null on a legacy, unstyled span. */
+        final CodeTextStyle style;
 
         ColorSpan(int start, int end, Color color, int priority) {
+            this(start, end, color, priority, null);
+        }
+
+        ColorSpan(int start, int end, Color color, int priority, CodeTextStyle style) {
             this.start = start;
             this.end = end;
             this.color = color;
             this.priority = priority;
+            this.style = style;
         }
     }
 
@@ -10137,11 +11046,18 @@ public class CodeEditor extends Widget {
         final int start;
         final int end;
         final Color color;
+        /** Null on a plain run, in which case the row draws exactly as it always did. */
+        final CodeTextStyle style;
 
         HighlightToken(int start, int end, Color color) {
+            this(start, end, color, null);
+        }
+
+        HighlightToken(int start, int end, Color color, CodeTextStyle style) {
             this.start = start;
             this.end = end;
             this.color = color;
+            this.style = style;
         }
     }
 
@@ -10180,6 +11096,23 @@ public class CodeEditor extends Widget {
         CodePoint(int line, int column) {
             this.line = line;
             this.column = column;
+        }
+    }
+
+    /** The image the pointer is hovering, with the pointer position it was reported at. */
+    private static final class InlineImageHoverState {
+        final InlineImageHit hit;
+        float pointerX;
+        float pointerY;
+
+        InlineImageHoverState(InlineImageHit hit, float pointerX, float pointerY) {
+            this.hit = hit;
+            this.pointerX = pointerX;
+            this.pointerY = pointerY;
+        }
+
+        boolean samePosition(InlineImageHit other) {
+            return hit.line == other.line && hit.column == other.column;
         }
     }
 
@@ -10312,11 +11245,72 @@ public class CodeEditor extends Widget {
         public Texture whitePixelTexture;
         /** Vertical offset of a diagnostic squiggle from the row bottom. */
         public float diagnosticSquiggleOffset = 1f;
-        /** Width of one zig or zag. */
+        /** Width of one full zig-zag period, a zig and a zag together. */
         public float diagnosticSquiggleStep = 2f;
-        /** Height difference between a zig and a zag. */
+        /** Height of a zig-zag period. */
         public float diagnosticSquiggleAmplitude = 2f;
         public float diagnosticSquiggleThickness = 1f;
+
+        // --- Text decoration geometry -----------------------------------------------------------
+        // Every one of these is measured from the row's bottom edge, the same origin
+        // drawDiagnosticsForRow uses, so a decoration and a diagnostic squiggle on the same row line up.
+        // Zero thickness disables that decoration, which lets a theme turn them all off with one knob
+        // per kind instead of hunting through the producers that created the spans.
+        /** Thickness of the plain underline; 0 disables it. */
+        public float underlineThickness = 1f;
+        /** Distance of the plain underline above the row bottom. */
+        public float underlineOffset = 3f;
+        /** Thickness of the lower line of a double underline; 0 falls back to {@link #underlineThickness}. */
+        public float doubleUnderlineThickness = 1f;
+        /** Gap between the two lines of a double underline; the second is drawn below the first. */
+        public float doubleUnderlineGap = 2f;
+        /** Thickness of the strike-through line; 0 disables it. */
+        public float strikethroughThickness = 1f;
+        /** Strike-through position above the row bottom, plus {@code lineHeight * 0.5}. */
+        public float strikethroughOffset = -1f;
+        /** Width of one full zig-zag period, a zig and a zag together. */
+        public float wavyUnderlineStep = 2f;
+        /** Height of a zig-zag period of a wavy underline. */
+        public float wavyUnderlineAmplitude = 2f;
+        /** Thickness of a wavy underline; 0 disables it. */
+        public float wavyUnderlineThickness = 1f;
+        /** Distance of a wavy underline above the row bottom. */
+        public float wavyUnderlineOffset = 2f;
+        /** Length of one dash of a dashed underline; the gap follows it. */
+        public float dashedUnderlineDashLength = 6f;
+        /** Gap between dashes of a dashed underline. */
+        public float dashedUnderlineGap = 4f;
+        /** Thickness of a dashed underline; 0 disables it. */
+        public float dashedUnderlineThickness = 1f;
+        /** Distance of a dashed underline above the row bottom. */
+        public float dashedUnderlineOffset = 3f;
+        /** Diameter of one dot of a dotted underline; the gap follows it. */
+        public float dottedUnderlineDotSize = 2f;
+        /** Gap between dots of a dotted underline. */
+        public float dottedUnderlineGap = 3f;
+        /** Thickness of a dotted underline; 0 disables it. A dot is drawn as a small square, so this is also its height. */
+        public float dottedUnderlineThickness = 1f;
+        /** Distance of a dotted underline above the row bottom. */
+        public float dottedUnderlineOffset = 3f;
+        /** How far the second pass of a fake bold is shifted right; 0 disables the overlay. */
+        public float fakeBoldOffset = 1f;
+        /**
+         * Shear of a fake italic, in x per y around the baseline; 0 disables it.
+         *
+         * <p>0.2 is a close match for a true italic cut, and 0.3 leans harder for a display look.
+         */
+        public float fakeItalicShear = 0.2f;
+        /** Inset of a decoration background from the top and bottom of the row. */
+        public float decorationBackgroundInset = 0f;
+        /**
+         * Width of one band of a gradient, in pixels.
+         *
+         * <p>libGDX's {@link BitmapFont} has no per-glyph colour, so a gradient is drawn as a run of
+         * solid-colour bands, each a sub-range of the text. Smaller is smoother and more draw calls;
+         * larger is cheaper and more visible as steps. 12px is imperceptible on a 1080p screen at the
+         * sizes a code font is used at.
+         */
+        public float gradientBandWidth = 12f;
         /** Width of the severity tick drawn in the gutter; 0 disables it. */
         public float diagnosticGutterMarkWidth = 3f;
         /** Size of a {@link CodeLineMark} icon in the gutter. */
@@ -10413,6 +11407,28 @@ public class CodeEditor extends Widget {
             this.diagnosticSquiggleStep = style.diagnosticSquiggleStep;
             this.diagnosticSquiggleAmplitude = style.diagnosticSquiggleAmplitude;
             this.diagnosticSquiggleThickness = style.diagnosticSquiggleThickness;
+            this.underlineThickness = style.underlineThickness;
+            this.underlineOffset = style.underlineOffset;
+            this.doubleUnderlineThickness = style.doubleUnderlineThickness;
+            this.doubleUnderlineGap = style.doubleUnderlineGap;
+            this.strikethroughThickness = style.strikethroughThickness;
+            this.strikethroughOffset = style.strikethroughOffset;
+            this.wavyUnderlineStep = style.wavyUnderlineStep;
+            this.wavyUnderlineAmplitude = style.wavyUnderlineAmplitude;
+            this.wavyUnderlineThickness = style.wavyUnderlineThickness;
+            this.wavyUnderlineOffset = style.wavyUnderlineOffset;
+            this.dashedUnderlineDashLength = style.dashedUnderlineDashLength;
+            this.dashedUnderlineGap = style.dashedUnderlineGap;
+            this.dashedUnderlineThickness = style.dashedUnderlineThickness;
+            this.dashedUnderlineOffset = style.dashedUnderlineOffset;
+            this.dottedUnderlineDotSize = style.dottedUnderlineDotSize;
+            this.dottedUnderlineGap = style.dottedUnderlineGap;
+            this.dottedUnderlineThickness = style.dottedUnderlineThickness;
+            this.dottedUnderlineOffset = style.dottedUnderlineOffset;
+            this.fakeBoldOffset = style.fakeBoldOffset;
+            this.fakeItalicShear = style.fakeItalicShear;
+            this.decorationBackgroundInset = style.decorationBackgroundInset;
+            this.gradientBandWidth = style.gradientBandWidth;
             this.diagnosticGutterMarkWidth = style.diagnosticGutterMarkWidth;
             this.lineMarkIconSize = style.lineMarkIconSize;
             this.lineMarkIconGap = style.lineMarkIconGap;
@@ -10792,6 +11808,41 @@ public class CodeEditor extends Widget {
                 style.rowPadding = derivedRowPadding;
                 style.guideSpacing = DEFAULT_GUIDE_SPACING;
                 style.guideOffsetX = DEFAULT_GUIDE_OFFSET_X;
+
+                // Decoration geometry is derived from the font rather than left at the field defaults,
+                // which are tuned for one size: a 24px font with a 1px underline looks like a rendering
+                // bug, and a 1px fake-bold shift on it does nothing at all.
+                style.underlineThickness = Math.max(1f, Math.round(fontLineHeight * 0.07f));
+                style.underlineOffset = Math.max(1f, Math.round(fontLineHeight * 0.16f));
+                style.doubleUnderlineThickness = style.underlineThickness;
+                style.doubleUnderlineGap = Math.max(1f, Math.round(fontLineHeight * 0.14f));
+                style.strikethroughThickness = Math.max(1f, Math.round(fontLineHeight * 0.07f));
+                // A wave needs a period much wider than its amplitude to read as one line: the zig and the
+                // zag are half a period apart, so at a 1:1 ratio the two levels separate visually and the
+                // shape reads as a dashed line again.
+                style.wavyUnderlineStep = Math.max(4f, Math.round(fontLineHeight * 0.45f));
+                style.wavyUnderlineAmplitude = Math.max(2f, Math.round(fontLineHeight * 0.15f));
+                style.wavyUnderlineThickness = style.underlineThickness;
+                style.wavyUnderlineOffset = style.underlineOffset;
+                // A dash covers roughly three quarters of a cycle of the wavy line at the same size, so
+                // the two broken underlines read as the same "weight" of decoration on one row.
+                style.dashedUnderlineDashLength = Math.max(2f, Math.round(fontLineHeight * 0.38f));
+                style.dashedUnderlineGap = Math.max(2f, Math.round(fontLineHeight * 0.24f));
+                style.dashedUnderlineThickness = style.underlineThickness;
+                style.dashedUnderlineOffset = style.underlineOffset;
+                style.dottedUnderlineDotSize = Math.max(1f, Math.round(fontLineHeight * 0.11f));
+                style.dottedUnderlineGap = Math.max(1f, Math.round(fontLineHeight * 0.18f));
+                style.dottedUnderlineThickness = style.underlineThickness;
+                style.dottedUnderlineOffset = style.underlineOffset;
+                // A diagnostic squiggle goes through the same helper as the wavy underline, so it takes the
+                // same derivation instead of the field defaults, which are tuned for one size: at 2px the
+                // whole zig-zag is smaller than a glyph's stroke and reads as noise under the word it marks.
+                style.diagnosticSquiggleStep = Math.max(4f, Math.round(fontLineHeight * 0.3f));
+                style.diagnosticSquiggleAmplitude = Math.max(2f, Math.round(fontLineHeight * 0.12f));
+                style.diagnosticSquiggleThickness = style.underlineThickness;
+                style.diagnosticSquiggleOffset = style.underlineOffset;
+                style.fakeBoldOffset = Math.max(1f, Math.round(fontLineHeight * 0.08f));
+                style.gradientBandWidth = Math.max(4f, Math.round(fontLineHeight * 0.9f));
                 return style;
             }
 
@@ -11219,6 +12270,17 @@ public class CodeEditor extends Widget {
                 return true;
             }
 
+            if (consumeImageClick(x, y)) {
+                // The image owned the press, so the caret does not move into its column and any selection
+                // is kept — the release would offer the click again, but only after the caret had already
+                // landed there. A drag from here pans rather than selecting, since the anchor the drag
+                // would extend was never set.
+                draggingSelection = false;
+                draggingTouchScroll = true;
+                refreshBlink();
+                return true;
+            }
+
             clearSelection();
             draggingSelection = true;
             draggingTouchScroll = false;
@@ -11479,8 +12541,13 @@ public class CodeEditor extends Widget {
                     notifyDoubleClick(x, y, false);
                     lastMouseTapTimeNanos = 0L;
                 } else {
-                    clearSelection();
-                    placeCursor(x, y);
+                    // The tap is timed even when an image consumed it: a click on an icon followed by a
+                    // click beside it is still a double-click, and would otherwise be re-offered to the
+                    // image instead of selecting the word around it.
+                    if (!consumeImageClick(x, y)) {
+                        clearSelection();
+                        placeCursor(x, y);
+                    }
                     lastMouseTapTimeNanos = nowNanos;
                     lastMouseTapX = x;
                     lastMouseTapY = y;
@@ -11492,11 +12559,13 @@ public class CodeEditor extends Widget {
                     notifyDoubleClick(x, y, true);
                     lastTapTimeNanos = 0L;
                 } else {
-                    clearSelection();
-                    placeCursor(x, y);
-                    showTransientCaretHandle();
-                    if (shouldShowKeyboardForTouchTap(x, y)) {
-                        onscreenKeyboard.show(true);
+                    if (!consumeImageClick(x, y)) {
+                        clearSelection();
+                        placeCursor(x, y);
+                        showTransientCaretHandle();
+                        if (shouldShowKeyboardForTouchTap(x, y)) {
+                            onscreenKeyboard.show(true);
+                        }
                     }
                     lastTapTimeNanos = nowNanos;
                     lastTapX = x;
@@ -11508,8 +12577,10 @@ public class CodeEditor extends Widget {
                     notifyDoubleClick(x, y, false);
                     lastMouseTapTimeNanos = 0L;
                 } else {
-                    clearSelection();
-                    placeCursor(x, y);
+                    if (!consumeImageClick(x, y)) {
+                        clearSelection();
+                        placeCursor(x, y);
+                    }
                     lastMouseTapTimeNanos = nowNanos;
                     lastMouseTapX = x;
                     lastMouseTapY = y;
@@ -11538,7 +12609,7 @@ public class CodeEditor extends Widget {
                 scrollY += amountY * lineHeight * WHEEL_SCROLL_ROWS;
             }
             clampScroll();
-            cancelHover();
+            cancelAllHover();
             return true;
         }
 
@@ -11551,7 +12622,7 @@ public class CodeEditor extends Widget {
         @Override
         public void exit(InputEvent event, float x, float y, int pointer, Actor toActor) {
             if (pointer == -1) {
-                cancelHover();
+                cancelAllHover();
             }
         }
     }
