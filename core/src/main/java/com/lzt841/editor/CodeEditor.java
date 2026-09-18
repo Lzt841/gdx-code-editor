@@ -136,6 +136,12 @@ public class CodeEditor extends Widget {
     private static final float KEY_REPEAT_INTERVAL = 0.045f;
     private static final float MIN_ZOOM_SCALE = 0.5f;
     private static final float MAX_ZOOM_SCALE = 3.0f;
+    /**
+     * Widest gap allowed between two consecutive passes of a fake bold, in drawn pixels. Beyond about a
+     * pixel the union of the copies stops reading as one heavier stroke and the eye resolves the gap as a
+     * second image; see {@link #passCount(float)}.
+     */
+    private static final float BOLD_PASS_SPACING = 1f;
     private static final int MAX_TOUCH_POINTERS = 20;
     private static final float[][] DEFAULT_RAINBOW_BRACKET_PALETTE = {
         {0.976f, 0.392f, 0.380f, 1f},
@@ -166,6 +172,24 @@ public class CodeEditor extends Widget {
     private static final int BRACKET_MATCH_SCAN_LINES = 2000;
     private static final String BRACKET_CHARACTERS = "()[]{}";
     private static final String WRAP_OPPORTUNITY_CHARACTERS = ",.;:+-*/=%&|!?)>]}";
+    /**
+     * Full-width punctuation that must never START a wrapped row (行首禁則): sentence punctuation, the
+     * closing brackets and quotes, the ellipsis, and the Japanese prolonged and iteration marks. A row
+     * that opens on one of these reads as a continuation of the row above it.
+     *
+     * <p><strong>Every char of this literal is above 0x7F and inside {@link #kinsokuBand(char)}.</strong>
+     * That is load-bearing, not stylistic. {@link #breakAllowedBefore} consults this set for lines that
+     * mix ASCII and CJK, and the proof that a pure-ASCII line wraps byte-identically to the old
+     * single-char predicate rests on no ASCII char ever being vetoed here. Extending either literal
+     * with an ASCII lookalike, or with a char outside the band, would silently regress code-file
+     * wrapping — the static check below fails the class load instead.
+     */
+    static final String NO_START_ROW_PUNCT = "，。、；：！？％＇）】》」』〕〉”’…ー々ヽヾゝゞ〆";
+    /** Full-width punctuation that must never END a wrapped row (行尾禁則): the opening brackets and quotes. */
+    static final String NO_END_ROW_PUNCT = "（〔［｛〈《「『“‘～";
+    static {
+        verifyKinsokuLiterals();
+    }
     private static final Array<HighlightToken> EMPTY_TOKENS = new Array<>(0);
     /** Documents at or below this many lines get structure analysis synchronously. */
     private static final int STRUCTURE_SYNC_LINE_LIMIT = 20000;
@@ -332,6 +356,8 @@ public class CodeEditor extends Widget {
     private final Color scratchTintColor = new Color();
     /** Sampled colour of the current gradient band; reused because a gradient run draws one per band. */
     private final Color scratchGradientColor = new Color();
+    /** The base colour of a bold run with one extra pass's coverage applied; reused once per pass. */
+    private final Color scratchTextColor = new Color();
     /**
      * The three matrices a fake italic needs: the projection as it was, the same projection sheared, and
      * the shear itself. All three are reused rather than allocated per italic run.
@@ -4359,7 +4385,8 @@ public class CodeEditor extends Widget {
 
     /**
      * How many visual rows a line occupies at {@code wrapWidth}, using the same break rules as
-     * {@link #wrapLine}, without allocating a layout or prefix-width array.
+     * {@link #wrapLine} — both decide every break through {@link #breakAllowedBefore} and
+     * {@link #resolveWrapBreak} — without allocating a layout or prefix-width array.
      */
     private int countWrapRows(int line, int wrapWidth) {
         // Same text wrapLine sees, including password masking. The two must agree on the row count
@@ -4388,12 +4415,12 @@ public class CodeEditor extends Widget {
             int bestBreak = -1;
             int index = segmentStart;
             while (index < length) {
-                char current = text.charAt(index);
                 absoluteWidth += advanceForColumn(line, text, index, absoluteWidth);
                 if (absoluteWidth - segmentStartWidth > available) {
                     break;
                 }
-                if (isWrapOpportunity(current)) {
+                // The boundary just past the column that fit, so k == index + 1 and bestBreak records k.
+                if (breakAllowedBefore(text, index + 1)) {
                     bestBreak = index + 1;
                 }
                 index++;
@@ -4403,16 +4430,12 @@ public class CodeEditor extends Widget {
                 return rows;
             }
 
-            int breakIndex;
-            if (index == segmentStart) {
-                breakIndex = segmentStart + 1;
-            } else if (bestBreak > segmentStart) {
-                breakIndex = bestBreak;
-            } else {
-                breakIndex = index;
-            }
-            // Every branch above gives breakIndex > segmentStart and trimWrappedIndent only moves
-            // forward, so the loop always advances.
+            // One helper, shared with wrapLine: the surrogate-safe fallback, and the kinsoku shelter
+            // that keeps a full-width non-starter off the next row's start. Every branch gives
+            // breakIndex > segmentStart and the shelter only moves forward, so the loop always advances.
+            int breakIndex = resolveWrapBreak(text, segmentStart, index, bestBreak);
+            // resolveWrapBreak already trimmed and sheltered this boundary; trimming again is
+            // idempotent and keeps this line a mirror of wrapLine's.
             int nextStart = trimWrappedIndent(text, breakIndex);
             // The inner loop may have run past the break, so re-walk from this segment's start, whose
             // width is known, up to the next one. Each character is therefore visited at most twice
@@ -5630,7 +5653,8 @@ public class CodeEditor extends Widget {
                 if (segmentWidth > available) {
                     break;
                 }
-                if (isWrapOpportunity(text, index)) {
+                // The boundary just past the column that fit, so k == index + 1 and bestBreak records k.
+                if (breakAllowedBefore(text, index + 1)) {
                     bestBreak = index + 1;
                 }
                 index++;
@@ -5642,14 +5666,8 @@ public class CodeEditor extends Widget {
                 return;
             }
 
-            int breakIndex;
-            if (index == segmentStart) {
-                breakIndex = segmentStart + 1;
-            } else if (bestBreak > segmentStart) {
-                breakIndex = bestBreak;
-            } else {
-                breakIndex = index;
-            }
+            // One helper, shared with countWrapRows, so a row counted there is the segment drawn here.
+            int breakIndex = resolveWrapBreak(text, segmentStart, index, bestBreak);
 
             layout.segmentStarts.add(segmentStart);
             layout.segmentEnds.add(breakIndex);
@@ -7919,29 +7937,88 @@ public class CodeEditor extends Widget {
         Color color,
         CodeTextStyle runStyle
     ) {
+        // The theme derives the offset from the font's unscaled line height, so it is scaled here to the
+        // size the glyphs are actually drawn at: without that, zooming in thins the bold and zooming out
+        // thickens it, because the offset stays fixed while the strokes grow and shrink.
+        float boldOffset = style.fakeBoldOffset * zoomScale;
+        boolean bold = runStyle.hasFlags(CodeTextStyle.BOLD) && boldOffset != 0f;
         if (runStyle.hasFlags(CodeTextStyle.GRADIENT) && runStyle.gradientEndColor != null) {
-            drawGradientTextRun(batch, layout, runStart, runEnd, runX, baseline, color, runStyle);
-            if (runStyle.hasFlags(CodeTextStyle.BOLD) && style.fakeBoldOffset != 0f) {
-                // The second pass must repeat the gradient rather than draw the run in one flat colour:
+            drawGradientTextRun(batch, layout, runStart, runEnd, runX, baseline, color, runStyle, 1f);
+            if (bold) {
+                // The extra passes must repeat the gradient rather than draw the run in one flat colour:
                 // a solid overlay a couple of pixels off covers the bands at every glyph's left edge, which
                 // leaves a gradient heading looking neither bold nor gradient.
-                drawGradientTextRun(
-                    batch, layout, runStart, runEnd, runX + style.fakeBoldOffset, baseline, color, runStyle
-                );
+                int passes = passCount(boldOffset);
+                float passAlpha = passAlpha(passes);
+                for (int i = 1; i <= passes; i++) {
+                    drawGradientTextRun(
+                        batch, layout, runStart, runEnd, runX + passOffset(boldOffset, passes, i), baseline,
+                        color, runStyle, passAlpha
+                    );
+                }
             }
         } else {
             style.font.setColor(color);
             style.font.draw(batch, layout.text, runX, baseline, runStart, runEnd, 0f, Align.left, false);
-            if (runStyle.hasFlags(CodeTextStyle.BOLD) && style.fakeBoldOffset != 0f) {
-                // A second pass one pixel right is all a single-weight bitmap font can do for bold. It is
-                // visibly not a bold cut at large sizes, which is why the knob exists.
+            if (bold) {
+                // A real bold face is not a regular glyph with a second one laid beside it: it is one
+                // heavier stroke, wider than the regular by about half the stem and symmetric about it, with
+                // the same plateau coverage and the same advance. Reproducing that from a single-weight font
+                // needs three things the older rightward overlay did not do.
+                //
+                // The passes are spread over the offset on both sides of the base draw rather than all to
+                // the right, so both edges harden the way the real face's do; a purely rightward copy leaves
+                // the left edge soft and drags a tail off the right. They are held at most a pixel apart, so
+                // the union of the copies is continuous and reads as one stroke instead of resolving into
+                // 重影. And each is drawn at reduced coverage, because the batch composites a pass over the
+                // ones before it rather than adding to them: full-coverage passes drive the plateau past
+                // anything a true bold reaches, and the surplus has nowhere to go but into the next glyph's
+                // cell, which fuses adjacent characters.
+                //
+                // The font is linearly filtered and does not snap x to integers, so a fractional offset
+                // blends into the edge instead of painting a second one.
+                int passes = passCount(boldOffset);
+                float passAlpha = passAlpha(passes);
+                // font.draw does not reset the colour, so one setColor at the reduced coverage covers every
+                // pass; it is restored after the loop so the dimmed colour does not outlive this run.
+                style.font.setColor(scratchTextColor.set(color).mul(1f, 1f, 1f, passAlpha));
+                for (int i = 1; i <= passes; i++) {
+                    style.font.draw(
+                        batch, layout.text, runX + passOffset(boldOffset, passes, i), baseline,
+                        runStart, runEnd, 0f, Align.left, false
+                    );
+                }
                 style.font.setColor(color);
-                style.font.draw(
-                    batch, layout.text, runX + style.fakeBoldOffset, baseline,
-                    runStart, runEnd, 0f, Align.left, false
-                );
             }
         }
+    }
+
+    /**
+     * How many extra passes a fake bold of the given offset draws. Two is the minimum, because a single
+     * pass can only sit on one side of the base stroke and leaves the other edge as soft as the regular
+     * glyph's; beyond that the passes stay at most {@value #BOLD_PASS_SPACING}px apart so the union of the
+     * copies is a continuous stroke the eye cannot resolve into separate images.
+     */
+    private static int passCount(float boldOffset) {
+        return Math.max(2, (int) Math.ceil(boldOffset / BOLD_PASS_SPACING));
+    }
+
+    /**
+     * Coverage of each extra pass. Splitting the offset into more passes multiplies how much ink they lay
+     * down in total, so the coverage is scaled back with the count to keep the plateau where a true bold
+     * face's is; at two passes this is just {@link CodeTextStyle#fakeBoldPassAlpha}.
+     */
+    private float passAlpha(int passes) {
+        return style.fakeBoldPassAlpha * 2f / passes;
+    }
+
+    /**
+     * Where the i-th extra pass is drawn, 1-based, in pixels from the base. The passes are spaced evenly
+     * over the offset and centred on the base draw, so pass 1 of 2 sits at -offset/4 and pass 2 at
+     * +offset/4, and the stroke widens symmetrically instead of growing a tail to the right.
+     */
+    private static float passOffset(float boldOffset, int passes, int i) {
+        return boldOffset * (i - (passes + 1f) / 2f) / passes;
     }
 
     /**
@@ -8016,7 +8093,8 @@ public class CodeEditor extends Widget {
         float runX,
         float baseline,
         Color startColor,
-        CodeTextStyle runStyle
+        CodeTextStyle runStyle,
+        float alphaScale
     ) {
         float[] widths = layout.prefixWidths;
         String text = layout.text;
@@ -8050,7 +8128,10 @@ public class CodeEditor extends Widget {
             }
             // Sample at the band's middle so each drawn segment is the colour its centre should have.
             float sample = (band + 0.5f) / bandCount;
-            style.font.setColor(scratchGradientColor.set(startColor).lerp(endColor, sample));
+            // The scale is applied after the lerp because Color.lerp interpolates alpha too, so dimming
+            // beforehand would be undone again toward the gradient's end colour.
+            style.font.setColor(
+                scratchGradientColor.set(startColor).lerp(endColor, sample).mul(1f, 1f, 1f, alphaScale));
             // Each band starts where the previous one ended in x, not at the run's left edge — the
             // prefix widths are the only source of truth for where a column is, so a band that skipped
             // an over-wide glyph must skip its width too, and the draw call has no other way to know.
@@ -10075,24 +10156,184 @@ public class CodeEditor extends Widget {
         return segment > 0 ? layout.continuationIndent : 0f;
     }
 
-    private boolean isWrapOpportunity(String text, int index) {
-        return isWrapOpportunity(text.charAt(index));
-    }
-
-    /** Whether a line may be broken immediately after this character. */
-    private boolean isWrapOpportunity(char current) {
+    /** Whether a line may be broken immediately after this character. The entire legacy ASCII model. */
+    private static boolean isWrapOpportunity(char current) {
         if (Character.isWhitespace(current)) {
             return true;
         }
         return WRAP_OPPORTUNITY_CHARACTERS.indexOf(current) >= 0;
     }
 
-    private int trimWrappedIndent(CharSequence text, int index) {
+    private static int trimWrappedIndent(CharSequence text, int index) {
         int next = index;
         while (next < text.length() && Character.isWhitespace(text.charAt(next)) && text.charAt(next) != '\t') {
             next++;
         }
         return next;
+    }
+
+    /**
+     * Whether a wrapped row may start at {@code k}: the single break authority for both
+     * {@link #countWrapRows} and {@link #wrapLine}. A row ends at {@code k} exactly when the next one
+     * begins there, so this replaces the old after-char predicate with a boundary test between
+     * {@code text[k-1]} (the current row's last char) and {@code text[k]} (the next row's first).
+     *
+     * <p>The model is run segmentation, but the runs are never materialised: the boundary test is a pure
+     * function of the two adjacent classes, which is what lets it fit the per-character hot path. A
+     * word run — ASCII identifier characters, Latin, Greek, Cyrillic, or full-width letters and digits —
+     * is an unbreakable atom exited only at a boundary; CJK ideographs, kana and Hangul are breakable
+     * between any two characters, which is the fix for a spaceless Chinese line; and the two 禁則
+     * overlays keep a full-width closer off the start of a row and a full-width opener off its end.
+     *
+     * <p>A pure-ASCII line takes rule 1, which is the old predicate verbatim, and cannot reach a rule
+     * that would change its wrapping. That guarantee is structural rather than positional: rules 2-7
+     * are reachable only when at least one of the two adjacent characters is non-ASCII, so reordering
+     * them among themselves cannot touch code-file wrapping.
+     *
+     * <p>Keep it O(1) and allocation-free: the wrap-width re-measure calls this once per character per
+     * line across the whole document.
+     */
+    static boolean breakAllowedBefore(CharSequence text, int k) {
+        // 0. k == length is end-of-line, which the callers' own `index >= length` branch owns.
+        if (k <= 0 || k >= text.length()) {
+            return false;
+        }
+        char prev = text.charAt(k - 1);
+        char next = text.charAt(k);
+        // 1. The whole legacy break model, verbatim, for an all-ASCII pair. Hoisted above every other
+        //    rule so no reordering below can reach an ASCII line: a high surrogate is above 0x7F, and
+        //    every char of both 禁則 literals is above 0x7F (verified at class load).
+        if (prev <= 0x7F && next <= 0x7F) {
+            return isWrapOpportunity(prev);
+        }
+        // 2. Never split a surrogate pair; the break belongs after the low surrogate, not inside it.
+        if (prev >= 0xD800 && prev <= 0xDBFF && next >= 0xDC00 && next <= 0xDFFF) {
+            return false;
+        }
+        // 3. 行首禁則: the next row would open on a non-starter.
+        if (isNoStartRowPunct(next)) {
+            return false;
+        }
+        // 4. 行尾禁則: this row would close on an opener.
+        if (isNoEndRowPunct(prev)) {
+            return false;
+        }
+        // 5. Word-run exit into non-word text: the edge of an embedded latin run is breakable on both
+        //    sides while the run itself is not, so 调用processDocument方法 stays whole while it fits.
+        if (next > 0x7F && !isWrapWordChar(next) && isWrapWordChar(prev)) {
+            return true;
+        }
+        // 6. A non-ASCII word run: breakable only where the run ends.
+        if (isWrapWordChar(prev)) {
+            return !isWrapWordChar(next);
+        }
+        // 7. prev is a CJK ideograph, kana, Hangul, Yi, an astral CJK char's low surrogate, or a
+        //    full-width punctuation char that is not an opener: a break may follow it. This is the rule
+        //    that makes a spaceless Chinese line wrap linguistically instead of at the pixel boundary.
+        return true;
+    }
+
+    /** The cheap band check gating both 禁則 literals; every char of both is inside one of these. */
+    static boolean kinsokuBand(char c) {
+        return (c >= 0x2018 && c <= 0x2026) || (c >= 0x3001 && c <= 0x3015)
+            || (c >= 0x309D && c <= 0x309E) || (c >= 0x30FC && c <= 0x30FE)
+            || (c >= 0xFF01 && c <= 0xFF5E);
+    }
+
+    static boolean isNoStartRowPunct(char c) {
+        return kinsokuBand(c) && NO_START_ROW_PUNCT.indexOf(c) >= 0;
+    }
+
+    static boolean isNoEndRowPunct(char c) {
+        return kinsokuBand(c) && NO_END_ROW_PUNCT.indexOf(c) >= 0;
+    }
+
+    /**
+     * Characters that form an unbreakable word run: ASCII identifier characters, the Latin-1 supplement
+     * with the Latin, Greek and Cyrillic extensions, and the full-width letters and digits. Scripts
+     * outside this set fall through to rule 7 and are breakable between characters — correct for CJK, a
+     * known limitation for joining scripts such as Arabic.
+     */
+    static boolean isWrapWordChar(char c) {
+        return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+            || c == '_' || c == '$'
+            || (c >= 0x00C0 && c <= 0x024F)
+            || (c >= 0x0370 && c <= 0x03FF)
+            || (c >= 0x0400 && c <= 0x052F)
+            || (c >= 0xFF10 && c <= 0xFF19)
+            || (c >= 0xFF21 && c <= 0xFF5A);
+    }
+
+    /** The width in columns of one unbreakable astral column, so an overflow never strands a low surrogate. */
+    static int astralStep(CharSequence text, int i) {
+        if (i + 1 < text.length()) {
+            char current = text.charAt(i);
+            char after = text.charAt(i + 1);
+            if (current >= 0xD800 && current <= 0xDBFF && after >= 0xDC00 && after <= 0xDFFF) {
+                return 2;
+            }
+        }
+        return 1;
+    }
+
+    /** Pushes the overflow break past a low surrogate instead of splitting its pair. */
+    static int pairSafeBreak(CharSequence text, int i) {
+        if (i > 0) {
+            char before = text.charAt(i - 1);
+            char current = text.charAt(i);
+            if (before >= 0xD800 && before <= 0xDBFF && current >= 0xDC00 && current <= 0xDFFF) {
+                return i + 1;
+            }
+        }
+        return i;
+    }
+
+    /**
+     * One shared row-resolution for {@link #countWrapRows} and {@link #wrapLine}: the three legacy
+     * fallback branches, made surrogate-safe, plus the kinsoku shelter. Both callers feed it the same
+     * inputs and then trim the result, so a counted row and its drawn segment cannot disagree.
+     *
+     * <p>The shelter is the backstop the per-char veto in {@link #breakAllowedBefore} cannot be: a break
+     * placed on whitespace leaves the next row's actual start wherever the indent trim lands, so a
+     * non-starter can still be first after trimming. This pulls the whole non-starter run onto the end
+     * of the current row — it may draw a glyph or two past the available width, which the scissored
+     * draw path clips — and it strictly advances, so the loop-termination argument survives.
+     */
+    static int resolveWrapBreak(CharSequence text, int segmentStart, int index, int bestBreak) {
+        int breakIndex;
+        if (index == segmentStart) {
+            // Not even one column fit. Force the whole surrogate pair onto its own row instead of
+            // splitting it; returns 1 for every BMP column.
+            breakIndex = segmentStart + astralStep(text, segmentStart);
+        } else if (bestBreak > segmentStart) {
+            breakIndex = bestBreak;
+        } else {
+            // No legal break in the row. bestBreak and a "first allowed break in (segmentStart, index]"
+            // scan test the same k values through the same predicate, so -1 means none exists and the
+            // overflow point is already the right answer — just never between a surrogate pair.
+            breakIndex = pairSafeBreak(text, index);
+        }
+        int nextStart = trimWrappedIndent(text, breakIndex);
+        while (nextStart < text.length() && isNoStartRowPunct(text.charAt(nextStart))) {
+            nextStart++;
+        }
+        return nextStart;
+    }
+
+    /** Fails the class load if either 禁則 literal gains an ASCII char or a char the band gate would skip. */
+    private static void verifyKinsokuLiterals() {
+        verifyKinsokuLiteral(NO_START_ROW_PUNCT, "NO_START_ROW_PUNCT");
+        verifyKinsokuLiteral(NO_END_ROW_PUNCT, "NO_END_ROW_PUNCT");
+    }
+
+    private static void verifyKinsokuLiteral(String chars, String name) {
+        for (int i = 0; i < chars.length(); i++) {
+            char c = chars.charAt(i);
+            if (c <= 0x7F || !kinsokuBand(c)) {
+                throw new AssertionError(
+                    name + " must contain only chars above 0x7F inside kinsokuBand; index " + i + " is not");
+            }
+        }
     }
 
     private float measureText(String text) {
@@ -11292,8 +11533,29 @@ public class CodeEditor extends Widget {
         public float dottedUnderlineThickness = 1f;
         /** Distance of a dotted underline above the row bottom. */
         public float dottedUnderlineOffset = 3f;
-        /** How far the second pass of a fake bold is shifted right; 0 disables the overlay. */
+        /**
+         * How much wider a fake bold makes each stroke; 0 disables the overlay. A bold run is drawn once,
+         * then again in passes spread evenly over this distance on both sides of the base draw, so the union
+         * of the passes is one stroke this much heavier rather than two copies the eye can tell apart.
+         *
+         * <p>This is a stroke width, not a line-height fraction: a true bold cut at the same size widens a
+         * stroke by about half its own width (a 2px stem becomes 3px) and keeps the advance, the letter
+         * spacing and the plateau coverage unchanged, so the offset has to follow the stem and not the
+         * metrics around it. Sizing it off the line height instead makes the overlay two to three times too
+         * wide for the stroke it sits on, and the surplus ink has nowhere to go but into the neighbouring
+         * glyph's cell, which is what reads as 重影.
+         */
         public float fakeBoldOffset = 1f;
+        /**
+         * Coverage of each extra pass of a fake bold, 0..1; the base pass is always full strength.
+         *
+         * <p>The passes overlap the base draw, and a batch compositing a second glyph over a first saturates
+         * the overlap rather than adding to it, so passes at full coverage drive the plateau past what a true
+         * bold ever reaches and pile the surplus into the gap between adjacent glyphs. Held below 1 the
+         * plateau still tops out where the real face's does, while the softened edges keep the gutter
+         * between two bold characters from filling in.
+         */
+        public float fakeBoldPassAlpha = 0.6f;
         /**
          * Shear of a fake italic, in x per y around the baseline; 0 disables it.
          *
@@ -11426,6 +11688,7 @@ public class CodeEditor extends Widget {
             this.dottedUnderlineThickness = style.dottedUnderlineThickness;
             this.dottedUnderlineOffset = style.dottedUnderlineOffset;
             this.fakeBoldOffset = style.fakeBoldOffset;
+            this.fakeBoldPassAlpha = style.fakeBoldPassAlpha;
             this.fakeItalicShear = style.fakeItalicShear;
             this.decorationBackgroundInset = style.decorationBackgroundInset;
             this.gradientBandWidth = style.gradientBandWidth;
@@ -11841,7 +12104,13 @@ public class CodeEditor extends Widget {
                 style.diagnosticSquiggleAmplitude = Math.max(2f, Math.round(fontLineHeight * 0.12f));
                 style.diagnosticSquiggleThickness = style.underlineThickness;
                 style.diagnosticSquiggleOffset = style.underlineOffset;
-                style.fakeBoldOffset = Math.max(1f, Math.round(fontLineHeight * 0.08f));
+                // A true bold cut widens each stroke by about half the stem and keeps the advance, so this
+                // tracks the stem, not the line height: a 21px face has 2px stems, widens to 3px, and its
+                // line height happens to be 28, making the widthening very nearly lineHeight/28. Sized off
+                // the line height at 0.08 the overlay is twice as wide as that, and the surplus ink lands in
+                // the next glyph's cell, which is what reads as 重影.
+                style.fakeBoldOffset = Math.max(1f, Math.round(fontLineHeight * 0.036f));
+                style.fakeBoldPassAlpha = 0.6f;
                 style.gradientBandWidth = Math.max(4f, Math.round(fontLineHeight * 0.9f));
                 return style;
             }
