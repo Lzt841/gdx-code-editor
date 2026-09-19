@@ -2246,9 +2246,12 @@ public class CodeEditor extends Widget {
     public void setSelection(int startLine, int startColumn, int endLine, int endColumn) {
         int safeStartLine = clamp(startLine, 0, document.getLineCount() - 1);
         int safeEndLine = clamp(endLine, 0, document.getLineCount() - 1);
+        // Both edges obey the same rule as an editor-placed boundary: neither may fall inside a pair.
         selectionAnchorLine = safeStartLine;
-        selectionAnchorColumn = clamp(startColumn, 0, document.getLineLength(safeStartLine));
-        document.moveCursorTo(safeEndLine, endColumn);
+        selectionAnchorColumn = snapBoundaryOffSurrogate(safeStartLine,
+            clamp(startColumn, 0, document.getLineLength(safeStartLine)));
+        document.moveCursorTo(safeEndLine,
+            snapBoundaryOffSurrogate(safeEndLine, clamp(endColumn, 0, document.getLineLength(safeEndLine))));
         preferredCursorX = -1f;
         ensureCursorVisible();
         refreshBlink();
@@ -2262,7 +2265,9 @@ public class CodeEditor extends Widget {
     /** Moves the caret, clearing any selection, and scrolls it into view. */
     public void setCursorPosition(int line, int column) {
         clearSelection();
-        document.moveCursorTo(line, column);
+        int safeLine = clamp(line, 0, document.getLineCount() - 1);
+        document.moveCursorTo(safeLine,
+            snapBoundaryOffSurrogate(safeLine, clamp(column, 0, document.getLineLength(safeLine))));
         preferredCursorX = -1f;
         expandCollapsedRegionContainingLine(document.getCursorLine());
         ensureCursorVisible();
@@ -3824,7 +3829,6 @@ public class CodeEditor extends Widget {
     private void invalidateLayout() {
         analyzedVersion = -1;
         structureAnalyzedVersion = -1;
-        searchAnalyzedVersion = -1;
         legacyHighlightVersion = -1;
         highlightResyncFrom = 0;
         highlightStatesPopulatedThrough = 0;
@@ -3840,6 +3844,11 @@ public class CodeEditor extends Widget {
         wrapRowCountsWidth = -1;
         wrapRowCountsLineCount = -1;
         wrapRemeasurePending = false;
+        // The per-line match arrays outlive the version reset above, and refreshSearchMatches trusts a
+        // non-null entry as evidence the line was already searched. Without marking every line dirty, a
+        // bulk setText under an active search would keep serving the previous document's matches, and a
+        // replace clamped against the new line lengths would then delete the wrong span.
+        invalidateSearch();
         discardAllLineLayouts();
     }
 
@@ -6113,17 +6122,30 @@ public class CodeEditor extends Widget {
         while (search <= length && searchMatcher.find(search)) {
             int start = searchMatcher.start();
             int end = searchMatcher.end();
-            if (end == start) {
-                // A pattern such as "a*" can match nothing; without this the scan would never advance.
+            // java.util.regex sees chars, not codepoints: it will match either half of a supplementary
+            // pair on its own. Replacing that match takes one half and orphans the other into the line,
+            // where the font can only draw it as a notdef box. A match starting on the low surrogate is
+            // skipped entirely; one stopping between the halves is extended past the pair, so a replace
+            // takes the whole emoji. This mirrors how the editor's own boundaries never split a pair.
+            if (isTrailingSurrogate(text, start)) {
                 search = start + 1;
-            } else {
-                search = end;
-            }
-            if (start < from || end > to) {
                 continue;
             }
             if (end == start) {
+                // A pattern such as "a*" can match nothing; without this the scan would never advance.
+                search = start + 1;
+                // A zero-width hit one column into a pair would leave the scan between its halves.
+                if (isTrailingSurrogate(text, search)) {
+                    search++;
+                }
                 // Zero-length hits have nothing to highlight or replace.
+                continue;
+            }
+            if (isTrailingSurrogate(text, end)) {
+                end++;
+            }
+            search = end;
+            if (start < from || end > to) {
                 continue;
             }
             if (searchWholeWord && !isWholeWordMatch(text, start, end)) {
@@ -6415,7 +6437,10 @@ public class CodeEditor extends Widget {
             return;
         }
 
-        document.deleteRange(selection.startLine, selection.startColumn, selection.endLine, selection.endColumn);
+        // Deleting from between the halves of a pair orphans one surrogate half into the surrounding text.
+        document.deleteRange(
+            selection.startLine, snapBoundaryOffSurrogate(selection.startLine, selection.startColumn),
+            selection.endLine, snapBoundaryOffSurrogate(selection.endLine, selection.endColumn));
         clearSelection();
     }
 
@@ -6710,7 +6735,11 @@ public class CodeEditor extends Widget {
         if (selection == null) {
             return "";
         }
-        return document.getTextRange(selection.startLine, selection.startColumn, selection.endLine, selection.endColumn);
+        // A boundary between the halves of a pair hands the clipboard a lone surrogate, which pastes back
+        // as a box rather than the emoji the user selected.
+        return document.getTextRange(
+            selection.startLine, snapBoundaryOffSurrogate(selection.startLine, selection.startColumn),
+            selection.endLine, snapBoundaryOffSurrogate(selection.endLine, selection.endColumn));
     }
 
     private void selectWordAt(float x, float y) {
@@ -7182,6 +7211,11 @@ public class CodeEditor extends Widget {
         document.beginCompoundEdit();
         try {
             document.deleteRange(selection.startLine, selection.startColumn, selection.endLine, selection.endColumn);
+            // The drop column is arithmetic over the text before the deletion, so it is re-snapped against
+            // the text after it: a shift by a plain char count can land on a pair's low surrogate, and the
+            // dragged text would then be inserted between the two halves.
+            adjustedDropPoint = new CodePoint(adjustedDropPoint.line,
+                snapBoundaryOffSurrogate(adjustedDropPoint.line, adjustedDropPoint.column));
             document.moveCursorTo(adjustedDropPoint.line, adjustedDropPoint.column);
             selectionAnchorLine = adjustedDropPoint.line;
             selectionAnchorColumn = adjustedDropPoint.column;
@@ -9082,7 +9116,9 @@ public class CodeEditor extends Widget {
                 if (localX >= suffixX) {
                     float suffixLocalX = Math.max(0f, Math.min(localX - suffixX, suffixWidth));
                     int suffixColumn = findColumnForX(layoutFor(region.endLine), display.suffixStart, display.suffixEnd, suffixLocalX);
-                    return new CodePoint(region.endLine, suffixColumn);
+                    // Same rounding as the main branch, so the same correction — but only for a caret.
+                    return new CodePoint(region.endLine, imageHit ? suffixColumn
+                        : snapBoundaryOffSurrogate(region.endLine, layoutFor(region.endLine).text, suffixColumn));
                 }
             }
         }
@@ -9094,6 +9130,12 @@ public class CodeEditor extends Widget {
         int column = imageHit
             ? containingColumnForX(layout, start, end, segmentLocalX)
             : findColumnForX(layout, start, end, segmentLocalX);
+        if (!imageHit) {
+            // A caret or a selection edge never belongs inside a supplementary pair: its low surrogate's
+            // column is zero-wide, so the position past the pair is the same x and is the one that keeps
+            // the emoji whole.
+            column = snapBoundaryOffSurrogate(line, layout.text, column);
+        }
         return new CodePoint(line, column);
     }
 
@@ -10128,7 +10170,9 @@ public class CodeEditor extends Widget {
         // targetX is a distance from the text origin, so the indent comes off before the lookup — same
         // adjustment getCodePointAtRowX makes, and the reason Up/Down keeps its column across a wrap.
         int column = findColumnForX(layout, start, end, targetX - segmentIndentOffset(layout, segment));
-        document.moveCursorTo(line, column);
+        // Up/Down inherits the same rounding as a click, so it needs the same correction: a caret on the
+        // low surrogate is where a paste or a keystroke would later split the pair.
+        document.moveCursorTo(line, snapBoundaryOffSurrogate(line, column));
     }
 
     /**
@@ -10408,22 +10452,49 @@ public class CodeEditor extends Widget {
      * <p>Asks the provider about the high surrogate rather than assuming any surrogate pair is an image:
      * a non-BMP character the provider does not answer for is still two glyphs, and must keep its width.
      *
-     * <p>Known limitation: cursor movement still stops on the trailing column. It is zero-width, so the
-     * caret does not visibly move, but Left/Right takes two keystrokes to cross one emoji. Collapsing it
-     * fully is a document-layer change — the cursor column is a {@code CodeDocument} concept — and is
-     * out of scope for the rendering work this belongs to.
+     * <p>The trailing column still exists as an index — a {@code CodeDocument} column counts {@code char}s,
+     * so a supplementary character is two of them — but nothing places a boundary there now: see
+     * {@link #snapBoundaryOffSurrogate}, which moves any caret, selection edge, copy, cut or drop past the
+     * pair, since that is the same x and the one that keeps the pair whole.
      */
     private boolean isTrailingImageSurrogate(int line, CharSequence text, int index) {
         if (inlineImageProvider == null || passwordMode) {
             return false;
         }
-        if (index <= 0 || !Character.isLowSurrogate(text.charAt(index))) {
-            return false;
-        }
-        if (!Character.isHighSurrogate(text.charAt(index - 1))) {
+        if (!isTrailingSurrogate(text, index)) {
             return false;
         }
         return inlineImageProvider.imageAt(line, index - 1, text) != null;
+    }
+
+    /** Whether {@code index} is the low surrogate of a supplementary pair, however that pair is drawn. */
+    private static boolean isTrailingSurrogate(CharSequence text, int index) {
+        return index > 0 && index < text.length()
+            && Character.isLowSurrogate(text.charAt(index))
+            && Character.isHighSurrogate(text.charAt(index - 1));
+    }
+
+    /**
+     * The column a boundary at {@code column} should occupy, moved off the zero-width low surrogate of a
+     * supplementary pair if it landed on it.
+     *
+     * <p>The pair's image is drawn at its high surrogate and the low one takes no advance, so the boundary
+     * before the low surrogate and the one after it are the same x. A boundary kept between them splits
+     * the pair in everything that works in columns — a copy, a cut, a delete range — and the text that
+     * comes out carries a lone surrogate, which the editor can only draw as a notdef box. That is how an
+     * emoji selected and copied comes back as two boxes. Moving the boundary past the pair is visually the
+     * same position and keeps the emoji whole.
+     */
+    private int snapBoundaryOffSurrogate(int line, CharSequence text, int column) {
+        if (column <= 0 || column >= text.length()) {
+            return column;
+        }
+        return isTrailingImageSurrogate(line, text, column) ? column + 1 : column;
+    }
+
+    /** {@link #snapBoundaryOffSurrogate(int, CharSequence, int)} for a column on a document line. */
+    private int snapBoundaryOffSurrogate(int line, int column) {
+        return snapBoundaryOffSurrogate(line, document.getLine(line), column);
     }
 
     /**
