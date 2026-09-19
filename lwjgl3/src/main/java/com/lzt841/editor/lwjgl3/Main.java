@@ -80,6 +80,9 @@ import com.lzt841.editor.structure.PythonIndentCodeStructureProvider;
 
 /** Desktop entry point with an interactive debug panel for the code editor. */
 public class Main extends ApplicationAdapter {
+    /** The editor's text colour, baked into the emoji rasters and the style alike. */
+    private static final Color TEXT_COLOR = new Color(0.93f, 0.96f, 0.99f, 1f);
+
     private BitmapFont font;
     private Texture whitePixel;
     private Stage stage;
@@ -199,6 +202,7 @@ public class Main extends ApplicationAdapter {
     private int profileIndex;
     private final RichTextHighlighter richTextHighlighter = new RichTextHighlighter();
     private RichTextImageProvider imageProvider;
+    private EmojiImageProvider emojiProvider;
     private InlineImageListener imageListener;
     private String lastEventText = "Ready";
     private Table popupMenu;
@@ -249,6 +253,12 @@ public class Main extends ApplicationAdapter {
                     + "  len=" + event.getTextLength();
             }
         });
+        // The emoji provider is built once because the profiles swap the editor's one provider slot:
+        // whatever sample is loaded has to find an emoji provider already waiting, or a supplementary
+        // codepoint in it falls back to two notdef boxes. The rich-text profile wraps this one, which
+        // answers its own marker characters first and defers the rest here.
+        emojiProvider = new EmojiImageProvider(font, resolveDesktopFontFile(),
+            editor.getLineHeight(), TEXT_COLOR);
         applyProfile(initialProfileIndex());
 
         ScrollPane sidebar = createSidebar();
@@ -312,9 +322,13 @@ public class Main extends ApplicationAdapter {
 
     @Override
     public void dispose() {
-        // The atlas belongs to the rich-text profile and is not freed by anything else.
+        // The atlas belongs to the rich-text profile and the emoji font to every profile; neither is freed
+        // by anything else.
         if (imageProvider != null) {
             imageProvider.dispose();
+        }
+        if (emojiProvider != null) {
+            emojiProvider.dispose();
         }
         stage.dispose();
         whitePixel.dispose();
@@ -2203,15 +2217,19 @@ public class Main extends ApplicationAdapter {
         // image that is no longer installed.
         if (profile.richText) {
             if (imageProvider == null) {
-                imageProvider = new RichTextImageProvider(editor.getLineHeight());
+                // The wrapper answers for the demo's own marker characters and falls through to the emoji
+                // provider for everything else, so the two share the editor's one provider slot.
+                imageProvider = new RichTextImageProvider(editor.getLineHeight(), emojiProvider);
             }
             if (imageListener == null) {
                 imageListener = createImageListener();
             }
             editor.setInlineImageProvider(imageProvider);
             editor.setInlineImageListener(imageListener);
-        } else if (imageProvider != null) {
-            editor.setInlineImageProvider(null);
+        } else {
+            // Emoji are not a rich-text feature: any sample may contain them, and an uninstalled provider
+            // would leave a supplementary-plane codepoint as two notdef boxes.
+            editor.setInlineImageProvider(emojiProvider);
             editor.setInlineImageListener(null);
         }
         if (searchField != null) {
@@ -2285,7 +2303,7 @@ public class Main extends ApplicationAdapter {
             .themeColor(new Color(0.274f, 0.561f, 0.898f, 1f))
             .backgroundColor(new Color(0.051f, 0.074f, 0.102f, 1f))
             .gutterColor(new Color(0.060f, 0.086f, 0.115f, 1f))
-            .textColor(new Color(0.93f, 0.96f, 0.99f, 1f))
+            .textColor(TEXT_COLOR)
             .gutterTextColor(new Color(0.64f, 0.72f, 0.8f, 1f))
             .textBaselineOffset(-6f)
             .build();

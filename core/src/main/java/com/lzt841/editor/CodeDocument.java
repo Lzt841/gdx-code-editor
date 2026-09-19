@@ -196,7 +196,9 @@ public class CodeDocument {
 
     public void moveCursorLeft() {
         if (cursorColumn > 0) {
-            cursorColumn--;
+            // Step over a whole cluster, so the caret never lands between the two halves of a
+            // surrogate pair -- a position that is neither before nor after a character.
+            cursorColumn = graphemeStartBefore(lines.get(cursorLine), cursorColumn);
             resetMergeState();
             return;
         }
@@ -208,8 +210,9 @@ public class CodeDocument {
     }
 
     public void moveCursorRight() {
-        if (cursorColumn < lines.get(cursorLine).length()) {
-            cursorColumn++;
+        StringBuilder current = lines.get(cursorLine);
+        if (cursorColumn < current.length()) {
+            cursorColumn = graphemeEndAt(current, cursorColumn);
             resetMergeState();
             return;
         }
@@ -376,13 +379,223 @@ public class CodeDocument {
         afterEdit(EditKind.INSERT_NEWLINE, beforeLine, 1, 2);
     }
 
+    // ---- grapheme clusters ----------------------------------------------------
+
+    private static final int ZWJ = 0x200D;
+    private static final int KEYCAP = 0x20E3;
+    private static final int TAG_FIRST = 0xE0020;
+    private static final int TAG_LAST = 0xE007F;
+    private static final int VARIATION_SELECTOR_FIRST = 0xFE00;
+    private static final int VARIATION_SELECTOR_LAST = 0xFE0F;
+    private static final int EMOJI_MODIFIER_FIRST = 0x1F3FB;
+    private static final int EMOJI_MODIFIER_LAST = 0x1F3FF;
+    private static final int REGIONAL_INDICATOR_FIRST = 0x1F1E6;
+    private static final int REGIONAL_INDICATOR_LAST = 0x1F1FF;
+
+    /**
+     * Where the grapheme cluster ending at {@code end} starts.
+     *
+     * <p>A cluster is one user-perceived character: a base code point plus whatever extends it, and a
+     * code point above U+FFFF is two {@code char}s. This is what makes a 😀 disappear in one backspace
+     * and a 👨‍👩‍👧‍👦 in one backspace too, instead of leaving a stranded surrogate behind that renders as a
+     * second, separate box. It covers the forms an emoji actually takes: a surrogate pair, a skin-tone
+     * modifier, a variation selector, a keycap, a flag's two regional indicators, a tag sequence, and
+     * any chain of those glued together by zero-width joiners. Plain text is unaffected, because a
+     * cluster of one {@code char} backs up over exactly one {@code char}.
+     *
+     * @see #graphemeEndAt(CharSequence, int)
+     */
+    static int graphemeStartBefore(CharSequence text, int end) {
+        if (end <= 0) {
+            return 0;
+        }
+        int stop = Math.min(end, text.length());
+        // A flag is exactly two regional indicators and nothing extends it, and the pairs are counted
+        // from the start of the run, so it takes its own count rather than the base-and-extender scan.
+        if (isRegionalIndicator(text, stop - 2)) {
+            int start = stop - 2;
+            while (start >= 2 && isRegionalIndicator(text, start - 2)) {
+                start -= 2;
+            }
+            int indicators = (stop - start) / 2;
+            // An even run is whole flags, and the cluster is the trailing pair; an odd one ends on a lone
+            // indicator, which is a cluster of its own.
+            return stop - (indicators % 2 == 0 ? 4 : 2);
+        }
+        int index = stop;
+        while (index > 0) {
+            // What trails a base belongs to the base before it, so the extenders are absorbed first and
+            // the base only then; absorbing them the other way round would take the diacritic off the
+            // letter it modifies and put it on the one after.
+            while (index > 0) {
+                if (index >= 2 && isEmojiModifier(text, index - 2)) {
+                    index -= 2;
+                    continue;
+                }
+                int extended = extenderWidthBefore(text, index);
+                if (extended > 0) {
+                    index -= extended;
+                    continue;
+                }
+                break;
+            }
+            if (index > 0) {
+                index -= unitBackward(text, index);
+            }
+            // A joiner glues the base just consumed to the one behind it, so the cluster reaches back
+            // over the joiner for another base and its own extenders.
+            if (index > 0 && text.charAt(index - 1) == ZWJ) {
+                index -= 1;
+                continue;
+            }
+            break;
+        }
+        return index;
+    }
+
+    /**
+     * Where the grapheme cluster starting at {@code index} ends, the forward twin of
+     * {@link #graphemeStartBefore(CharSequence, int)}. Cursor-right and forward delete move by this, so
+     * they and backspace agree about where every cluster's edges are.
+     */
+    static int graphemeEndAt(CharSequence text, int index) {
+        int length = text.length();
+        if (index >= length) {
+            return length;
+        }
+        if (isRegionalIndicator(text, index)) {
+            int end = index;
+            while (end + 1 < length && isRegionalIndicator(text, end)) {
+                end += 2;
+            }
+            int indicators = (end - index) / 2;
+            return Math.min(length, index + (indicators >= 2 ? 4 : 2));
+        }
+        int at = index;
+        boolean consumedBase = false;
+        while (at < length) {
+            if (!consumedBase) {
+                at += unitForward(text, at);
+                consumedBase = true;
+                continue;
+            }
+            if (isEmojiModifier(text, at)) {
+                at += 2;
+                continue;
+            }
+            int extended = extenderWidthAt(text, at);
+            if (extended > 0) {
+                at += extended;
+                continue;
+            }
+            if (text.charAt(at) == ZWJ) {
+                at += 1;
+                consumedBase = false;
+                continue;
+            }
+            break;
+        }
+        return at;
+    }
+
+    /** The width in {@code char}s of the code unit ending at {@code end}: two for a surrogate pair. */
+    private static int unitBackward(CharSequence text, int end) {
+        if (end >= 2 && Character.isLowSurrogate(text.charAt(end - 1))
+            && Character.isHighSurrogate(text.charAt(end - 2))) {
+            return 2;
+        }
+        return 1;
+    }
+
+    /** The width in {@code char}s of the code unit at {@code index}: two for a surrogate pair. */
+    private static int unitForward(CharSequence text, int index) {
+        if (index + 1 < text.length() && Character.isHighSurrogate(text.charAt(index))
+            && Character.isLowSurrogate(text.charAt(index + 1))) {
+            return 2;
+        }
+        return 1;
+    }
+
+    /**
+     * Whether a code unit starting here is a supplementary code point in the emoji-modifier range, the
+     * skin tones that turn 👍 into 👍🏽. Modifiers extend the base before them.
+     */
+    private static boolean isEmojiModifier(CharSequence text, int index) {
+        return codePointAt(text, index, EMOJI_MODIFIER_FIRST, EMOJI_MODIFIER_LAST);
+    }
+
+    /** Whether a surrogate pair starting here is one regional indicator, half of a flag. */
+    private static boolean isRegionalIndicator(CharSequence text, int index) {
+        return codePointAt(text, index, REGIONAL_INDICATOR_FIRST, REGIONAL_INDICATOR_LAST);
+    }
+
+    private static boolean codePointAt(CharSequence text, int index, int first, int last) {
+        if (index < 0 || index + 1 >= text.length()) {
+            return false;
+        }
+        char high = text.charAt(index);
+        char low = text.charAt(index + 1);
+        if (!Character.isHighSurrogate(high) || !Character.isLowSurrogate(low)) {
+            return false;
+        }
+        int codePoint = Character.toCodePoint(high, low);
+        return codePoint >= first && codePoint <= last;
+    }
+
+    /**
+     * The width in {@code char}s of the extender code unit at {@code index}, or 0 if the code unit there
+     * does not extend the base before it. A tag character is a supplementary code point, so this is not
+     * just {@link #isExtender(char)}: the tag characters of a flag's tag sequence occupy plane 14 and
+     * each takes two {@code char}s.
+     */
+    private static int extenderWidthAt(CharSequence text, int index) {
+        if (index < 0 || index >= text.length()) {
+            return 0;
+        }
+        char first = text.charAt(index);
+        if (Character.isHighSurrogate(first) && index + 1 < text.length()
+            && Character.isLowSurrogate(text.charAt(index + 1))) {
+            return codePointAt(text, index, TAG_FIRST, TAG_LAST) ? 2 : 0;
+        }
+        return isExtender(first) ? 1 : 0;
+    }
+
+    /** The backward twin of {@link #extenderWidthAt(CharSequence, int)}. */
+    private static int extenderWidthBefore(CharSequence text, int end) {
+        if (end <= 0 || end > text.length()) {
+            return 0;
+        }
+        int width = unitBackward(text, end);
+        return extenderWidthAt(text, end - width);
+    }
+
+    /**
+     * Whether a BMP code point extends the base before it: a variation selector, a combining diacritic,
+     * or a keycap. Tag characters are deliberately excluded, because they are supplementary and belong to
+     * {@link #extenderWidthAt(CharSequence, int)}; the zero-width joiner is excluded too, because it is
+     * not an extension of its base but a glue between two bases, and each direction treats it explicitly.
+     */
+    private static boolean isExtender(char character) {
+        if (character >= VARIATION_SELECTOR_FIRST && character <= VARIATION_SELECTOR_LAST) {
+            return true;
+        }
+        if (character == KEYCAP) {
+            return true;
+        }
+        int type = Character.getType(character);
+        return type == Character.NON_SPACING_MARK || type == Character.ENCLOSING_MARK;
+    }
+
     public void backspace() {
         if (cursorColumn > 0) {
             int beforeLine = cursorLine;
             int beforeColumn = cursorColumn;
             recordUndo(EditKind.BACKSPACE, beforeLine, beforeColumn, beforeLine, beforeLine, 1);
-            lines.get(cursorLine).deleteCharAt(cursorColumn - 1);
-            cursorColumn--;
+            // A whole grapheme cluster goes at once. Removing one char of a surrogate pair would leave a
+            // stray half behind, and a 😀 that takes two presses is the bug this fixes.
+            int start = graphemeStartBefore(lines.get(cursorLine), cursorColumn);
+            lines.get(cursorLine).delete(start, cursorColumn);
+            cursorColumn = start;
             afterEdit(EditKind.BACKSPACE, beforeLine, 1, 1);
             return;
         }
@@ -409,7 +622,8 @@ public class CodeDocument {
             int beforeLine = cursorLine;
             int beforeColumn = cursorColumn;
             recordUndo(EditKind.DELETE_FORWARD, beforeLine, beforeColumn, beforeLine, beforeLine, 1);
-            current.deleteCharAt(cursorColumn);
+            int end = graphemeEndAt(current, cursorColumn);
+            current.delete(cursorColumn, end);
             afterEdit(EditKind.DELETE_FORWARD, beforeLine, 1, 1);
             return;
         }

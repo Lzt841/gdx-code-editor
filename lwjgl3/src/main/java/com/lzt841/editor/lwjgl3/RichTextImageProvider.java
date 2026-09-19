@@ -15,13 +15,19 @@ import com.lzt841.editor.InlineImageProvider;
  * in a large file. BMP symbols and real supplementary-plane emoji both go through it: the latter arrive
  * as surrogate pairs, and this provider answers from the high surrogate, which is what makes the pair
  * collapse into one column.
+ *
+ * <p>Everything this has no tile for falls through to the {@link EmojiImageProvider}, which rasterises
+ * real glyphs from an emoji font; the two share the editor's one provider slot without it having to know
+ * there are two.
  */
 public class RichTextImageProvider implements InlineImageProvider {
     private final TextureRegion[] tiles;
     private final float size;
+    private final EmojiImageProvider emoji;
 
-    public RichTextImageProvider(float lineHeight) {
+    public RichTextImageProvider(float lineHeight, EmojiImageProvider emoji) {
         this.size = lineHeight * 0.8f;
+        this.emoji = emoji;
         this.tiles = loadTiles();
     }
 
@@ -69,7 +75,8 @@ public class RichTextImageProvider implements InlineImageProvider {
             tile = tileForCharacter(character);
         }
         if (tile < 0) {
-            return null;
+            // Not one of the demo tiles; the emoji font gets a chance at it instead.
+            return emoji.imageAt(line, column, lineText);
         }
         // The editor centres the image on the text's own ink band, so a square tile the size it asked for
         // already frames the letters beside it; an offset of 0 is the right answer for an emoji.

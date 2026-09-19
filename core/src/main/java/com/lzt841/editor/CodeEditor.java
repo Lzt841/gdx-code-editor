@@ -356,8 +356,6 @@ public class CodeEditor extends Widget {
     private final Color scratchTintColor = new Color();
     /** Sampled colour of the current gradient band; reused because a gradient run draws one per band. */
     private final Color scratchGradientColor = new Color();
-    /** The base colour of a bold run with one extra pass's coverage applied; reused once per pass. */
-    private final Color scratchTextColor = new Color();
     /**
      * The three matrices a fake italic needs: the projection as it was, the same projection sheared, and
      * the shear itself. All three are reused rather than allocated per italic run.
@@ -7943,17 +7941,16 @@ public class CodeEditor extends Widget {
         float boldOffset = style.fakeBoldOffset * zoomScale;
         boolean bold = runStyle.hasFlags(CodeTextStyle.BOLD) && boldOffset != 0f;
         if (runStyle.hasFlags(CodeTextStyle.GRADIENT) && runStyle.gradientEndColor != null) {
-            drawGradientTextRun(batch, layout, runStart, runEnd, runX, baseline, color, runStyle, 1f);
+            drawGradientTextRun(batch, layout, runStart, runEnd, runX, baseline, color, runStyle);
             if (bold) {
                 // The extra passes must repeat the gradient rather than draw the run in one flat colour:
                 // a solid overlay a couple of pixels off covers the bands at every glyph's left edge, which
                 // leaves a gradient heading looking neither bold nor gradient.
                 int passes = passCount(boldOffset);
-                float passAlpha = passAlpha(passes);
                 for (int i = 1; i <= passes; i++) {
                     drawGradientTextRun(
                         batch, layout, runStart, runEnd, runX + passOffset(boldOffset, passes, i), baseline,
-                        color, runStyle, passAlpha
+                        color, runStyle
                     );
                 }
             }
@@ -7964,31 +7961,33 @@ public class CodeEditor extends Widget {
                 // A real bold face is not a regular glyph with a second one laid beside it: it is one
                 // heavier stroke, wider than the regular by about half the stem and symmetric about it, with
                 // the same plateau coverage and the same advance. Reproducing that from a single-weight font
-                // needs three things the older rightward overlay did not do.
+                // needs two things the older rightward overlay did not do.
                 //
                 // The passes are spread over the offset on both sides of the base draw rather than all to
                 // the right, so both edges harden the way the real face's do; a purely rightward copy leaves
-                // the left edge soft and drags a tail off the right. They are held at most a pixel apart, so
-                // the union of the copies is continuous and reads as one stroke instead of resolving into
-                // 重影. And each is drawn at reduced coverage, because the batch composites a pass over the
-                // ones before it rather than adding to them: full-coverage passes drive the plateau past
-                // anything a true bold reaches, and the surplus has nowhere to go but into the next glyph's
-                // cell, which fuses adjacent characters.
+                // the left edge soft and drags a tail off the right. And they are held at most a pixel apart,
+                // so the union of the copies is continuous and reads as one stroke instead of resolving into
+                // 重影.
+                //
+                // The passes are drawn at the same strength as the base, deliberately. Dimming them does not
+                // hold the plateau down -- a batch compositing one glyph over another saturates at full
+                // coverage, so overlapping passes cap exactly where a true bold face's own plateau caps -- and
+                // it does not help the seam between two adjacent bold glyphs either, because the gutter's dip
+                // contrast is unchanged by it: the peaks and the dip rise together. What dimming does do is
+                // pull the colour of the fringe toward the background, since under straight-alpha compositing
+                // a pixel at coverage c renders as text*c + bg*(1-c), and a fringe held at 0.44 coverage
+                // instead of 0.60 is visibly a dark halo hugging the glyph. That reads as 黑描边.
                 //
                 // The font is linearly filtered and does not snap x to integers, so a fractional offset
                 // blends into the edge instead of painting a second one.
                 int passes = passCount(boldOffset);
-                float passAlpha = passAlpha(passes);
-                // font.draw does not reset the colour, so one setColor at the reduced coverage covers every
-                // pass; it is restored after the loop so the dimmed colour does not outlive this run.
-                style.font.setColor(scratchTextColor.set(color).mul(1f, 1f, 1f, passAlpha));
+                // font.draw does not reset the colour, so one setColor covers every pass.
                 for (int i = 1; i <= passes; i++) {
                     style.font.draw(
                         batch, layout.text, runX + passOffset(boldOffset, passes, i), baseline,
                         runStart, runEnd, 0f, Align.left, false
                     );
                 }
-                style.font.setColor(color);
             }
         }
     }
@@ -8001,15 +8000,6 @@ public class CodeEditor extends Widget {
      */
     private static int passCount(float boldOffset) {
         return Math.max(2, (int) Math.ceil(boldOffset / BOLD_PASS_SPACING));
-    }
-
-    /**
-     * Coverage of each extra pass. Splitting the offset into more passes multiplies how much ink they lay
-     * down in total, so the coverage is scaled back with the count to keep the plateau where a true bold
-     * face's is; at two passes this is just {@link CodeTextStyle#fakeBoldPassAlpha}.
-     */
-    private float passAlpha(int passes) {
-        return style.fakeBoldPassAlpha * 2f / passes;
     }
 
     /**
@@ -8093,8 +8083,7 @@ public class CodeEditor extends Widget {
         float runX,
         float baseline,
         Color startColor,
-        CodeTextStyle runStyle,
-        float alphaScale
+        CodeTextStyle runStyle
     ) {
         float[] widths = layout.prefixWidths;
         String text = layout.text;
@@ -8128,10 +8117,7 @@ public class CodeEditor extends Widget {
             }
             // Sample at the band's middle so each drawn segment is the colour its centre should have.
             float sample = (band + 0.5f) / bandCount;
-            // The scale is applied after the lerp because Color.lerp interpolates alpha too, so dimming
-            // beforehand would be undone again toward the gradient's end colour.
-            style.font.setColor(
-                scratchGradientColor.set(startColor).lerp(endColor, sample).mul(1f, 1f, 1f, alphaScale));
+            style.font.setColor(scratchGradientColor.set(startColor).lerp(endColor, sample));
             // Each band starts where the previous one ended in x, not at the run's left edge — the
             // prefix widths are the only source of truth for where a column is, so a band that skipped
             // an over-wide glyph must skip its width too, and the draw call has no other way to know.
@@ -11547,16 +11533,6 @@ public class CodeEditor extends Widget {
          */
         public float fakeBoldOffset = 1f;
         /**
-         * Coverage of each extra pass of a fake bold, 0..1; the base pass is always full strength.
-         *
-         * <p>The passes overlap the base draw, and a batch compositing a second glyph over a first saturates
-         * the overlap rather than adding to it, so passes at full coverage drive the plateau past what a true
-         * bold ever reaches and pile the surplus into the gap between adjacent glyphs. Held below 1 the
-         * plateau still tops out where the real face's does, while the softened edges keep the gutter
-         * between two bold characters from filling in.
-         */
-        public float fakeBoldPassAlpha = 0.6f;
-        /**
          * Shear of a fake italic, in x per y around the baseline; 0 disables it.
          *
          * <p>0.2 is a close match for a true italic cut, and 0.3 leans harder for a display look.
@@ -11688,7 +11664,6 @@ public class CodeEditor extends Widget {
             this.dottedUnderlineThickness = style.dottedUnderlineThickness;
             this.dottedUnderlineOffset = style.dottedUnderlineOffset;
             this.fakeBoldOffset = style.fakeBoldOffset;
-            this.fakeBoldPassAlpha = style.fakeBoldPassAlpha;
             this.fakeItalicShear = style.fakeItalicShear;
             this.decorationBackgroundInset = style.decorationBackgroundInset;
             this.gradientBandWidth = style.gradientBandWidth;
@@ -12110,7 +12085,6 @@ public class CodeEditor extends Widget {
                 // the line height at 0.08 the overlay is twice as wide as that, and the surplus ink lands in
                 // the next glyph's cell, which is what reads as 重影.
                 style.fakeBoldOffset = Math.max(1f, Math.round(fontLineHeight * 0.036f));
-                style.fakeBoldPassAlpha = 0.6f;
                 style.gradientBandWidth = Math.max(4f, Math.round(fontLineHeight * 0.9f));
                 return style;
             }
