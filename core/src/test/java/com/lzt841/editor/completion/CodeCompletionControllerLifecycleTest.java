@@ -229,6 +229,65 @@ public class CodeCompletionControllerLifecycleTest {
         return Array.with(CodeCompletionItem.of("absolute"));
     }
 
+    @Test public void unchangedSnippetBodyStillStartsItsPlaceholder() {
+        int version = editor.getDocumentVersion();
+        controller.triggerManually();
+        responses.first().complete(Array.with(CodeCompletionItem.snippet("ab", "${1:ab}$0", "placeholder")));
+
+        assertTrue(controller.acceptSelected());
+
+        assertClosed();
+        assertEquals("abc", editor.getText());
+        assertEquals(new CodeEditorTextRange(0, 0, 0, 2), editor.getSelection());
+        assertNotNull(controller.getSnippetSession());
+        assertEquals(version, editor.getDocumentVersion());
+        assertEquals(0, editor.getUndoEntryCount());
+        controller.uninstall();
+    }
+
+    @Test public void unchangedSnippetCanMoveToAnInteriorFinalStopAndReportSuccess() {
+        int version = editor.getDocumentVersion();
+        controller.triggerManually();
+        responses.first().complete(Array.with(CodeCompletionItem.snippet("ab", "a$0b", "final stop")));
+
+        assertTrue(controller.acceptSelected());
+
+        assertClosed();
+        assertEquals("abc", editor.getText());
+        assertEquals(1, editor.getCursorColumn());
+        assertNull(controller.getSnippetSession());
+        assertEquals(version, editor.getDocumentVersion());
+        assertEquals(0, editor.getUndoEntryCount());
+    }
+
+    @Test public void unchangedSnippetWithNoStopsStillReportsAcceptance() {
+        int version = editor.getDocumentVersion();
+        controller.triggerManually();
+        responses.first().complete(Array.with(CodeCompletionItem.snippet("ab", "ab", "plain snippet")));
+
+        assertTrue(controller.acceptSelected());
+
+        assertClosed();
+        assertEquals("abc", editor.getText());
+        assertEquals(2, editor.getCursorColumn());
+        assertNull(controller.getSnippetSession());
+        assertEquals(version, editor.getDocumentVersion());
+        assertEquals(0, editor.getUndoEntryCount());
+    }
+
+    @Test public void aFilterEditingTheDocumentDoesNotCountAsSnippetAcceptance() {
+        controller.triggerManually();
+        responses.first().complete(Array.with(CodeCompletionItem.snippet("absolute", "absolute", "plain snippet")));
+        editor.setInputFilter((source, character) -> { source.setText("host edit"); return true; });
+
+        assertFalse(controller.acceptSelected());
+
+        assertClosed();
+        assertEquals("host edit", editor.getText());
+        assertNull(controller.getSnippetSession());
+        assertEquals(0, editor.getUndoEntryCount());
+    }
+
     private void setBlockedMode(int mode, boolean blocked) {
         if (mode == 0) {
             editor.setReadOnly(blocked);

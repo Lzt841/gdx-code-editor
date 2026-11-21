@@ -1,5 +1,82 @@
 # Changelog
 
+## Unreleased
+
+## v1.4.0 — 2026-11-22
+
+### Added
+
+- Optional diagnostic quick fixes and current-document code actions with immutable snapshots,
+  asynchronous discovery, full-text preview, explicit application and one named undo step. A scoped
+  extension offers Alt+Enter discovery and an unbound command for a unique preferred action.
+- Generic code-based diagnostic replacement rules, plus an independent diagnostic-batch revision and
+  listener which invalidate old actions even when a fresh analysis describes unchanged text.
+- An optional document/selection formatting provider and controller with immutable snapshots,
+  asynchronous result delivery, cancellation, exact range validation and one named undo step.
+  Scoped formatting commands integrate with the command palette and Ctrl/Command+Alt+L.
+- A strict token-preserving JSON formatter which edits whitespace gaps, honors indentation options,
+  retains numeric and string spellings, and rejects invalid input or excessive nesting atomically.
+- A guarded exact-batch overload which checks cancellation/owner lifetime after input filtering,
+  preventing a cancelled or unloaded formatter from committing its pending edits.
+- An optional go-to-line/column dialog with 1-based input validation, Ctrl/Command+G and command-palette
+  integration, fold expansion, keyboard/touch actions and scoped focus/lifecycle cleanup. Desktop and
+  Android examples expose the dialog through an action button.
+- An optional line-comment extension with configurable prefixes, Ctrl/Command+/, command-palette
+  integration, selection-direction preservation and one named undo step. Desktop and Android
+  examples select the prefix for their current language and expose an action button.
+- An optional Unicode-aware word-editing extension with Ctrl-based Windows/Linux shortcuts,
+  Option-based macOS shortcuts, selection extension, word deletion and named undo.
+- Unicode-aware document/offset mapping with a lazy Fenwick line-length index and incremental
+  single-line updates, plus a repeatable position-mapping benchmark task.
+- Exact saved-content tracking through `isDirty()` and `markSaved()`, including asynchronous save
+  snapshots, newline normalization and returning to a saved state through undo/redo.
+- An implementation review with prioritized follow-up work for platform input validation,
+  search performance and additional language tools.
+
+### Fixed
+
+- Regex replacements now expand group references before filtering the actual inserted text.
+  Replace All filters each insertion once, including independent calls to stateful filters.
+- Identical range, batch and search replacements preserve history/version instead of deleting and
+  reinserting unchanged text; batch caret tracking skips those edits. Replace All counts changed matches.
+- Range, batch and search replacement preflight now rejects stale coordinates or a newly blocked
+  editor after input-filter callbacks.
+- Snippets can navigate placeholders and final stops over identical text, including empty stops,
+  without rewriting the body or discarding redo. Direct starts reject blocked modes and invalid ranges.
+- Completion distinguishes a successfully finished snippet from a rejected insertion, so an unrelated
+  document change inside an input filter is not reported as successful snippet acceptance.
+- Snippet insertion normalizes expanded CRLF/CR text and placeholder offsets together, snapshots and
+  validates parsed templates, and rejects the complete insertion when input filtering removes a
+  character. Insertion listeners see the first selected stop; callback rewrites end stale sessions.
+- Snippet mirrors use one exact batch, keeping later stops and the edited caret aligned across
+  multiline, adjacent and empty fields. Editing any copy also updates affected ancestor mirrors;
+  overlapping child/parent changes are merged before filtering. A rejected mirror leaves every other
+  copy unchanged and ends navigation while preserving the user's edit.
+- Snippets use exact replacement spans to distinguish repeated text and remove overwritten child
+  stops while retaining surviving copies. Invalid overlaps and circular parent/mirror dependencies
+  reject insertion before editing; nested final stops follow their parent's replacement endpoint.
+- Deferred content notifications preserve exact splice coordinates and their previous document
+  version, including same-frame typing and reentrant callbacks. Snippet navigation flushes pending
+  input before switching stops, follows independent surrounding edits, and ends on stale events.
+
+### Examples and validation
+
+- Updated desktop and Android examples with line-comment and go-to-line actions, plus README
+  integration examples and lifecycle documentation for the optional extensions and providers.
+- Expanded the regression suite from 237 to 526 tests across 45 test classes, with no failures,
+  errors or skipped tests. Coverage includes snippets, exact edits, save points, Unicode mapping,
+  diagnostics, code actions, formatting, commands and extension lifecycle/reentry.
+- Verified core library packaging, desktop compilation and Android debug compilation. GUI rendering
+  and Android device behavior have not been manually verified for this release.
+
+### Distribution
+
+- Git tag and JitPack dependency version: `v1.4.0`.
+- Gradle publication version: `1.4.0`.
+- Release assets include the core library JAR, source JAR and SHA-256 checksums.
+- New editing extensions remain opt-in; native keymap defaults and existing provider integrations
+  remain available. This release applies code actions only to the current document.
+
 ## v1.3.0 — 2026-11-21
 
 ### Added

@@ -31,6 +31,7 @@ import com.lzt841.editor.extensions.CodeCommandPaletteExtension;
 import com.lzt841.editor.extensions.CodeStandardCommandsExtension;
 import com.lzt841.editor.extensions.CodeTextEditingExtension;
 import com.lzt841.editor.extensions.CodeLineEditingExtension;
+import com.lzt841.editor.extensions.CodeCommentEditingExtension;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -583,6 +584,25 @@ public class CodeCommandPaletteTest {
             assertEquals(1, f.editor.getUndoEntryCount());
             assertTrue(f.editor.undo());
             assertEquals("a\nbeta\ngamma\nz", f.editor.getText());
+        });
+    }
+
+    @Test public void lineCommentCommandKeepsTheReversedSelectionAfterPaletteFocusRestoration() {
+        onGdx(f -> {
+            f.editor.setText("alpha\nbeta\ngamma");
+            f.editor.setSelection(1, 3, 0, 1);
+            f.editor.getExtensions().install(new CodeCommentEditingExtension());
+            assertTrue(f.palette.open("comments toggle line"));
+            assertEquals(1, f.palette.getResultCount());
+            assertTrue(f.palette.executeSelected());
+            assertSame(f.editor, f.stage.getKeyboardFocus());
+            assertEquals("// alpha\n// beta\ngamma", f.editor.getText());
+            assertEquals(new CodeEditorTextRange(0, 4, 1, 6), f.editor.getSelection());
+            assertEquals(0, f.editor.getCursorLine());
+            assertEquals(4, f.editor.getCursorColumn());
+            assertEquals(1, f.editor.getUndoEntryCount());
+            assertTrue(f.editor.undo());
+            assertEquals("alpha\nbeta\ngamma", f.editor.getText());
         });
     }
 

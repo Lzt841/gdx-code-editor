@@ -27,6 +27,16 @@ public class CodeEditorContentChangeEvent {
     public final int removedLineCount;
     /** Lines present in the affected range after the edit. */
     public final int insertedLineCount;
+    /**
+     * Exact replaced span in pre-edit coordinates, or null when the notification combines edits that
+     * cannot be described by one known splice. Text shared with the replacement remains part of this
+     * span, unlike a minimal text diff. No document-wide offset conversion or text snapshot is needed.
+     */
+    public final CodeEditorTextRange replacedRange;
+    /** Inserted span in post-edit coordinates; null whenever {@link #replacedRange} is null. */
+    public final CodeEditorTextRange insertedRange;
+    /** Document version at the previous notification, or -1 if not provided. */
+    public final int previousDocumentVersion;
 
     private final CodeEditor editor;
 
@@ -41,6 +51,24 @@ public class CodeEditorContentChangeEvent {
         int removedLineCount,
         int insertedLineCount
     ) {
+        this(editor, type, documentVersion, cursorLine, cursorColumn, startLine, endLine,
+            removedLineCount, insertedLineCount, -1, null, null);
+    }
+
+    CodeEditorContentChangeEvent(
+        CodeEditor editor,
+        CodeEditorContentChangeType type,
+        int documentVersion,
+        int cursorLine,
+        int cursorColumn,
+        int startLine,
+        int endLine,
+        int removedLineCount,
+        int insertedLineCount,
+        int previousDocumentVersion,
+        CodeEditorTextRange replacedRange,
+        CodeEditorTextRange insertedRange
+    ) {
         this.editor = editor;
         this.type = type == null ? CodeEditorContentChangeType.UNKNOWN : type;
         this.documentVersion = documentVersion;
@@ -50,10 +78,15 @@ public class CodeEditorContentChangeEvent {
         this.endLine = endLine;
         this.removedLineCount = removedLineCount;
         this.insertedLineCount = insertedLineCount;
+        this.replacedRange = replacedRange;
+        this.insertedRange = insertedRange;
+        this.previousDocumentVersion = previousDocumentVersion;
     }
 
     /**
-     * The whole document text.
+     * The whole document text, read from the live editor when this method is called.
+     * Later or reentrant edits are reflected by this accessor; it does not retain an immutable
+     * snapshot of the event's document version.
      *
      * <p>Allocates a string the size of the document on every call, so do not call it from a listener
      * that runs on every keystroke. Read {@link #getChangedText()} or the editor's line accessors
@@ -63,7 +96,7 @@ public class CodeEditorContentChangeEvent {
         return editor == null ? "" : editor.getText();
     }
 
-    /** Text of the changed lines only, joined with newlines. */
+    /** Text of the currently present lines in the recorded change range, joined with newlines. */
     public String getChangedText() {
         if (editor == null) {
             return "";

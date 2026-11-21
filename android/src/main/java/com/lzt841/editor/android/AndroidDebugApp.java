@@ -40,9 +40,12 @@ import com.lzt841.editor.input.CodeEditorInteractionMode;
 import com.lzt841.editor.search.CodeSearchBar;
 import com.lzt841.editor.commands.CodeCommandPalette.CodeCommandPaletteStyle;
 import com.lzt841.editor.extensions.CodeCommandPaletteExtension;
+import com.lzt841.editor.extensions.CodeGoToLineExtension;
+import com.lzt841.editor.navigation.CodeGoToLineDialog.CodeGoToLineDialogStyle;
 import com.lzt841.editor.extensions.CodeCompletionExtension;
 import com.lzt841.editor.extensions.CodeSnippetExtension;
 import com.lzt841.editor.extensions.CodeLineEditingExtension;
+import com.lzt841.editor.extensions.CodeCommentEditingExtension;
 import com.lzt841.editor.completion.CodeCompletionItem;
 import com.lzt841.editor.extensions.CodeStandardCommandsExtension;
 import com.lzt841.editor.extensions.CodeTextEditingExtension;
@@ -65,6 +68,7 @@ public class AndroidDebugApp extends ApplicationAdapter {
     private Label eventLabel;
     private DemoProfile[] profiles;
     private int profileIndex;
+    private final CodeCommentEditingExtension commentEditingExtension = new CodeCommentEditingExtension();
     private String lastEvent = "Ready";
     private TextButton sampleButton;
     private TextButton wrapButton;
@@ -154,12 +158,19 @@ public class AndroidDebugApp extends ApplicationAdapter {
         editor.getExtensions().install(new CodeStandardCommandsExtension());
         editor.getExtensions().install(new CodeTextEditingExtension());
         editor.getExtensions().install(new CodeLineEditingExtension());
+        editor.getExtensions().install(commentEditingExtension);
         editor.getExtensions().install(new CodeSnippetExtension("demo.snippets",
             CodeCompletionItem.snippet("fori", "for (int ${1:i} = 0; $1 < ${2:count}; $1++) {\n\t$0\n}", "for loop"),
             CodeCompletionItem.snippet("ifelse", "if (${1:condition}) {\n\t$2\n} else {\n\t$0\n}", "if / else"),
             CodeCompletionItem.snippet("sout", "System.out.println(${1:value});$0", "print value")));
         editor.getExtensions().install(new CodeCompletionExtension());
         editor.getExtensions().install(paletteExtension);
+        CodeGoToLineDialogStyle jumpStyle = new CodeGoToLineDialogStyle(fieldStyle, buttonStyle, labelStyle);
+        jumpStyle.window.background = panel;
+        jumpStyle.maxWidth = dp(480f);
+        jumpStyle.edgeMargin = dp(12f);
+        jumpStyle.controlHeight = dp(44f);
+        editor.getExtensions().install(new CodeGoToLineExtension(jumpStyle));
         paletteExtension.getPalette().setExecutionListener((command, handled) ->
             lastEvent = command.label + (handled ? ": completed" : ": not applied"));
 
@@ -308,6 +319,12 @@ public class AndroidDebugApp extends ApplicationAdapter {
             }
         })).colspan(2);
         controlsTable.row();
+        controlsTable.add(button("Go to Line / Column", buttonStyle, () -> {
+            if (!editor.getCommands().execute(CodeGoToLineExtension.SHOW)) {
+                lastEvent = "Enable the editor and leave password mode to go to a line.";
+            }
+        })).colspan(2);
+        controlsTable.row();
         controlsTable.add(button("Show Completions", buttonStyle, () -> {
             if (!editor.getCommands().execute(CodeCompletionExtension.TRIGGER)) {
                 lastEvent = "Completion requires a writable editor outside password mode.";
@@ -324,6 +341,12 @@ public class AndroidDebugApp extends ApplicationAdapter {
             lastEvent = changed ? "Deleted current/selected lines" : "Line deletion was not applied";
             if (changed) stage.setKeyboardFocus(editor);
         }));
+        controlsTable.row();
+        controlsTable.add(button("Toggle Line Comment", buttonStyle, () -> {
+            boolean changed = editor.getCommands().execute(CodeCommentEditingExtension.TOGGLE_LINE_COMMENT);
+            lastEvent = changed ? "Toggled current/selected line comments" : "Line comment was not applied";
+            if (changed) stage.setKeyboardFocus(editor);
+        })).colspan(2);
         controlsTable.row();
         controlsTable.add(quickTitle).colspan(2).left().padTop(dp(2f)).padBottom(dp(2f));
         controlsTable.row();
@@ -605,6 +628,8 @@ public class AndroidDebugApp extends ApplicationAdapter {
         hidePopupMenu();
         profileIndex = index;
         DemoProfile profile = profiles[index];
+        commentEditingExtension.setLineCommentPrefix("Python".equals(profile.name) ? "#"
+            : "Java".equals(profile.name) ? "//" : null);
         editor.setHighlighter(profile.highlighter);
         editor.setStructureProvider(profile.structureProvider);
         editor.clearSearchRange();

@@ -75,9 +75,12 @@ import com.lzt841.editor.input.CodeEditorInteractionMode;
 import com.lzt841.editor.search.CodeSearchBar;
 import com.lzt841.editor.extensions.CodeTextEditingExtension;
 import com.lzt841.editor.extensions.CodeCommandPaletteExtension;
+import com.lzt841.editor.extensions.CodeGoToLineExtension;
+import com.lzt841.editor.navigation.CodeGoToLineDialog.CodeGoToLineDialogStyle;
 import com.lzt841.editor.extensions.CodeCompletionExtension;
 import com.lzt841.editor.extensions.CodeSnippetExtension;
 import com.lzt841.editor.extensions.CodeLineEditingExtension;
+import com.lzt841.editor.extensions.CodeCommentEditingExtension;
 import com.lzt841.editor.extensions.CodeStandardCommandsExtension;
 import com.lzt841.editor.commands.CodeCommandPalette.CodeCommandPaletteStyle;
 import com.lzt841.editor.structure.BraceCodeStructureProvider;
@@ -205,6 +208,7 @@ public class Main extends ApplicationAdapter {
 
     private DemoProfile[] profiles;
     private int profileIndex;
+    private final CodeCommentEditingExtension commentEditingExtension = new CodeCommentEditingExtension();
     private final RichTextHighlighter richTextHighlighter = new RichTextHighlighter();
     private RichTextImageProvider imageProvider;
     private EmojiImageProvider emojiProvider;
@@ -249,7 +253,11 @@ public class Main extends ApplicationAdapter {
         commandPaletteExtension = new CodeCommandPaletteExtension(paletteStyle);
         editor.getExtensions().install(new CodeStandardCommandsExtension());
         editor.getExtensions().install(new CodeLineEditingExtension());
+        editor.getExtensions().install(commentEditingExtension);
         editor.getExtensions().install(commandPaletteExtension);
+        CodeGoToLineDialogStyle jumpStyle = new CodeGoToLineDialogStyle(debugTextFieldStyle, debugButtonStyle, debugLabelStyle);
+        jumpStyle.window.background = popupBackground;
+        editor.getExtensions().install(new CodeGoToLineExtension(jumpStyle));
         commandPaletteExtension.getPalette().setExecutionListener((command, handled) ->
             lastEventText = command.label + (handled ? ": completed" : ": not applied"));
         DemoCompletionProvider demoCompletion = new DemoCompletionProvider();
@@ -1012,9 +1020,18 @@ public class Main extends ApplicationAdapter {
             }
         }));
         sidebar.row();
+        sidebar.add(createActionButton("Go to Line / Column (Ctrl-G)", () -> {
+            if (!editor.getCommands().execute(CodeGoToLineExtension.SHOW)) {
+                lastEventText = "Go to Line requires an enabled editor outside password mode.";
+            }
+        }));
+        sidebar.row();
         sidebar.add(standardCommandsButton);
         sidebar.row();
         sidebar.add(lineEditingExtensionButton);
+        sidebar.row();
+        sidebar.add(createActionButton("Toggle Line Comment (Ctrl-/)",
+            () -> executeExtensionCommand(CodeCommentEditingExtension.TOGGLE_LINE_COMMENT)));
         sidebar.row();
         sidebar.add(textEditingExtensionButton);
         sidebar.row();
@@ -2215,6 +2232,8 @@ public class Main extends ApplicationAdapter {
     private void applyProfile(int index) {
         profileIndex = index;
         DemoProfile profile = profiles[profileIndex];
+        commentEditingExtension.setLineCommentPrefix("Python".equals(profile.name) ? "#"
+            : "Java".equals(profile.name) || "Kotlin".equals(profile.name) || "JavaScript".equals(profile.name) ? "//" : null);
         editor.setHighlighter(profile.highlighter);
         editor.setStructureProvider(profile.structureProvider);
         editor.clearSearchRange();

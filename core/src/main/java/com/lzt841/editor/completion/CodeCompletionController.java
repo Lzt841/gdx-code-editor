@@ -400,13 +400,12 @@ public class CodeCompletionController {
      */
     private boolean acceptSnippet(CodeCompletionItem item, CodeEditorTextRange range) {
         cancelSnippet();
-        int versionBefore = editor.getDocumentVersion();
-        CodeSnippetSession session = CodeSnippetSession.start(editor, item.insertText, range);
+        CodeSnippetSession session = CodeSnippetSession.startForCompletion(editor, item.insertText, range);
         if (session == null) {
-            // Either the insert failed or the snippet had no stops. The version tells which, and only
-            // the first is a failure to report.
-            return editor.getDocumentVersion() != versionBefore;
+            return false;
         }
+        // Success can consist solely of selecting existing text or visiting $0 without any edit.
+        if (!session.isActive()) return true;
         snippetSession = session;
         session.setFinishListener(new CodeSnippetSession.FinishListener() {
             @Override

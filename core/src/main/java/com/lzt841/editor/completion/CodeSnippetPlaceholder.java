@@ -18,11 +18,18 @@ public class CodeSnippetPlaceholder {
     public final int start;
     /** Exclusive offset into the parsed insert text. */
     public final int end;
+    /** Enclosing placeholder's array index, or -1 for a top-level/manual stop. */
+    final int parent;
 
     public CodeSnippetPlaceholder(int index, int start, int end) {
+        this(index, start, end, -1);
+    }
+
+    CodeSnippetPlaceholder(int index, int start, int end, int parent) {
         this.index = index;
         this.start = start;
         this.end = end;
+        this.parent = parent;
     }
 
     public int length() {

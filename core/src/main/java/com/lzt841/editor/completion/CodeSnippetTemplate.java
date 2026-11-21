@@ -65,7 +65,7 @@ public class CodeSnippetTemplate {
         CodeSnippetContext resolved = context == null ? new CodeSnippetContext() : context;
         StringBuilder text = new StringBuilder(source.length());
         Array<CodeSnippetPlaceholder> placeholders = new Array<CodeSnippetPlaceholder>();
-        parseBody(source, 0, source.length(), text, placeholders, resolved, (char) 0);
+        parseBody(source, 0, source.length(), text, placeholders, resolved, (char) 0, -1);
         boolean hasZero = false;
         for (int i = 0; i < placeholders.size; i++) {
             if (placeholders.get(i).index == 0) {
@@ -78,6 +78,142 @@ public class CodeSnippetTemplate {
         }
         fillEmptyMirrors(text, placeholders);
         return new CodeSnippetTemplate(source, text.toString(), placeholders, buildTabOrder(placeholders));
+    }
+
+    /** Independent insertion plan, with LF text and offsets mapped from the expanded body. */
+    CodeSnippetTemplate normalizedCopy() {
+        String body = insertText;
+        int[] offsets = null;
+        if (body.indexOf('\r') >= 0) {
+            offsets = new int[body.length() + 1];
+            StringBuilder normalized = new StringBuilder(body.length());
+            for (int i = 0; i < body.length(); i++) {
+                char character = body.charAt(i);
+                normalized.append(character == '\r' ? '\n' : character);
+                offsets[i + 1] = normalized.length();
+                if (character == '\r' && i + 1 < body.length() && body.charAt(i + 1) == '\n') {
+                    // A boundary between CR and LF belongs after the normalized newline.
+                    i++;
+                    offsets[i + 1] = normalized.length();
+                }
+            }
+            body = normalized.toString();
+        }
+
+        Array<CodeSnippetPlaceholder> stops = new Array<CodeSnippetPlaceholder>(placeholders.size);
+        IntArray order = new IntArray(tabOrder);
+        if (order.size == 0 || order.peek() != 0) return null;
+        for (int i = 0; i < order.size; i++) {
+            int index = order.get(i);
+            if (index < 0 || order.indexOf(index) != i) return null;
+        }
+        for (int i = 0; i < placeholders.size; i++) {
+            CodeSnippetPlaceholder stop = placeholders.get(i);
+            if (stop == null || stop.index < 0 || stop.start < 0 || stop.end < stop.start
+                || stop.end > insertText.length() || !order.contains(stop.index) || stop.parent < -1 || stop.parent >= i
+                || splitsSurrogatePair(insertText, stop.start) || splitsSurrogatePair(insertText, stop.end)) {
+                return null;
+            }
+            if (stop.parent >= 0) {
+                CodeSnippetPlaceholder parent = placeholders.get(stop.parent);
+                if (parent.start > stop.start || parent.end < stop.end) return null;
+                // An index cannot mirror itself through an enclosing default: the two copies overlap.
+                for (int ancestor = stop.parent; ancestor >= 0; ancestor = placeholders.get(ancestor).parent) {
+                    if (placeholders.get(ancestor).index == stop.index) return null;
+                }
+            }
+            stops.add(new CodeSnippetPlaceholder(stop.index,
+                offsets == null ? stop.start : offsets[stop.start],
+                offsets == null ? stop.end : offsets[stop.end], stop.parent));
+        }
+        for (int i = 0; i < order.size; i++) {
+            int index = order.get(i);
+            boolean found = false;
+            for (int p = 0; p < stops.size; p++) {
+                if (stops.get(p).index == index) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                if (index != 0) return null;
+                stops.add(new CodeSnippetPlaceholder(0, body.length(), body.length()));
+            }
+        }
+        if (hasUnsafeOverlaps(stops) || hasIndexDependencyCycle(stops, order)) return null;
+        return new CodeSnippetTemplate(source, body, stops, order);
+    }
+
+    /** Mirroring may never replace part of another occurrence of the same field. */
+    private static boolean hasUnsafeOverlaps(Array<CodeSnippetPlaceholder> stops) {
+        for (int i = 0; i < stops.size; i++) {
+            CodeSnippetPlaceholder first = stops.get(i);
+            for (int j = i + 1; j < stops.size; j++) {
+                CodeSnippetPlaceholder second = stops.get(j);
+                if (first.index == second.index) {
+                    if (Math.max(first.start, second.start) < Math.min(first.end, second.end)
+                        || first.isEmpty() && second.start < first.start && first.start < second.end
+                        || second.isEmpty() && first.start < second.start && second.start < first.end) {
+                        return true;
+                    }
+                } else if (first.start < second.start && second.start < first.end && first.end < second.end
+                    || second.start < first.start && first.start < second.end && second.end < first.end) {
+                    return true;
+                }
+            }
+        }
+        // A hand-built template may omit parent metadata for fully contained fields. Keep accepting
+        // those templates; only declared parent relationships add edges to the cycle check.
+        return false;
+    }
+
+    /** An edit of a child changes its parent; mirrors can link that dependency across occurrences. */
+    private static boolean hasIndexDependencyCycle(Array<CodeSnippetPlaceholder> stops, IntArray order) {
+        IntArray[] parents = new IntArray[order.size];
+        int[] incoming = new int[order.size];
+        for (int i = 0; i < stops.size; i++) {
+            CodeSnippetPlaceholder child = stops.get(i);
+            if (child.parent < 0) continue;
+            int childIndex = order.indexOf(child.index);
+            int parentIndex = order.indexOf(stops.get(child.parent).index);
+            if (parents[childIndex] == null) parents[childIndex] = new IntArray();
+            if (!parents[childIndex].contains(parentIndex)) {
+                parents[childIndex].add(parentIndex);
+                incoming[parentIndex]++;
+            }
+        }
+        int[] pending = new int[order.size];
+        int head = 0;
+        int tail = 0;
+        for (int i = 0; i < incoming.length; i++) {
+            if (incoming[i] == 0) pending[tail++] = i;
+        }
+        while (head < tail) {
+            IntArray next = parents[pending[head++]];
+            if (next == null) continue;
+            for (int i = 0; i < next.size; i++) {
+                int parent = next.get(i);
+                if (--incoming[parent] == 0) pending[tail++] = parent;
+            }
+        }
+        return head != order.size;
+    }
+
+    boolean isAncestor(int ancestor, int child) {
+        return isAncestor(placeholders, ancestor, child);
+    }
+
+    private static boolean isAncestor(Array<CodeSnippetPlaceholder> placeholders, int ancestor, int child) {
+        for (int parent = child < 0 ? -1 : placeholders.get(child).parent; parent >= 0;
+             parent = placeholders.get(parent).parent) {
+            if (parent == ancestor) return true;
+        }
+        return false;
+    }
+
+    private static boolean splitsSurrogatePair(String text, int offset) {
+        return offset > 0 && offset < text.length()
+            && Character.isHighSurrogate(text.charAt(offset - 1)) && Character.isLowSurrogate(text.charAt(offset));
     }
 
     /** Nothing to Tab between: either no stops, or only the implied {@code $0} at the end. */
@@ -124,7 +260,8 @@ public class CodeSnippetTemplate {
         StringBuilder text,
         Array<CodeSnippetPlaceholder> placeholders,
         CodeSnippetContext context,
-        char stop
+        char stop,
+        int parent
     ) {
         int i = from;
         while (i < to) {
@@ -138,7 +275,7 @@ public class CodeSnippetTemplate {
                 continue;
             }
             if (c == '$') {
-                i = parseDollar(source, i, to, text, placeholders, context);
+                i = parseDollar(source, i, to, text, placeholders, context, parent);
                 continue;
             }
             text.append(c);
@@ -157,7 +294,8 @@ public class CodeSnippetTemplate {
         int to,
         StringBuilder text,
         Array<CodeSnippetPlaceholder> placeholders,
-        CodeSnippetContext context
+        CodeSnippetContext context,
+        int parent
     ) {
         int next = i + 1;
         if (next >= to) {
@@ -170,13 +308,13 @@ public class CodeSnippetTemplate {
             return next + 1;
         }
         if (c == '{') {
-            return parseBrace(source, next + 1, to, text, placeholders, context);
+            return parseBrace(source, next + 1, to, text, placeholders, context, parent);
         }
         if (c >= '0' && c <= '9') {
             int[] consumed = {next};
             int index = readIndex(source, to, consumed);
             int pos = text.length();
-            placeholders.add(new CodeSnippetPlaceholder(index, pos, pos));
+            placeholders.add(new CodeSnippetPlaceholder(index, pos, pos, parent));
             return consumed[0];
         }
         if (isIdentStart(c)) {
@@ -201,7 +339,8 @@ public class CodeSnippetTemplate {
         int to,
         StringBuilder text,
         Array<CodeSnippetPlaceholder> placeholders,
-        CodeSnippetContext context
+        CodeSnippetContext context,
+        int parent
     ) {
         if (i >= to) {
             text.append("${");
@@ -209,10 +348,10 @@ public class CodeSnippetTemplate {
         }
         char c = source.charAt(i);
         if (c >= '0' && c <= '9') {
-            return parseTabStopBrace(source, i, to, text, placeholders, context);
+            return parseTabStopBrace(source, i, to, text, placeholders, context, parent);
         }
         if (isIdentStart(c)) {
-            return parseVariableBrace(source, i, to, text, placeholders, context);
+            return parseVariableBrace(source, i, to, text, placeholders, context, parent);
         }
         // `${` not followed by a name or a number: emit literally, including the brace, and let the
         // rest of the body carry on. Consuming a matching `}` here would eat a later tab stop's closer.
@@ -226,20 +365,21 @@ public class CodeSnippetTemplate {
         int to,
         StringBuilder text,
         Array<CodeSnippetPlaceholder> placeholders,
-        CodeSnippetContext context
+        CodeSnippetContext context,
+        int parent
     ) {
         int[] consumed = {i};
         int index = readIndex(source, to, consumed);
         i = consumed[0];
         if (i >= to) {
             int pos = text.length();
-            placeholders.add(new CodeSnippetPlaceholder(index, pos, pos));
+            placeholders.add(new CodeSnippetPlaceholder(index, pos, pos, parent));
             return to;
         }
         char c = source.charAt(i);
         if (c == '}') {
             int pos = text.length();
-            placeholders.add(new CodeSnippetPlaceholder(index, pos, pos));
+            placeholders.add(new CodeSnippetPlaceholder(index, pos, pos, parent));
             return i + 1;
         }
         if (c == '|') {
@@ -248,7 +388,7 @@ public class CodeSnippetTemplate {
             i = choiceAt[0];
             int start = text.length();
             text.append(first);
-            placeholders.add(new CodeSnippetPlaceholder(index, start, text.length()));
+            placeholders.add(new CodeSnippetPlaceholder(index, start, text.length(), parent));
             // readFirstChoice stops *on* the closing `|` rather than past it, so skip it here before
             // looking for the brace. Without this the `|}` tail leaks into the insert text.
             if (i < to && source.charAt(i) == '|') {
@@ -268,8 +408,8 @@ public class CodeSnippetTemplate {
             // document-ordered.
             int slot = placeholders.size;
             placeholders.add(null);
-            i = parseBody(source, i + 1, to, text, placeholders, context, '}');
-            placeholders.set(slot, new CodeSnippetPlaceholder(index, start, text.length()));
+            i = parseBody(source, i + 1, to, text, placeholders, context, '}', slot);
+            placeholders.set(slot, new CodeSnippetPlaceholder(index, start, text.length(), parent));
             if (i < to && source.charAt(i) == '}') {
                 i++;
             }
@@ -277,7 +417,7 @@ public class CodeSnippetTemplate {
         }
         // `${1foo` — not a valid stop. Keep the number as a stop and leave `foo` to the body.
         int pos = text.length();
-        placeholders.add(new CodeSnippetPlaceholder(index, pos, pos));
+        placeholders.add(new CodeSnippetPlaceholder(index, pos, pos, parent));
         return i;
     }
 
@@ -287,7 +427,8 @@ public class CodeSnippetTemplate {
         int to,
         StringBuilder text,
         Array<CodeSnippetPlaceholder> placeholders,
-        CodeSnippetContext context
+        CodeSnippetContext context,
+        int parent
     ) {
         int[] consumed = {i};
         String name = readIdent(source, to, consumed);
@@ -296,16 +437,18 @@ public class CodeSnippetTemplate {
         if (i < to && source.charAt(i) == ':') {
             StringBuilder fallback = new StringBuilder();
             Array<CodeSnippetPlaceholder> nested = new Array<CodeSnippetPlaceholder>();
-            i = parseBody(source, i + 1, to, fallback, nested, context, '}');
+            i = parseBody(source, i + 1, to, fallback, nested, context, '}', -1);
             if (resolved == null || resolved.isEmpty()) {
                 int base = text.length();
+                int baseIndex = placeholders.size;
                 text.append(fallback);
                 for (int n = 0; n < nested.size; n++) {
                     CodeSnippetPlaceholder nestedPlaceholder = nested.get(n);
                     placeholders.add(new CodeSnippetPlaceholder(
                         nestedPlaceholder.index,
                         nestedPlaceholder.start + base,
-                        nestedPlaceholder.end + base
+                        nestedPlaceholder.end + base,
+                        nestedPlaceholder.parent < 0 ? parent : baseIndex + nestedPlaceholder.parent
                     ));
                 }
             } else {
@@ -447,10 +590,6 @@ public class CodeSnippetTemplate {
     }
 
     /**
-     * {@code 1, 2, 3, \ldots} in numeric order, then {@code 0}. Indices are unique; a missing {@code 0}
-     * is not invented here — {@link #parse} already added it.
-     */
-    /**
      * Copies each stop's default text into the bare {@code $n} mirrors that share its index.
      *
      * <p>This is what makes the commonest snippet of all work. In
@@ -477,29 +616,19 @@ public class CodeSnippetTemplate {
             for (int j = 0; j < placeholders.size; j++) {
                 CodeSnippetPlaceholder other = placeholders.get(j);
                 if (j == i) {
-                    placeholders.set(j, new CodeSnippetPlaceholder(other.index, at, at + length));
+                    placeholders.set(j, new CodeSnippetPlaceholder(other.index, at, at + length, other.parent));
                     continue;
                 }
                 int start = other.start;
                 int end = other.end;
-                if (end < at) {
-                    // Entirely before the insertion: untouched.
-                    placeholders.set(j, other);
-                    continue;
-                }
-                if (start < at) {
-                    // Spans the insertion point, so it grows around it.
+                if (isAncestor(placeholders, j, i) || start < at && end > at) {
+                    // Actual nesting, including an empty parent, grows around the inserted mirror.
                     end += length;
-                } else if (start == at && end == at && j < i) {
-                    // An empty stop at the same offset, earlier in the document-ordered array, is the
-                    // one enclosing this mirror — `${2:${1}}`. It grows to contain the text instead of
-                    // being pushed past it, which is what makes the outer stop select the filled value.
-                    end += length;
-                } else {
+                } else if (start > at || start == at && (start < end || j > i)) {
                     start += length;
                     end += length;
                 }
-                placeholders.set(j, new CodeSnippetPlaceholder(other.index, start, end));
+                placeholders.set(j, new CodeSnippetPlaceholder(other.index, start, end, other.parent));
             }
         }
     }

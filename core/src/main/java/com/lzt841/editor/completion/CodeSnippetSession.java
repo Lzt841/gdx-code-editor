@@ -9,7 +9,10 @@ import com.lzt841.editor.CodeEditorContentChangeType;
 import com.lzt841.editor.CodeEditorContentListener;
 import com.lzt841.editor.CodeEditorInputInterceptor;
 import com.lzt841.editor.CodeEditorPosition;
+import com.lzt841.editor.CodeEditorTextEdit;
 import com.lzt841.editor.CodeEditorTextRange;
+
+import java.util.Comparator;
 
 /**
  * A live snippet: the placeholders are inserted, one is selected, and Tab moves between them.
@@ -26,17 +29,18 @@ import com.lzt841.editor.CodeEditorTextRange;
  * avoid. Ranges are instead maintained by re-reading the snippet's own region, which is a few lines
  * long whatever the document's size.
  *
- * <p>After each edit the session re-reads its region and compares it with the copy it kept, finding the
- * common prefix and suffix. That yields the changed span and its length delta without a per-line
- * journal of columns, which the document does not record. Every placeholder at or after the change is
- * shifted; the active one grows or shrinks around it.
+ * <p>After each edit the session reads its region and uses the event's exact pre-edit and post-edit
+ * ranges to track the splice, retaining shared text in replaced defaults. Legacy events without exact
+ * coordinates use a caret-constrained text diff. The edited occurrence grows or shrinks, adjacent
+ * fields shift, and nested fields covered by a parent replacement leave the navigation order. Mirror
+ * propagation is planned from children to affected parents before one exact batch changes the text.
  *
  * <h2>When it gives up</h2>
  *
- * <p>Deliberately eager, because a snippet that mis-tracks silently corrupts text the user is looking
- * at. It finishes on undo, redo, {@code setText}, a whole-document change, an edit outside its region,
- * or the caret leaving the region. Finishing is not failure: the text stays exactly as it is and only
- * the Tab behaviour stops.
+ * <p>The session finishes on undo, redo, {@code setText}, an external batch rewrite, stale or reentrant
+ * events, an edit crossing a tracked boundary, or the caret leaving the region. Independent edits above
+ * or below the region are followed. Finishing leaves the text and caret as they are; only the Tab
+ * behaviour stops.
  */
 public class CodeSnippetSession {
     private final CodeEditor editor;
@@ -49,8 +53,9 @@ public class CodeSnippetSession {
     private int regionStartLine;
     /** Last line of the region, inclusive. Kept in step as the snippet's own lines change. */
     private int regionEndLine;
-    /** The region's text as the session last saw it, for diffing after an edit. */
+    /** Text and version last consumed by this session. */
     private String regionText = "";
+    private int regionVersion;
     private int tabPosition = -1;
     private boolean active;
     private boolean applyingOwnEdit;
@@ -116,12 +121,20 @@ public class CodeSnippetSession {
      *     still inserted and the caret placed at {@code $0}
      */
     public static CodeSnippetSession start(CodeEditor editor, String source, CodeEditorTextRange replaceRange) {
+        CodeSnippetSession session = startForCompletion(editor, source, replaceRange);
+        return session != null && session.isActive() ? session : null;
+    }
+
+    /** Returns a successful start even if its final stop immediately finishes the session. */
+    static CodeSnippetSession startForCompletion(CodeEditor editor, String source, CodeEditorTextRange replaceRange) {
         if (editor == null || source == null) {
             return null;
         }
         // Captured before the edit, so $TM_SELECTED_TEXT is the text about to be replaced.
-        CodeSnippetTemplate template = CodeSnippetTemplate.parse(source, CodeSnippetContext.from(editor));
-        return startParsed(editor, template, replaceRange);
+        CodeSnippetTemplate template = CodeSnippetTemplate.parse(source, CodeSnippetContext.from(editor)).normalizedCopy();
+        if (template == null) return null;
+        CodeSnippetSession session = new CodeSnippetSession(editor, template);
+        return session.insertAndBegin(replaceRange) ? session : null;
     }
 
     /** As {@link #start(CodeEditor, String, CodeEditorTextRange)} for an already-parsed template. */
@@ -133,55 +146,56 @@ public class CodeSnippetSession {
         if (editor == null || template == null) {
             return null;
         }
-        CodeSnippetSession session = new CodeSnippetSession(editor, template);
-        return session.insertAndBegin(replaceRange) ? session : null;
+        CodeSnippetTemplate prepared = template.normalizedCopy();
+        if (prepared == null) return null;
+        CodeSnippetSession session = new CodeSnippetSession(editor, prepared);
+        return session.insertAndBegin(replaceRange) && session.isActive() ? session : null;
     }
 
     private boolean insertAndBegin(CodeEditorTextRange replaceRange) {
-        int startLine;
-        int startColumn;
-        if (replaceRange != null) {
-            startLine = replaceRange.startLine;
-            startColumn = replaceRange.startColumn;
-        } else {
-            CodeEditorTextRange selection = editor.getSelection();
-            if (selection != null) {
-                startLine = selection.startLine;
-                startColumn = selection.startColumn;
-            } else {
-                startLine = editor.getCursorLine();
-                startColumn = editor.getCursorColumn();
-            }
+        if (editor.isReadOnly() || editor.isDisabled() || editor.isPasswordMode()) return false;
+        CodeEditorTextRange target = replaceRange != null ? replaceRange : editor.getSelection();
+        if (target == null) {
+            target = new CodeEditorTextRange(editor.getCursorLine(), editor.getCursorColumn(),
+                editor.getCursorLine(), editor.getCursorColumn());
         }
-
-        boolean inserted;
-        if (replaceRange != null) {
-            inserted = editor.replaceRange(replaceRange, template.insertText);
-        } else {
-            inserted = editor.insertTextAtCursor(template.insertText);
+        final CodeEditorTextRange insertionRange = target;
+        final Array<CodeEditorTextEdit> edits = Array.with(new CodeEditorTextEdit(target, template.insertText));
+        if (!editor.canApplyEdits(edits)) return false;
+        final boolean unchanged = template.insertText.equals(editor.getTextRange(target));
+        final int[] acceptedVersion = {-1};
+        applyingOwnEdit = true;
+        try {
+            editor.runAsSingleUndoStep("Insert Snippet", new Runnable() {
+                @Override public void run() {
+                    // Exact insertion rejects the whole body if filtering would invalidate its stops.
+                    // Existing text needs navigation only, preserving its history and redo entries.
+                    if (!unchanged && !editor.applyEditsExact(edits, "Insert Snippet")) return;
+                    acceptedVersion[0] = editor.getDocumentVersion();
+                    buildRanges(insertionRange.startLine, insertionRange.startColumn);
+                    if (!template.hasNavigableStops()) {
+                        moveCaretToFinalStop();
+                        return;
+                    }
+                    active = true;
+                    editor.addContentListener(contentListener);
+                    // Completion gets first refusal while its popup is open; otherwise Tab reaches us.
+                    editor.addInputInterceptor(inputInterceptor);
+                    editor.addCaretListener(caretListener);
+                    tabPosition = -1;
+                    next();
+                }
+            });
+        } finally {
+            applyingOwnEdit = false;
         }
-        if (!inserted) {
+        // Closing the group notifies host listeners, which can rewrite the document themselves.
+        if (acceptedVersion[0] < 0 || editor.getDocumentVersion() != acceptedVersion[0]
+            || editor.isReadOnly() || editor.isDisabled() || editor.isPasswordMode()) {
+            finish(false);
             return false;
         }
-
-        buildRanges(startLine, startColumn);
-        if (!template.hasNavigableStops()) {
-            // Nothing to Tab between. Put the caret at $0 and do not install anything: a session that
-            // only intercepts Tab in order to pass it through would break indentation for no gain.
-            moveCaretToFinalStop();
-            return false;
-        }
-
-        active = true;
-        editor.addContentListener(contentListener);
-        // Registered after any completion controller, which is what makes the ordering work: with the
-        // popup closed the controller declines every key except its own trigger chord, so Tab reaches
-        // the session; with the popup open the controller takes Tab first, as it should.
-        editor.addInputInterceptor(inputInterceptor);
-        editor.addCaretListener(caretListener);
-        tabPosition = -1;
-        next();
-        return active;
+        return true;
     }
 
     /**
@@ -208,6 +222,7 @@ public class CodeSnippetSession {
             ranges.add(range);
         }
         regionText = readRegion();
+        regionVersion = editor.getDocumentVersion();
     }
 
     private void positionOf(
@@ -237,11 +252,18 @@ public class CodeSnippetSession {
         }
     }
 
+    private boolean syncBeforeNavigation() {
+        if (!active) return false;
+        if (regionVersion != editor.getDocumentVersion()) {
+            editor.flushPendingContentChanges();
+            if (regionVersion != editor.getDocumentVersion()) finish(false);
+        }
+        return active;
+    }
+
     /** Moves to the next stop. Finishes the session after the last one. */
     public boolean next() {
-        if (!active) {
-            return false;
-        }
+        if (!syncBeforeNavigation()) return false;
         if (tabPosition + 1 >= tabOrder.size) {
             finish(true);
             return false;
@@ -260,9 +282,7 @@ public class CodeSnippetSession {
 
     /** Moves to the previous stop. Stays on the first one rather than finishing. */
     public boolean previous() {
-        if (!active || tabPosition <= 0) {
-            return false;
-        }
+        if (!syncBeforeNavigation() || tabPosition <= 0) return false;
         tabPosition--;
         selectStop(tabPosition);
         return true;
@@ -286,8 +306,10 @@ public class CodeSnippetSession {
         return tabOrder.size;
     }
 
+    /** Returns an independent template snapshot; its mutable arrays cannot change this session. */
     public CodeSnippetTemplate getTemplate() {
-        return template;
+        return new CodeSnippetTemplate(template.source, template.insertText,
+            new Array<CodeSnippetPlaceholder>(template.placeholders), new IntArray(template.tabOrder));
     }
 
     public CodeSnippetSession setFinishListener(FinishListener listener) {
@@ -338,6 +360,7 @@ public class CodeSnippetSession {
             return;
         }
         LiveRange range = ranges.get(primary);
+        boolean wasApplyingOwnEdit = applyingOwnEdit;
         applyingOwnEdit = true;
         try {
             if (range.isEmpty()) {
@@ -346,7 +369,7 @@ public class CodeSnippetSession {
                 editor.setSelection(range.startLine, range.startColumn, range.endLine, range.endColumn);
             }
         } finally {
-            applyingOwnEdit = false;
+            applyingOwnEdit = wasApplyingOwnEdit;
         }
     }
 
@@ -362,7 +385,7 @@ public class CodeSnippetSession {
     /** First occurrence of an index; later ones with the same index are mirrors. */
     private int primaryRangeIndexFor(int index) {
         for (int i = 0; i < template.placeholders.size && i < ranges.size; i++) {
-            if (template.placeholders.get(i).index == index) {
+            if (ranges.get(i).alive && template.placeholders.get(i).index == index) {
                 return i;
             }
         }
@@ -391,6 +414,12 @@ public class CodeSnippetSession {
         if (!active || applyingOwnEdit) {
             return;
         }
+        if (event.documentVersion != editor.getDocumentVersion()
+            || event.documentVersion == regionVersion
+            || event.previousDocumentVersion >= 0 && event.previousDocumentVersion != regionVersion) {
+            finish(false);
+            return;
+        }
         if (!isFollowable(event)) {
             finish(false);
             return;
@@ -404,33 +433,41 @@ public class CodeSnippetSession {
         // startLine + removedLineCount is not a line number at all. The difference of the two sums does
         // survive the accumulation, which is what the shift needs.
         if (event.startLine < regionStartLine) {
-            int delta = event.insertedLineCount - event.removedLineCount;
-            if (delta != 0) {
-                shiftRegionLines(delta);
-            }
-            regionText = readRegion();
-            // An edit starting above may also have reached into the region and taken part of the
-            // snippet with it. Cheaply detected by checking the placeholders still land inside the
-            // region text; a shift alone leaves them all valid.
-            if (!rangesFitRegion()) {
+            if (event.replacedRange != null && event.replacedRange.endLine >= regionStartLine) {
                 finish(false);
+                return;
             }
+            int delta = event.insertedLineCount - event.removedLineCount;
+            if (delta != 0) shiftRegionLines(delta);
+            if (!regionText.equals(readRegion()) || !rangesFitRegion()) {
+                finish(false);
+                return;
+            }
+            regionVersion = event.documentVersion;
             return;
         }
         if (event.startLine > regionEndLine) {
-            regionText = readRegion();
+            if (!regionText.equals(readRegion())) {
+                finish(false);
+                return;
+            }
+            regionVersion = event.documentVersion;
             return;
         }
 
         int lineDelta = event.insertedLineCount - event.removedLineCount;
         regionEndLine = Math.max(regionStartLine, regionEndLine + lineDelta);
         String updated = readRegion();
-        if (!applyDiff(regionText, updated)) {
+        int sourceRangeIndex = applyDiff(regionText, updated, event);
+        if (sourceRangeIndex == Integer.MIN_VALUE) {
             finish(false);
             return;
         }
         regionText = updated;
-        mirrorCurrentStop();
+        // Publish the accepted user transition before mirror propagation. The mirror batch is a new
+        // transition and advances this baseline again after its own notification is suppressed.
+        regionVersion = event.documentVersion;
+        mirrorCurrentStop(sourceRangeIndex);
     }
 
     /**
@@ -456,6 +493,7 @@ public class CodeSnippetSession {
     private boolean rangesFitRegion() {
         for (int i = 0; i < ranges.size; i++) {
             LiveRange range = ranges.get(i);
+            if (!range.alive) continue;
             if (offsetOf(regionText, range.startLine, range.startColumn) < 0
                 || offsetOf(regionText, range.endLine, range.endColumn) < 0) {
                 return false;
@@ -475,179 +513,315 @@ public class CodeSnippetSession {
     }
 
     /**
-     * Finds what changed between two versions of the region and moves the placeholders accordingly.
+     * Tracks the event's original splice, retaining text shared by the old and new defaults. Legacy
+     * events without exact coordinates fall back to a caret-constrained prefix/suffix diff.
      *
-     * <p>A common-prefix / common-suffix diff, which is exact for the single contiguous edit a
-     * keystroke, paste or delete produces. It cannot distinguish two separate edits in one event, so a
-     * change that does not reduce to one span returns false and the session stops.
-     *
-     * @return false when the session can no longer trust its ranges
+     * @return the edited occurrence, -1 for surrounding text, or MIN_VALUE for an unsafe change
      */
-    private boolean applyDiff(String before, String after) {
-        if (before.equals(after)) {
-            return true;
+    private int applyDiff(String before, String after, CodeEditorContentChangeEvent event) {
+        int changeStart;
+        int changeEnd;
+        if (event.replacedRange != null && event.insertedRange != null) {
+            CodeEditorTextRange replaced = event.replacedRange;
+            CodeEditorTextRange inserted = event.insertedRange;
+            changeStart = offsetOf(before, replaced.startLine, replaced.startColumn);
+            changeEnd = offsetOf(before, replaced.endLine, replaced.endColumn);
+            int insertedStart = offsetOf(after, inserted.startLine, inserted.startColumn);
+            int insertedEnd = offsetOf(after, inserted.endLine, inserted.endColumn);
+            if (changeStart < 0 || changeEnd < changeStart || insertedStart != changeStart
+                || insertedEnd < insertedStart
+                || !before.regionMatches(0, after, 0, changeStart)
+                || before.length() - changeEnd != after.length() - insertedEnd
+                || !before.regionMatches(changeEnd, after, insertedEnd, before.length() - changeEnd)) {
+                return Integer.MIN_VALUE;
+            }
+        } else {
+            if (before.equals(after)) return -1;
+            int caret = offsetOf(after, event.cursorLine, event.cursorColumn);
+            int oldEnd = caret - (after.length() - before.length());
+            if (caret >= 0 && oldEnd >= 0 && oldEnd <= before.length()
+                && before.length() - oldEnd == after.length() - caret
+                && before.regionMatches(oldEnd, after, caret, before.length() - oldEnd)) {
+                changeStart = commonPrefix(before, after, Math.min(oldEnd, caret));
+                changeEnd = oldEnd;
+            } else {
+                changeStart = commonPrefix(before, after, Math.min(before.length(), after.length()));
+                int suffix = 0;
+                int maxSuffix = Math.min(before.length() - changeStart, after.length() - changeStart);
+                while (suffix < maxSuffix
+                    && before.charAt(before.length() - 1 - suffix) == after.charAt(after.length() - 1 - suffix)) {
+                    suffix++;
+                }
+                changeEnd = before.length() - suffix;
+            }
+            // A text diff may stop between the shared high surrogate and the changed low surrogate.
+            if (splitsSurrogatePair(before, changeStart) || splitsSurrogatePair(after, changeStart)) changeStart--;
+            int insertedEnd = changeEnd + after.length() - before.length();
+            if (splitsSurrogatePair(before, changeEnd) || splitsSurrogatePair(after, insertedEnd)) changeEnd++;
         }
-        int prefix = 0;
-        int maxPrefix = Math.min(before.length(), after.length());
-        while (prefix < maxPrefix && before.charAt(prefix) == after.charAt(prefix)) {
-            prefix++;
-        }
-        int suffix = 0;
-        int maxSuffix = Math.min(before.length() - prefix, after.length() - prefix);
-        while (suffix < maxSuffix
-            && before.charAt(before.length() - 1 - suffix) == after.charAt(after.length() - 1 - suffix)) {
-            suffix++;
-        }
-        int removedLength = before.length() - prefix - suffix;
-        int insertedLength = after.length() - prefix - suffix;
-        if (removedLength < 0 || insertedLength < 0) {
-            return false;
-        }
+        int source = editedRangeIndex(before, changeStart, changeEnd);
+        return applyRangeChange(before, after, changeStart, changeEnd, source) ? source : Integer.MIN_VALUE;
+    }
 
-        int activeIndex = primaryRangeIndexFor(getCurrentTabStop());
-        int changeStart = prefix;
-        int changeEnd = prefix + removedLength;
+    private static int commonPrefix(String before, String after, int limit) {
+        int prefix = 0;
+        while (prefix < limit && before.charAt(prefix) == after.charAt(prefix)) prefix++;
+        return prefix;
+    }
+
+    /** Prefer the selected index at shared boundaries, then the smallest enclosing field. */
+    private int editedRangeIndex(String before, int changeStart, int changeEnd) {
+        int candidate = -1;
+        int candidateLength = Integer.MAX_VALUE;
+        boolean candidateIsCurrent = false;
+        for (int i = 0; i < ranges.size; i++) {
+            LiveRange range = ranges.get(i);
+            if (!range.alive || template.placeholders.get(i).index <= 0) continue;
+            int start = offsetOf(before, range.startLine, range.startColumn);
+            int end = offsetOf(before, range.endLine, range.endColumn);
+            if (start < 0 || changeStart < start || changeEnd > end) continue;
+            boolean isCurrent = template.placeholders.get(i).index == getCurrentTabStop();
+            if (candidate < 0 || isCurrent && !candidateIsCurrent
+                || isCurrent == candidateIsCurrent && end - start < candidateLength) {
+                candidate = i;
+                candidateLength = end - start;
+                candidateIsCurrent = isCurrent;
+            }
+        }
+        return candidate;
+    }
+
+    /** Tracks an exact splice; mirror edits use their known spans instead of guessing a diff. */
+    private boolean applyRangeChange(String before, String after, int changeStart, int changeEnd, int expandingIndex) {
+        int removedLength = changeEnd - changeStart;
+        int insertedLength = after.length() - before.length() + removedLength;
         int delta = insertedLength - removedLength;
+        if (changeStart < 0 || changeEnd > before.length() || removedLength < 0 || insertedLength < 0) return false;
 
         for (int i = 0; i < ranges.size; i++) {
             LiveRange range = ranges.get(i);
+            if (!range.alive) continue;
             int start = offsetOf(before, range.startLine, range.startColumn);
             int end = offsetOf(before, range.endLine, range.endColumn);
-            if (start < 0 || end < 0) {
-                return false;
-            }
+            if (start < 0 || end < start) return false;
             int newStart = start;
             int newEnd = end;
+            boolean isExpandingStop = i == expandingIndex;
+            boolean isDescendant = template.isAncestor(expandingIndex, i);
 
-            boolean isActiveStop = i == activeIndex;
-            if (changeStart >= start && changeEnd <= end) {
-                // Inside this placeholder: it grows or shrinks with the edit.
-                newEnd = end + delta;
-            } else if (isActiveStop && changeStart == end && removedLength == 0) {
-                // Typing at the very end of the active stop extends it, which is what makes a
-                // placeholder feel like a field rather than a fixed-width box.
-                newEnd = end + delta;
+            if (removedLength > 0 && isDescendant && changeStart <= start && changeEnd >= end) {
+                // Replacing a default removes its nested fields, even if a minimal diff would leave
+                // their old text untouched. The nested exit survives at the replacement's endpoint.
+                if (template.placeholders.get(i).index != 0) {
+                    range.alive = false;
+                    continue;
+                }
+                newStart = newEnd = changeStart + insertedLength;
+            } else if (removedLength == 0 && !isExpandingStop && changeStart >= start && changeStart <= end) {
+                // Insertions at a shared edge belong to the edited field. Actual ancestors grow with
+                // their child, including when both started empty; adjacent empty mirrors stay apart.
+                if (changeStart > start && changeStart < end || template.isAncestor(i, expandingIndex)) {
+                    newEnd += delta;
+                } else if (changeStart == start && (start < end || i > expandingIndex)) {
+                    newStart += delta;
+                    newEnd += delta;
+                }
+            } else if (changeStart >= start && changeEnd <= end && (start < end || isExpandingStop)) {
+                newEnd += delta;
             } else if (changeEnd <= start) {
-                newStart = start + delta;
-                newEnd = end + delta;
+                newStart += delta;
+                newEnd += delta;
             } else if (changeStart >= end) {
-                // Entirely after this placeholder: unaffected.
-                newStart = start;
-                newEnd = end;
+                // The change is after this field.
+            } else if (isDescendant) {
+                // A partially overwritten child cannot describe the remaining text either.
+                if (template.placeholders.get(i).index != 0) {
+                    range.alive = false;
+                    continue;
+                }
+                newStart = newEnd = changeStart + insertedLength;
             } else {
-                // The edit straddles a boundary, so this placeholder no longer describes a coherent
-                // span. Better to stop than to guess.
                 return false;
             }
-            if (newEnd < newStart) {
-                newEnd = newStart;
-            }
-            if (!setFromOffsets(after, range, newStart, newEnd)) {
-                return false;
-            }
+            if (!setFromOffsets(after, range, newStart, newEnd)) return false;
         }
+        pruneTabOrder();
         return true;
     }
 
-    /** Copies the active stop's text into the other stops that share its index. */
-    private void mirrorCurrentStop() {
-        int index = getCurrentTabStop();
-        if (index <= 0) {
-            return;
-        }
-        int primary = primaryRangeIndexFor(index);
-        if (primary < 0) {
-            return;
-        }
-        LiveRange source = ranges.get(primary);
-        String value = editor.getTextRange(
-            source.startLine, source.startColumn, source.endLine, source.endColumn);
-
-        // The caret has to be put back afterwards. replaceRange clears the selection and leaves the
-        // caret at the end of what it inserted, which is correct for the completion popup that method
-        // was written for and wrong here: the user is mid-word in a different placeholder. Tracked as an
-        // offset into the region rather than a line/column, because a mirror earlier in the region
-        // changes the columns of everything after it.
-        int caretOffset = offsetOf(regionText, editor.getCursorLine(), editor.getCursorColumn());
-
-        applyingOwnEdit = true;
-        editor.beginCompoundEdit();
-        try {
-            // Backwards, so replacing one mirror cannot move the ones not yet visited.
-            for (int i = ranges.size - 1; i >= 0; i--) {
-                if (i == primary || template.placeholders.get(i).index != index) {
-                    continue;
-                }
-                LiveRange target = ranges.get(i);
-                String current = editor.getTextRange(
-                    target.startLine, target.startColumn, target.endLine, target.endColumn);
-                if (value.equals(current)) {
-                    continue;
-                }
-                if (caretOffset >= 0) {
-                    int at = offsetOf(regionText, target.startLine, target.startColumn);
-                    if (at >= 0 && at + current.length() <= caretOffset) {
-                        caretOffset += value.length() - current.length();
-                    }
-                }
-                editor.replaceRange(
-                    target.startLine, target.startColumn, target.endLine, target.endColumn, value);
-                advanceRangeEnd(target, value);
-            }
-        } finally {
-            editor.endCompoundEdit();
-            applyingOwnEdit = false;
-        }
-        regionEndLine = Math.max(regionEndLine, lastRangeLine());
-        regionText = readRegion();
-        restoreCaret(caretOffset);
-    }
-
-    /** Puts the caret back at a region offset after the mirror edits moved it. */
-    private void restoreCaret(int caretOffset) {
-        if (caretOffset < 0) {
-            return;
-        }
-        int line = regionStartLine;
-        int column = 0;
-        for (int i = 0; i < caretOffset && i < regionText.length(); i++) {
-            if (regionText.charAt(i) == '\n') {
-                line++;
-                column = 0;
-            } else {
-                column++;
-            }
-        }
-        applyingOwnEdit = true;
-        try {
-            editor.setCursorPosition(line, column);
-        } finally {
-            applyingOwnEdit = false;
+    private void pruneTabOrder() {
+        for (int i = tabOrder.size - 1; i >= 0; i--) {
+            if (primaryRangeIndexFor(tabOrder.get(i)) >= 0) continue;
+            tabOrder.removeIndex(i);
+            if (i <= tabPosition) tabPosition--;
         }
     }
 
-    /** Sets a range's end so it covers {@code value} starting from the range's own start. */
-    private void advanceRangeEnd(LiveRange range, String value) {
-        int line = range.startLine;
-        int column = range.startColumn;
-        for (int i = 0; i < value.length(); i++) {
-            if (value.charAt(i) == '\n') {
-                line++;
-                column = 0;
-            } else {
-                column++;
-            }
-        }
-        range.endLine = line;
-        range.endColumn = column;
+    private static boolean splitsSurrogatePair(String text, int offset) {
+        return offset > 0 && offset < text.length()
+            && Character.isHighSurrogate(text.charAt(offset - 1)) && Character.isLowSurrogate(text.charAt(offset));
     }
 
-    private int lastRangeLine() {
-        int last = regionStartLine;
+    /** Plans linked fields from children to parents, then applies all copies as one exact batch. */
+    private void mirrorCurrentStop(int sourceIndex) {
+        if (sourceIndex < 0 || template.placeholders.get(sourceIndex).index <= 0) return;
+        IntArray order = mirrorOrder();
+        if (order == null) {
+            finish(false);
+            return;
+        }
+        int[] sources = new int[order.size];
+        for (int i = 0; i < sources.length; i++) sources[i] = -1;
+        sources[order.indexOf(template.placeholders.get(sourceIndex).index)] = sourceIndex;
+        markAncestorSources(sourceIndex, order, sources);
+
+        String beforeMirrors = regionText;
+        CodeEditorTextRange[] originalRanges = new CodeEditorTextRange[ranges.size];
+        boolean[] changed = new boolean[ranges.size];
         for (int i = 0; i < ranges.size; i++) {
-            last = Math.max(last, ranges.get(i).endLine);
+            LiveRange range = ranges.get(i);
+            if (range.alive) originalRanges[i] = new CodeEditorTextRange(
+                range.startLine, range.startColumn, range.endLine, range.endColumn);
         }
-        return last;
+
+        for (int step = 0; step < order.size; step++) {
+            int source = sources[step];
+            if (source < 0 || !ranges.get(source).alive) continue;
+            LiveRange sourceRange = ranges.get(source);
+            int sourceStart = offsetOf(regionText, sourceRange.startLine, sourceRange.startColumn);
+            int sourceEnd = offsetOf(regionText, sourceRange.endLine, sourceRange.endColumn);
+            if (sourceStart < 0 || sourceEnd < sourceStart) {
+                finish(false);
+                return;
+            }
+            String value = regionText.substring(sourceStart, sourceEnd);
+            Array<MirrorEdit> mirrors = new Array<MirrorEdit>();
+            for (int i = 0; i < ranges.size; i++) {
+                if (i == source || !ranges.get(i).alive || template.placeholders.get(i).index != order.get(step)) continue;
+                LiveRange target = ranges.get(i);
+                int start = offsetOf(regionText, target.startLine, target.startColumn);
+                int end = offsetOf(regionText, target.endLine, target.endColumn);
+                if (start < 0 || end < start) {
+                    finish(false);
+                    return;
+                }
+                if (!value.equals(regionText.substring(start, end))) mirrors.add(new MirrorEdit(i, start, end));
+            }
+            mirrors.sort(MIRROR_ORDER);
+            for (int i = 0; i < mirrors.size; i++) {
+                MirrorEdit edit = mirrors.get(i);
+                markAncestorSources(edit.rangeIndex, order, sources);
+                String updated = regionText.substring(0, edit.start) + value + regionText.substring(edit.end);
+                if (!applyRangeChange(regionText, updated, edit.start, edit.end, edit.rangeIndex)) {
+                    finish(false);
+                    return;
+                }
+                changed[edit.rangeIndex] = true;
+                regionEndLine += newlineCount(value) - newlineCount(regionText.substring(edit.start, edit.end));
+                regionText = updated;
+            }
+        }
+
+        final Array<CodeEditorTextEdit> edits = new Array<CodeEditorTextEdit>();
+        for (int i = 0; i < ranges.size; i++) {
+            if (!changed[i] || !ranges.get(i).alive) continue;
+            // A mirrored parent already includes its children's final text. Replacing both would
+            // overlap and would filter those characters twice, so retain only the enclosing edit.
+            boolean covered = false;
+            for (int j = 0; j < ranges.size; j++) {
+                if (changed[j] && ranges.get(j).alive && template.isAncestor(j, i)) {
+                    covered = true;
+                    break;
+                }
+            }
+            if (covered) continue;
+            LiveRange range = ranges.get(i);
+            int start = offsetOf(regionText, range.startLine, range.startColumn);
+            int end = offsetOf(regionText, range.endLine, range.endColumn);
+            CodeEditorTextRange original = originalRanges[i];
+            String replacement = regionText.substring(start, end);
+            int oldStart = offsetOf(beforeMirrors, original.startLine, original.startColumn);
+            int oldEnd = offsetOf(beforeMirrors, original.endLine, original.endColumn);
+            if (!replacement.equals(beforeMirrors.substring(oldStart, oldEnd))) {
+                edits.add(new CodeEditorTextEdit(original, replacement));
+            }
+        }
+        if (edits.size == 0) return;
+        if (!editor.canApplyEdits(edits)) {
+            finish(false);
+            return;
+        }
+
+        final int[] acceptedVersion = {-1};
+        applyingOwnEdit = true;
+        try {
+            editor.runAsSingleUndoStep("Mirror Snippet", new Runnable() {
+                @Override public void run() {
+                    if (!editor.applyEditsExact(edits, "Mirror Snippet")) return;
+                    acceptedVersion[0] = editor.getDocumentVersion();
+                    regionVersion = acceptedVersion[0];
+                    if (!regionText.equals(readRegion()) || !rangesFitRegion()) finish(false);
+                }
+            });
+        } finally {
+            applyingOwnEdit = false;
+        }
+        if (acceptedVersion[0] < 0 || acceptedVersion[0] != editor.getDocumentVersion()) finish(false);
+    }
+
+    /** Orders index dependencies across all occurrences, including parents of mirror targets. */
+    private IntArray mirrorOrder() {
+        IntArray ordered = new IntArray(tabOrder.size);
+        int count = tabOrder.size - 1; // $0 never mirrors.
+        while (ordered.size < count) {
+            int previousSize = ordered.size;
+            for (int position = 0; position < tabOrder.size; position++) {
+                int index = tabOrder.get(position);
+                if (index <= 0 || ordered.contains(index)) continue;
+                boolean blocked = false;
+                for (int i = 0; i < ranges.size; i++) {
+                    CodeSnippetPlaceholder child = template.placeholders.get(i);
+                    if (!ranges.get(i).alive || child.index <= 0 || ordered.contains(child.index)) continue;
+                    for (int parent = child.parent; parent >= 0;
+                         parent = template.placeholders.get(parent).parent) {
+                        if (ranges.get(parent).alive && template.placeholders.get(parent).index == index) {
+                            blocked = true;
+                            break;
+                        }
+                    }
+                    if (blocked) break;
+                }
+                if (!blocked) ordered.add(index);
+            }
+            if (ordered.size == previousSize) return null;
+        }
+        return ordered;
+    }
+
+    private void markAncestorSources(int child, IntArray order, int[] sources) {
+        for (int parent = template.placeholders.get(child).parent; parent >= 0;
+             parent = template.placeholders.get(parent).parent) {
+            if (!ranges.get(parent).alive) continue;
+            int position = order.indexOf(template.placeholders.get(parent).index);
+            if (position >= 0 && sources[position] < 0) sources[position] = parent;
+        }
+    }
+
+    private static final Comparator<MirrorEdit> MIRROR_ORDER = new Comparator<MirrorEdit>() {
+        @Override public int compare(MirrorEdit first, MirrorEdit second) {
+            int byStart = Integer.compare(second.start, first.start);
+            if (byStart != 0) return byStart;
+            int byEnd = Integer.compare(second.end, first.end);
+            return byEnd != 0 ? byEnd : Integer.compare(second.rangeIndex, first.rangeIndex);
+        }
+    };
+
+    private static int newlineCount(String text) {
+        int count = 0;
+        for (int i = 0; i < text.length(); i++) {
+            if (text.charAt(i) == '\n') count++;
+        }
+        return count;
     }
 
     private String readRegion() {
@@ -661,7 +835,7 @@ public class CodeSnippetSession {
     /** Offset of a document position within the region text, or -1 when it falls outside. */
     private int offsetOf(String region, int line, int column) {
         int relativeLine = line - regionStartLine;
-        if (relativeLine < 0) {
+        if (relativeLine < 0 || column < 0) {
             return -1;
         }
         int offset = 0;
@@ -683,6 +857,8 @@ public class CodeSnippetSession {
     }
 
     private boolean setFromOffsets(String region, LiveRange range, int start, int end) {
+        if (start < 0 || end < start || end > region.length()
+            || splitsSurrogatePair(region, start) || splitsSurrogatePair(region, end)) return false;
         int line = regionStartLine;
         int column = 0;
         int i = 0;
@@ -730,12 +906,26 @@ public class CodeSnippetSession {
         }
     }
 
+    /** One mirror's original span, before any mirror in the batch moves it. */
+    private static final class MirrorEdit {
+        final int rangeIndex;
+        final int start;
+        final int end;
+
+        MirrorEdit(int rangeIndex, int start, int end) {
+            this.rangeIndex = rangeIndex;
+            this.start = start;
+            this.end = end;
+        }
+    }
+
     /** Mutable line/column pair, so tracking an edit does not allocate a range per placeholder per key. */
     private static final class LiveRange {
         int startLine;
         int startColumn;
         int endLine;
         int endColumn;
+        boolean alive = true;
 
         boolean isEmpty() {
             return startLine == endLine && startColumn == endColumn;

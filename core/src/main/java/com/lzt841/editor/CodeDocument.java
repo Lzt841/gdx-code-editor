@@ -29,6 +29,14 @@ public class CodeDocument {
     private final Array<UndoEntry> redoStack = new Array<>();
     private final Array<LineEdit> journal = new Array<>();
     private final Array<String> cachedSnapshot = new Array<>();
+    /** Canonical LF-separated content captured by the last setText or markSaved call. */
+    private String savedText = "";
+    /** Cached result of comparing the current content with {@link #savedText}. */
+    private boolean dirtyStateCacheValid;
+    private boolean dirty;
+    /** Fenwick tree of each line's UTF-16 length plus its following line separator. */
+    private int[] lineLengthFenwick = new int[0];
+    private boolean lineLengthIndexDirty = true;
 
     private int cursorLine;
     private int cursorColumn;
@@ -64,11 +72,14 @@ public class CodeDocument {
         journal.clear();
         journalBaseVersion = version;
         snapshotVersion = -1;
+        savedText = getText();
+        dirty = false;
+        dirtyStateCacheValid = true;
     }
 
     private void applyText(String text, int targetCursorLine, int targetCursorColumn) {
         lines.clear();
-        String normalized = text == null ? "" : text.replace("\r\n", "\n").replace('\r', '\n');
+        String normalized = normalizeText(text);
         int start = 0;
         while (true) {
             int newline = normalized.indexOf('\n', start);
@@ -82,6 +93,7 @@ public class CodeDocument {
         if (lines.isEmpty()) {
             lines.add(new StringBuilder());
         }
+        invalidateLineLengthIndex();
         cursorLine = clamp(targetCursorLine, 0, lines.size - 1);
         cursorColumn = clamp(targetCursorColumn, 0, lines.get(cursorLine).length());
         recomputeLongestLine();
@@ -139,6 +151,43 @@ public class CodeDocument {
         return builder.toString();
     }
 
+    /**
+     * Returns whether the canonical document text differs from the last saved baseline.
+     *
+     * <p>The comparison is exact and does not allocate a second full document string. The result is
+     * cached until the document content changes.
+     */
+    public boolean isDirty() {
+        if (!dirtyStateCacheValid) {
+            dirty = !contentEquals(savedText);
+            dirtyStateCacheValid = true;
+        }
+        return dirty;
+    }
+
+    /**
+     * Marks the current document text as saved without changing text, caret, version or history.
+     * Saving also ends the current typing-merge run.
+     */
+    public void markSaved() {
+        savedText = getText();
+        dirty = false;
+        dirtyStateCacheValid = true;
+        resetMergeState();
+    }
+
+    /**
+     * Marks a previously persisted canonical snapshot as saved. This overload is useful when an
+     * asynchronous save completes after the document has changed; the current text is not captured.
+     * CRLF and CR separators are normalized to LF, like {@link #setText(String)}.
+     */
+    public void markSaved(String persistedText) {
+        savedText = normalizeText(persistedText);
+        dirty = !contentEquals(savedText);
+        dirtyStateCacheValid = true;
+        resetMergeState();
+    }
+
     public int getCursorLine() {
         return cursorLine;
     }
@@ -155,37 +204,97 @@ public class CodeDocument {
     /** Converts a line/column pair to a document character offset. */
     public int toOffset(int line, int column) {
         int safeLine = clamp(line, 0, lines.size - 1);
-        int offset = 0;
-        for (int i = 0; i < safeLine; i++) {
-            offset += lines.get(i).length() + 1;
-        }
-        return offset + clamp(column, 0, lines.get(safeLine).length());
+        return linePrefixLength(safeLine) + clamp(column, 0, lines.get(safeLine).length());
     }
 
     /** Converts a document character offset to a line index. */
     public int lineAtOffset(int offset) {
-        int remaining = Math.max(0, offset);
-        for (int i = 0; i < lines.size; i++) {
-            int lineLength = lines.get(i).length();
-            if (remaining <= lineLength) {
-                return i;
-            }
-            remaining -= lineLength + 1;
-        }
-        return lines.size - 1;
+        ensureLineLengthIndex();
+        int target = Math.max(0, offset);
+        int line = lineCountBeforeOffset(target);
+        return Math.min(line, lines.size - 1);
     }
 
     /** Converts a document character offset to a column within {@link #lineAtOffset(int)}. */
     public int columnAtOffset(int offset) {
-        int remaining = Math.max(0, offset);
-        for (int i = 0; i < lines.size; i++) {
-            int lineLength = lines.get(i).length();
-            if (remaining <= lineLength) {
-                return remaining;
-            }
-            remaining -= lineLength + 1;
+        int line = lineAtOffset(offset);
+        return columnAtOffset(offset, line);
+    }
+
+    int columnAtOffset(int offset, int line) {
+        int safeLine = clamp(line, 0, lines.size - 1);
+        int column = Math.max(0, offset) - linePrefixLength(safeLine);
+        return Math.min(column, lines.get(safeLine).length());
+    }
+
+    /** Prefix sum of line weights before {@code endExclusive}; each weight includes a separator. */
+    private int linePrefixLength(int endExclusive) {
+        ensureLineLengthIndex();
+        int sum = 0;
+        for (int index = endExclusive; index > 0; index -= index & -index) {
+            sum += lineLengthFenwick[index];
         }
-        return lines.get(lines.size - 1).length();
+        return sum;
+    }
+
+    /** Number of complete line weights consumed by {@code offset}. */
+    private int lineCountBeforeOffset(int offset) {
+        int index = 0;
+        int sum = 0;
+        for (int bit = Integer.highestOneBit(lines.size); bit != 0; bit >>= 1) {
+            int next = index + bit;
+            if (next <= lines.size && sum + lineLengthFenwick[next] <= offset) {
+                index = next;
+                sum += lineLengthFenwick[next];
+            }
+        }
+        return index;
+    }
+
+    private void ensureLineLengthIndex() {
+        if (!lineLengthIndexDirty && lineLengthFenwick.length == lines.size + 1) {
+            return;
+        }
+        lineLengthFenwick = new int[lines.size + 1];
+        for (int line = 0; line < lines.size; line++) {
+            int index = line + 1;
+            lineLengthFenwick[index] += lines.get(line).length() + 1;
+            int parent = index + (index & -index);
+            if (parent < lineLengthFenwick.length) {
+                lineLengthFenwick[parent] += lineLengthFenwick[index];
+            }
+        }
+        lineLengthIndexDirty = false;
+    }
+
+    private void updateLineLengthIndex(int line, int oldWeight, int newWeight) {
+        if (lineLengthIndexDirty || lineLengthFenwick.length != lines.size + 1) {
+            lineLengthIndexDirty = true;
+            return;
+        }
+        int delta = newWeight - oldWeight;
+        if (delta == 0) {
+            return;
+        }
+        for (int index = line + 1; index < lineLengthFenwick.length; index += index & -index) {
+            lineLengthFenwick[index] += delta;
+        }
+    }
+
+    /** Updates a line weight in place when line identity is preserved, otherwise defers a rebuild. */
+    private void refreshLineLengthIndex(int startLine, int removedCount, int insertedCount, int oldLineLength) {
+        if (removedCount != 1 || insertedCount != 1 || oldLineLength < 0) {
+            invalidateLineLengthIndex();
+            return;
+        }
+        if (lineLengthIndexDirty || lineLengthFenwick.length != lines.size + 1) {
+            return;
+        }
+        updateLineLengthIndex(startLine, oldLineLength + 1, lines.get(startLine).length() + 1);
+    }
+
+    private void invalidateLineLengthIndex() {
+        lineLengthIndexDirty = true;
     }
 
     public void moveCursorTo(int line, int column) {
@@ -256,10 +365,11 @@ public class CodeDocument {
     public void insertChar(char character) {
         int beforeLine = cursorLine;
         int beforeColumn = cursorColumn;
+        int oldLineLength = lines.get(cursorLine).length();
         recordUndo(EditKind.INSERT, beforeLine, beforeColumn, beforeLine, beforeLine, 1);
         lines.get(cursorLine).insert(cursorColumn, character);
         cursorColumn++;
-        afterEdit(EditKind.INSERT, beforeLine, 1, 1);
+        afterEdit(EditKind.INSERT, beforeLine, 1, 1, oldLineLength);
     }
 
     public void insertText(String text) {
@@ -282,6 +392,7 @@ public class CodeDocument {
         recordUndo(kind, beforeLine, beforeColumn, beforeLine, beforeLine, newLineCount);
 
         StringBuilder currentLine = lines.get(cursorLine);
+        int oldLineLength = currentLine.length();
         String suffix = currentLine.substring(cursorColumn);
         currentLine.setLength(cursorColumn);
 
@@ -307,7 +418,7 @@ public class CodeDocument {
         cursorLine = lineIndex;
         cursorColumn = lines.get(lineIndex).length();
         lines.get(lineIndex).append(suffix);
-        afterEdit(kind, beforeLine, 1, newLineCount);
+        afterEdit(kind, beforeLine, 1, newLineCount, newLineCount == 1 ? oldLineLength : -1);
     }
 
     public void deleteRange(int startLine, int startColumn, int endLine, int endColumn) {
@@ -330,6 +441,7 @@ public class CodeDocument {
 
         int beforeLine = cursorLine;
         int beforeColumn = cursorColumn;
+        int oldLineLength = startLine == endLine ? lines.get(startLine).length() : -1;
         recordUndo(EditKind.DELETE_RANGE, beforeLine, beforeColumn, startLine, endLine, 1);
 
         if (startLine == endLine) {
@@ -345,7 +457,7 @@ public class CodeDocument {
 
         cursorLine = startLine;
         cursorColumn = startColumn;
-        afterEdit(EditKind.DELETE_RANGE, startLine, endLine - startLine + 1, 1);
+        afterEdit(EditKind.DELETE_RANGE, startLine, endLine - startLine + 1, 1, oldLineLength);
     }
 
     public String getTextRange(int startLine, int startColumn, int endLine, int endColumn) {
@@ -391,7 +503,7 @@ public class CodeDocument {
         lines.insert(cursorLine + 1, next);
         cursorLine++;
         cursorColumn = indentText.length();
-        afterEdit(EditKind.INSERT_NEWLINE, beforeLine, 1, 2);
+        afterEdit(EditKind.INSERT_NEWLINE, beforeLine, 1, 2, -1);
     }
 
     // ---- grapheme clusters ----------------------------------------------------
@@ -605,13 +717,14 @@ public class CodeDocument {
         if (cursorColumn > 0) {
             int beforeLine = cursorLine;
             int beforeColumn = cursorColumn;
+            int oldLineLength = lines.get(cursorLine).length();
             recordUndo(EditKind.BACKSPACE, beforeLine, beforeColumn, beforeLine, beforeLine, 1);
             // A whole grapheme cluster goes at once. Removing one char of a surrogate pair would leave a
             // stray half behind, and a 😀 that takes two presses is the bug this fixes.
             int start = graphemeStartBefore(lines.get(cursorLine), cursorColumn);
             lines.get(cursorLine).delete(start, cursorColumn);
             cursorColumn = start;
-            afterEdit(EditKind.BACKSPACE, beforeLine, 1, 1);
+            afterEdit(EditKind.BACKSPACE, beforeLine, 1, 1, oldLineLength);
             return;
         }
 
@@ -628,7 +741,7 @@ public class CodeDocument {
         lines.removeIndex(cursorLine);
         cursorLine = targetLine;
         cursorColumn = previousLength;
-        afterEdit(EditKind.BACKSPACE, targetLine, 2, 1);
+        afterEdit(EditKind.BACKSPACE, targetLine, 2, 1, -1);
     }
 
     public void deleteForward() {
@@ -636,10 +749,11 @@ public class CodeDocument {
         if (cursorColumn < current.length()) {
             int beforeLine = cursorLine;
             int beforeColumn = cursorColumn;
+            int oldLineLength = current.length();
             recordUndo(EditKind.DELETE_FORWARD, beforeLine, beforeColumn, beforeLine, beforeLine, 1);
             int end = graphemeEndAt(current, cursorColumn);
             current.delete(cursorColumn, end);
-            afterEdit(EditKind.DELETE_FORWARD, beforeLine, 1, 1);
+            afterEdit(EditKind.DELETE_FORWARD, beforeLine, 1, 1, oldLineLength);
             return;
         }
 
@@ -652,7 +766,7 @@ public class CodeDocument {
         recordUndo(EditKind.DELETE_FORWARD, beforeLine, beforeColumn, beforeLine, beforeLine + 1, 1);
         current.append(lines.get(cursorLine + 1));
         lines.removeIndex(cursorLine + 1);
-        afterEdit(EditKind.DELETE_FORWARD, beforeLine, 2, 1);
+        afterEdit(EditKind.DELETE_FORWARD, beforeLine, 2, 1, -1);
     }
 
     /**
@@ -673,11 +787,12 @@ public class CodeDocument {
 
         int beforeLine = cursorLine;
         int beforeColumn = cursorColumn;
+        int oldLineLength = current.length();
         recordUndo(EditKind.AUTO_DEDENT, beforeLine, beforeColumn, beforeLine, beforeLine, 1);
         current.delete(0, cursorColumn);
         current.insert(0, replacement);
         cursorColumn = replacement.length();
-        afterEdit(EditKind.AUTO_DEDENT, beforeLine, 1, 1);
+        afterEdit(EditKind.AUTO_DEDENT, beforeLine, 1, 1, oldLineLength);
     }
 
     public CodeIndentStrategy getIndentStrategy() {
@@ -726,13 +841,14 @@ public class CodeDocument {
 
                 // Keep the caret the same distance into the text, not the same absolute column.
                 int caretOffsetInText = line == cursorLine ? Math.max(0, cursorColumn - whitespace) : -1;
+                int oldLineLength = text.length();
                 recordUndo(EditKind.INDENT_LINES, cursorLine, cursorColumn, line, line, 1);
                 text.delete(0, whitespace);
                 text.insert(0, replacement);
                 if (caretOffsetInText >= 0) {
                     cursorColumn = Math.min(text.length(), replacement.length() + caretOffsetInText);
                 }
-                afterEdit(EditKind.INDENT_LINES, line, 1, 1);
+                afterEdit(EditKind.INDENT_LINES, line, 1, 1, oldLineLength);
                 changed = true;
             }
         } finally {
@@ -954,6 +1070,10 @@ public class CodeDocument {
         }
 
         splice(startLine, endLine, entry.removedLines);
+        int oldLineLength = displaced.size == 1 && entry.removedLines.size == 1
+            ? displaced.first().length()
+            : -1;
+        refreshLineLengthIndex(startLine, displaced.size, entry.removedLines.size, oldLineLength);
 
         cursorLine = clamp(entry.cursorLine, 0, lines.size - 1);
         cursorColumn = clamp(entry.cursorColumn, 0, lines.get(cursorLine).length());
@@ -1052,13 +1172,14 @@ public class CodeDocument {
         }
     }
 
-    private void afterEdit(EditKind kind, int startLine, int removedCount, int insertedCount) {
+    private void afterEdit(EditKind kind, int startLine, int removedCount, int insertedCount, int oldLineLength) {
         UndoEntry pending = pendingEntryForCursor();
         if (pending != null) {
             pending.inverseCursorLine = cursorLine;
             pending.inverseCursorColumn = cursorColumn;
         }
         recomputeLongestLineAfterSplice(startLine, insertedCount);
+        refreshLineLengthIndex(startLine, removedCount, insertedCount, oldLineLength);
         journalReplace(startLine, removedCount, insertedCount);
         touch();
         if (compoundEditDepth == 0) {
@@ -1264,11 +1385,36 @@ public class CodeDocument {
     }
 
     private int estimateTextLength() {
-        int total = Math.max(0, lines.size - 1);
-        for (int i = 0; i < lines.size; i++) {
-            total += lines.get(i).length();
+        ensureLineLengthIndex();
+        return linePrefixLength(lines.size) - 1;
+    }
+
+    private static String normalizeText(String text) {
+        return text == null ? "" : text.replace("\r\n", "\n").replace('\r', '\n');
+    }
+
+    private boolean contentEquals(String expected) {
+        int offset = 0;
+        for (int lineIndex = 0; lineIndex < lines.size; lineIndex++) {
+            StringBuilder line = lines.get(lineIndex);
+            int lineLength = line.length();
+            if (offset + lineLength > expected.length()) {
+                return false;
+            }
+            for (int column = 0; column < lineLength; column++) {
+                if (line.charAt(column) != expected.charAt(offset + column)) {
+                    return false;
+                }
+            }
+            offset += lineLength;
+            if (lineIndex + 1 < lines.size) {
+                if (offset >= expected.length() || expected.charAt(offset) != '\n') {
+                    return false;
+                }
+                offset++;
+            }
         }
-        return total;
+        return offset == expected.length();
     }
 
     private static int clamp(int value, int min, int max) {
@@ -1284,6 +1430,7 @@ public class CodeDocument {
 
     private void touch() {
         version++;
+        dirtyStateCacheValid = false;
     }
 
     private void resetMergeState() {

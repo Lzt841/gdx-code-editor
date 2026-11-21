@@ -26,6 +26,12 @@ dependencies {
   }
 }
 
+tasks.register('positionMappingBenchmark', JavaExec) {
+  dependsOn testClasses
+  classpath = sourceSets.test.runtimeClasspath
+  mainClass = 'com.lzt841.editor.CodeDocumentPositionBenchmark'
+}
+
 publishing {
   publications {
     release(MavenPublication) {

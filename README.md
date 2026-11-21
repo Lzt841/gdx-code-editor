@@ -5,6 +5,7 @@
 The library is designed for in-app script editors, config editors, lightweight IDE tools, and any Scene2D UI that needs an embeddable code editor.
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.
+See [the implementation review](docs/EDITOR_REVIEW.md) for current limitations and planned improvements.
 
 ## Features
 
@@ -34,12 +35,16 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
 - Optional extensions with scoped resources, install rollback and deterministic unload
 - Undoable uppercase/lowercase selection and trailing-whitespace cleanup extension
 - Whole-line move, duplicate and delete commands, preserving caret and selection direction
+- Optional line-comment toggling with configurable language prefixes and Ctrl/Command+/
 - Code completion with a built-in popup and documentation side panel
 - Multiple named completion sources with async merging, cancellation and scoped extension registration
 - Reusable snippet-pack extensions with conditional availability and independent unload
 - Snippets with placeholder tabbing, mirrored stops, choices and variables
 - Hover tooltips and parameter hints
+- Optional go-to-line/column dialog with validated 1-based input, fold reveal and Ctrl/Command+G
 - Go to definition, find references and rename, with a word-level fallback
+- Pluggable document/selection formatting with async cancellation, atomic edits and a strict JSON provider
+- Optional diagnostic quick fixes and refactoring actions with preview, explicit apply and Alt+Enter discovery
 - Auto-closing brackets and quotes, wrap selection, pair delete
 - Line marks for breakpoints, bookmarks and change bars
 - Configurable indent strategy, block indent and Shift-Tab dedent
@@ -59,6 +64,7 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
   - key chord to named action mapping
   - custom commands and extension lifecycle
   - navigation (definition, references, rename)
+  - document and selection formatting (synchronous or asynchronous)
 
 ## Screenshots
 
@@ -89,7 +95,7 @@ Add the dependency:
 
 ```gradle
 dependencies {
-    implementation 'com.github.Lzt841:gdx-code-editor:v1.3.0'
+    implementation 'com.github.Lzt841:gdx-code-editor:v1.4.0'
 }
 ```
 
@@ -102,7 +108,7 @@ repositories {
 }
 
 dependencies {
-    implementation("com.github.Lzt841:gdx-code-editor:v1.3.0")
+    implementation("com.github.Lzt841:gdx-code-editor:v1.4.0")
 }
 ```
 
@@ -624,6 +630,11 @@ Patterns are applied **one line at a time**. That is what keeps the per-line mat
 - a pattern cannot match across a line break
 - `^` and `$` anchor to the start and end of each line, not of the document
 
+Replacement templates (including `$1` and `${name}`) expand before input filtering. Each actual
+insertion is filtered once; filtering never rewrites the template's group syntax. `replaceAllSearchMatches`
+returns the number of matches whose text changed. Identical results create no edit or history entry.
+When every result is unchanged, replacement preserves the selection, active match, folds and redo.
+
 An invalid pattern is not an error. The match count drops to zero and `getSearchRegexError()` explains
 why, so a search field can report the problem while the user is still typing it. Both methods compile
 on demand, so they can be polled per frame without running a search.
@@ -654,7 +665,7 @@ editor.addContentListener(new CodeEditorContentListener() {
             // trigger completion after typing or paste
         }
 
-        String text = event.text;
+        String text = event.getText();
         int version = event.documentVersion;
         int cursorLine = event.cursorLine;
         int cursorColumn = event.cursorColumn;
@@ -676,14 +687,44 @@ The callback is triggered after actual content changes such as:
 The event payload includes:
 
 - `type`: mutation kind such as `INSERT`, `DELETE`, `PASTE`, `UNDO`, `REDO`
-- `text`: full document text after the change
+- `getText()`: full document text after the change, read from the live editor when called
 - `documentVersion`: incremented editor document version
 - `cursorLine` and `cursorColumn`: caret position after the change
 
+## Saved State
+
+`setText(...)` normalizes CRLF and CR separators to LF, clears undo/redo history, and establishes a clean baseline.
+For documents edited through the mutation API, use `isDirty()` to compare the exact canonical text with the
+last save point:
+
+```java
+if (editor.isDirty()) {
+    save(editor.getText());
+    editor.markSaved();
+}
+```
+
+`markSaved()` records the current text without changing the document version, caret, content events, or
+undo/redo history. It also ends the current typing-merge run, so edits typed after a save undo separately.
+When a save completes asynchronously, pass the exact snapshot that was persisted instead:
+
+```java
+String snapshot = editor.getText();
+startAsyncSave(snapshot, () -> editor.markSaved(snapshot));
+```
+
+The snapshot overload normalizes CRLF and CR to LF and leaves the current text untouched. Run the save
+completion callback on the same application thread as other editor mutations. If the user edits while
+the save is in flight, the callback cannot accidentally mark newer text clean.
+Calling `clearUndoHistory()` after saving is optional history policy; it is not needed to make `isDirty()`
+return false. Content-change events are still delivered for mutations only, and `event.getText()` reads the
+full current editor text at the time the accessor is called rather than immutable event-time text.
+
 ## Large Documents
 
-Per-line work is deferred until a line is drawn or measured, and a keystroke only reprocesses the
-lines it touched. Two things are worth knowing:
+**Position mapping uses a lazy line-length index.** `toOffset`, `lineAtOffset` and `columnAtOffset` use a Fenwick prefix-sum tree after the first query, so mapping is O(log lineCount) instead of walking every preceding line. Same-line edits update the affected weight incrementally; edits that add, remove, or reorder lines invalidate the tree and rebuild it on demand. This keeps UTF-16 offsets and newline-boundary clamping unchanged while avoiding document-wide scans for large files.
+
+Run `gradlew :core:positionMappingBenchmark` to compare against the linear implementation on the local JVM. One run on 20,000 lines, 1,000 offsets and 3 rounds measured 174.92 ms for linear mapping and 0.86 ms for Fenwick mapping; this is informational and is not a timing assertion.
 
 **Use an incremental highlighter.** All seven built-ins already are. A custom `CodeHighlighter` still
 works, but it colours the whole document once per edit, so implement `IncrementalCodeHighlighter`
@@ -995,14 +1036,190 @@ same check without mutating anything.
 
 Batch replacements pass through the input filter and newline normalization once before editing. The
 caret follows the resulting text, so rejected characters and CR/CRLF line endings do not shift it to
-the wrong position. Empty deletions, empty replacements and batches with no effective edits return
+the wrong position. Identical replacements are skipped before tracking the caret. Empty deletions,
+empty replacements and batches with no effective edits return
 `false`, preserve the selection and undo/redo history, and emit no content-change event.
+If an input filter changes the document version or makes the editor read-only/disabled, the outer
+replacement is rejected before using the old coordinates. The filter's own changes remain in effect.
 
 Use `applyEditsExact` for edits which must retain every replacement character. It checks the same
 ranges and filters replacements once, but rejects the entire batch if any character is removed or
 newline normalization would alter a replacement. Supply LF newlines. Identical replacements are
 skipped; a fully unchanged/rejected batch keeps the selection, caret, document version and history.
 This makes moving existing text safe even if the host has since installed a more restrictive filter.
+
+The guarded overload, `applyEditsExact(edits, label, commitGuard)`, also checks a cheap, side-effect-free
+`BooleanSupplier` after filtering and immediately before mutation. Use this when a filter callback can
+cancel an asynchronous operation or unload its owner. Version and editable state are rechecked after
+the guard. Replacements are still filtered once.
+
+## Formatting
+
+`CodeFormattingController` adds optional document and selection formatting through a host-owned
+`CodeFormattingProvider`. It captures immutable text, version, requested range and indentation options,
+then validates the result and applies exact edits as one named undo step. No Stage or keyboard focus
+is required, so the same service works with host menus, Scene2D commands and headless integrations.
+
+```java
+import com.lzt841.editor.extensions.CodeFormattingExtension;
+import com.lzt841.editor.formatting.CodeFormattingController;
+import com.lzt841.editor.formatting.JsonCodeFormattingProvider;
+
+CodeFormattingExtension formatting = new CodeFormattingExtension(new JsonCodeFormattingProvider());
+editor.getExtensions().install(formatting);
+
+editor.getCommands().execute(CodeFormattingExtension.FORMAT_DOCUMENT);
+editor.getCommands().execute(CodeFormattingExtension.FORMAT_SELECTION); // requires a selection
+editor.getCommands().setShortcuts(CodeFormattingExtension.FORMAT_DOCUMENT,
+    CodeKeyStroke.ctrlShift(Input.Keys.F));
+
+// Unloading removes both commands, disposes the controller and cancels pending responses.
+editor.getExtensions().uninstall(CodeFormattingExtension.ID);
+```
+
+The document command defaults to Ctrl/Command+Alt+L. Both commands appear in the command palette under
+Formatting. Selection formatting has no default shortcut. Conflicting command IDs or shortcuts fail
+installation and roll back the controller and any commands already registered.
+
+For direct use, construct `new CodeFormattingController(editor, provider)`, call `formatDocument()` or
+`formatSelection()`, and dispose it when the host releases the editor. These methods return whether a
+provider was dispatched, including a synchronous no-op or reported failure. Optional
+`CodeFormattingListener` callbacks distinguish successful changes, already formatted text and errors.
+`isPending()`, `cancel()` and `setProvider()` support host progress UI, cancellation and language changes.
+The provider and any worker pool remain host-owned.
+
+The built-in `JsonCodeFormattingProvider` accepts strict JSON documents or a selected complete JSON
+value. It indents nonempty objects and arrays using the captured tabs/spaces strategy, keeps empty
+containers compact, and retains a document's existing terminal LF. It changes whitespace gaps between
+tokens, preserving string escapes, number spelling, key order and duplicate keys. Fine-grained edits
+carry the caret along its original token. Malformed JSON, partial values, trailing data and nesting
+beyond 128 array/object levels produce a failure without changing the document. JSON formatting is
+explicit; choose a different provider for other languages.
+
+A custom provider implements `format(request, response)`. `request.text` is the entire canonical-LF
+snapshot; `range`, `startOffset` and `endOffset` delimit the requested region. Positions are zero-based
+UTF-16 line/column pairs. Return `Array<CodeEditorTextEdit>` in original-snapshot coordinates, using LF
+replacements. All edits must remain inside the requested region, be in bounds, avoid surrogate-pair
+midpoints and not overlap. An empty array means already formatted; a null array is invalid. Report
+invalid syntax or unsupported selections through `response.fail(message)`.
+
+Providers are called on the GDX thread. For background work, compute only from the immutable request
+and post `complete`/`fail` back to that thread. For example, a host-owned `Executor` can run the built-in
+formatter through a response adapter:
+
+```java
+JsonCodeFormattingProvider json = new JsonCodeFormattingProvider();
+CodeFormattingProvider backgroundJson = (request, response) -> worker.execute(() -> {
+    if (response.isCancelled()) return;
+    json.format(request, new CodeFormattingResponse() {
+        @Override public void complete(Array<CodeEditorTextEdit> edits) {
+            Gdx.app.postRunnable(() -> response.complete(edits));
+        }
+        @Override public void fail(String message) {
+            Gdx.app.postRunnable(() -> response.fail(message));
+        }
+        @Override public boolean isCancelled() { return response.isCancelled(); }
+    });
+});
+```
+
+Only `response.isCancelled()` is safe to poll from a worker; controller methods and result delivery
+use the GDX thread. Cancellation is advisory until the worker observes it, and final acceptance always
+checks live state. New requests, provider replacement, document edits, explicit cancellation and
+disposal invalidate older answers. Undoing back to identical text still has a different version.
+Selection results also require the same live selection range; document formatting permits caret
+movement while waiting and maps the current caret through the accepted edits.
+
+Read-only, disabled, password and open-compound-edit states reject formatting. A filter which removes
+any replacement character rejects the whole batch. The final commit guard also catches cancellation,
+new requests, disposal and availability changes inside filter callbacks, without filtering twice.
+Rejected/no-op results preserve selection, caret, version and history; successful edits clear the
+selection following the normal batch-edit policy. Host callbacks' own edits remain in effect. Late
+or duplicate results and cancelled requests produce no status callback. A provider exception cleans up
+its request and propagates; an already delivered answer is not applied again. The built-in provider
+runs synchronously unless wrapped by the host, so schedule large-document formatting appropriately.
+
+## Code Actions and Diagnostic Fixes
+
+`CodeActionController` discovers quick fixes, refactorings and source actions against an immutable
+current-document snapshot. Discovery retains suggestions for the host to display; it never edits the
+text. `preview(chosenAction)` returns the prospective full text without running filters, and
+`apply(chosenAction)` explicitly commits a selected action as one named undo step. Actions may edit
+any part of this document, for example adding an import above the requested selection.
+
+A scoped extension adds a rebindable Alt+Enter discovery command and an unbound preferred-action
+command, both in the Code Actions category of the command palette:
+
+```java
+import com.badlogic.gdx.utils.Array;
+import com.lzt841.editor.CodeDiagnostic;
+import com.lzt841.editor.CodeDiagnosticSeverity;
+import com.lzt841.editor.codeactions.*;
+import com.lzt841.editor.extensions.CodeActionExtension;
+
+CodeActionExtension fixes = new CodeActionExtension(new DiagnosticCodeActionProvider(
+    new CodeDiagnosticFix("spelling.teh", "Replace with 'the'", "the")));
+editor.getExtensions().install(fixes);
+CodeActionController actions = fixes.getController();
+
+// The analyzer supplies the exact range and code; rules do not guess the language or token.
+editor.setText("teh word");
+editor.setCursorPosition(0, 1);
+editor.setDiagnostics(Array.with(new CodeDiagnostic(0, 0, 0, 3,
+    CodeDiagnosticSeverity.WARNING, "Possible typo", "spelling.teh", null)));
+editor.getCommands().execute(CodeActionExtension.REQUEST_ACTIONS);
+
+Array<CodeAction> suggestions = actions.getActions(); // synchronous provider in this example
+String prospectiveText = actions.preview(suggestions.first()); // "the word"; editor unchanged
+// In the host's explicit selection/confirmation handler, call actions.apply(theChosenAction).
+```
+
+Install a `CodeActionListener` to populate your picker from `onActionsReady` for either synchronous or
+asynchronous providers, and report `onCodeActionFailed` or `onActionApplied`. The extension supplies
+commands; the host supplies the suggestion list and preview UI. `applyPreferred()` and the
+`APPLY_PREFERRED` command require exactly one enabled preferred action in the retained result; multiple
+preferred suggestions remain available for manual selection. A disabled action carries a displayable
+`disabledReason`. Direct use without commands or a Stage is also supported: construct the controller,
+call `requestActions()`, and dispose it when releasing the editor.
+
+A custom provider implements `provideActions(request, response)` and returns `Array<CodeAction>` through
+`response.complete`, or reports a problem with `response.fail(message)`. Every action has a nonblank,
+batch-unique ID and title, a `CodeActionKind`, preferred/disabled metadata and a defensively copied edit
+batch. An empty result means no suggestions; an empty or identical edit batch is a successful no-op
+when explicitly applied. Null actions, duplicate IDs, out-of-bounds ranges, overlapping edits,
+surrogate-pair midpoints and non-LF replacements reject the whole result without changing the text.
+
+Requests capture LF text, document version, caret, selection (or an empty caret range), offsets and
+an independent diagnostic revision. `request.diagnostics` is an unmodifiable list of copied relevant
+diagnostics: those intersecting the selection, or covering the caret, including a zero-width diagnostic
+exactly at the caret. Invalid diagnostic coordinates and batches predating the current text are omitted;
+refactoring providers may still use the text without diagnostics. Snapshots exclude diagnostic
+`userData`, so a worker never receives arbitrary host objects. `DiagnosticCodeActionProvider` matches
+codes exactly and returns one replacement action per matching rule/diagnostic pair, including
+zero-width insertions and deletions; it keeps literal replacement text and does not normalize newlines.
+
+Every accepted `setDiagnostics` and every `clearDiagnostics` advances `getDiagnosticRevision()`, even
+when the text/version and diagnostic entries are unchanged. Rejected outdated diagnostic batches do
+not advance it. `addDiagnosticListener`/`removeDiagnosticListener` expose these changes on the GDX
+thread. Use the setters instead of mutating the live diagnostics array, so revision checks remain valid.
+
+Providers run on the GDX thread. For background computation, use only the immutable request, poll
+`response.isCancelled()` on the worker, then post `complete`/`fail` through `Gdx.app.postRunnable`.
+Controller methods and delivery remain on the GDX thread. New discovery, provider replacement,
+cancellation, disposal, text edits, a new diagnostic batch, or changed caret/selection invalidate old
+suggestions. Live state is checked again when reading results, receiving an answer and applying it;
+no `act()` call is needed to reject stale positions. Late or duplicate answers are ignored.
+
+Read-only, disabled, password and open-compound-edit modes reject discovery/application. Actual edits
+run filters once and use the final exact-batch guard, including diagnostic revision and request
+identity; a filter that rejects characters, refreshes diagnostics, starts another request, or unloads
+the extension cannot commit the old action. Successful changes clear the selection following the
+batch-edit policy. Rejected and no-op actions preserve text, selection, caret and history; callback
+edits of their own remain in effect. `apply` returns true for both a changed and an unchanged success,
+and success consumes the result set. Preview returns null if unavailable and never authorizes a later
+stale application. Unloading removes both commands, disposes the controller and cancels pending work;
+the provider and worker pool stay host-owned. This service applies only current-document edits;
+workspace-wide edits and language-specific semantic fixes remain host responsibilities.
 
 ## Keyboard Shortcuts
 
@@ -1248,6 +1465,39 @@ Each changed command is one named undo step; already-normalized input creates no
 commands respect read-only, disabled and password modes. The extension is opt-in and unloading it
 removes all three commands and their shortcuts.
 
+### Word Editing Extension
+
+```java
+import com.lzt841.editor.extensions.CodeWordEditingExtension;
+
+// Ctrl-based defaults for Windows/Linux:
+editor.getExtensions().install(new CodeWordEditingExtension());
+
+// Option-based shortcuts for macOS:
+editor.getExtensions().install(CodeWordEditingExtension.macOSDefaults());
+
+// Commands for menus/palette only, without reserving keys:
+editor.getExtensions().install(new CodeWordEditingExtension(
+    CodeWordEditingExtension.ShortcutProfile.NONE));
+editor.getExtensions().uninstall(CodeWordEditingExtension.ID);
+```
+
+| Command | Windows/Linux | macOS |
+| --- | --- | --- |
+| Move word left/right | Ctrl+Left / Ctrl+Right | Option+Left / Option+Right |
+| Select word left/right | Ctrl+Shift+Left / Ctrl+Shift+Right | Option+Shift+Left / Option+Shift+Right |
+| Delete previous/next word | Ctrl+Backspace / Ctrl+Delete | Option+Backspace / Option+Forward Delete |
+
+The extension is opt-in and registers the six commands under **Words**. Word characters are Unicode
+letters and digits, `_` and `$`; adjacent punctuation forms a separate run. Navigation and deletion
+skip whitespace, including logical line breaks, and use UTF-16 document positions while scanning
+supplementary code points safely. Moving right from a run advances past its following whitespace to
+the next run; moving left skips preceding whitespace to the previous run. Deletion uses the same
+boundaries, and a selection is deleted instead. Shift commands retain the selection anchor and active
+end. Word deletion is one named undo step. Movement remains available in read-only mode; deletion
+requires a writable, enabled editor. All commands are unavailable in password mode, and unloading the
+extension removes its commands and shortcuts.
+
 ### Whole-Line Editing Extension
 
 ```java
@@ -1287,6 +1537,42 @@ identical neighboring text still moves the caret without creating a content edit
 Registered line-editing chords are reserved even on no-ops, so Alt+Up/Down cannot unexpectedly fall
 back to ordinary movement and collapse the selection. All five commands require a writable, enabled
 editor outside password mode. Unloading the extension removes its commands and any rebound keys.
+
+### Line Comment Extension
+
+```java
+import com.lzt841.editor.extensions.CodeCommentEditingExtension;
+
+CodeCommentEditingExtension comments = new CodeCommentEditingExtension("//");
+editor.getExtensions().install(comments);
+editor.getCommands().execute(CodeCommentEditingExtension.TOGGLE_LINE_COMMENT);
+
+comments.setLineCommentPrefix("#");  // switch language syntax without reinstalling
+comments.setLineCommentPrefix(null); // disable for languages such as JSON
+editor.getExtensions().uninstall(CodeCommentEditingExtension.ID);
+
+// Menu/palette only, without the default shortcut:
+editor.getExtensions().install(new CodeCommentEditingExtension("//", false));
+```
+
+The default shortcut is **Ctrl/Command+/**, following the editor keymap policy. The command appears
+under **Comments** in the command palette. The prefix defaults to `//` and can be any nonempty token
+without whitespace or control characters, such as `#`, `--` or `;`. This is a line-based operation,
+without language parsing; choose a prefix explicitly and disable it for unsupported syntax.
+
+Without a selection, it operates on the caret's logical line. With a selection, it operates on every
+touched logical line, excluding a final endpoint at the next line's column zero. If every nonblank
+line already starts with the prefix after its ASCII space/tab indentation, the command removes one
+prefix and at most one following ASCII space. Otherwise it adds a prefix and a space to every nonblank
+line. Existing indentation is preserved; a mixed block gains one prefix per nonblank line so toggling
+it again restores its original text. Blank lines in a selection are skipped; a caret on an empty or
+whitespace-only line can start a comment.
+
+Caret and selection endpoints follow the original text, preserving forward/backward direction.
+Each operation is one named undo step. Only the inserted prefixes pass through the input filter;
+if any inserted character is rejected, the whole operation preserves the text, selection and history.
+The command requires an enabled, writable editor outside password mode. Unloading the extension
+releases the command and its current shortcut.
 
 ## Auto Edit Strategies
 
@@ -1530,6 +1816,20 @@ is no scrolling, so a very long blurb grows the panel until it is clamped to the
 A completion item can insert a template instead of literal text. Accepting it selects the first
 placeholder; Tab and Shift-Tab move between them, Escape leaves the text as it stands.
 
+When the expanded body already matches the target text, a snippet still selects its placeholders or
+visits `$0`, including empty stops at the caret. It reuses the existing text without input filtering,
+content-change events or new history entries. Completion reports acceptance even when only the final
+stop is visited. Direct snippet starts also reject read-only, disabled and password-mode editors and
+invalid target ranges.
+
+Before insertion, the session copies and validates the expanded template, normalizes CRLF and CR to
+LF, and maps every placeholder offset to the normalized body. Variables are normalized too.
+`startParsed` leaves the supplied template unchanged, and `getTemplate()` returns an independent
+snapshot. Invalid stops or tab orders, including endpoints inside a surrogate pair, reject insertion.
+If input filtering rejects any character, the entire snippet insertion is rejected, preserving the
+existing text, selection and history. A host callback that changes the document invalidates the old
+target range; its own changes remain. Content notifications observe the first selected stop.
+
 ```java
 items.add(CodeCompletionItem.snippet(
     "fori", "for (int ${1:i} = 0; $1 < ${2:count}; $1++) {\n\t$0\n}"));
@@ -1549,8 +1849,18 @@ The syntax is LSP's, so bodies written for a language server work unchanged:
 
 Stops that share a number mirror each other, and the mirrors are filled in before the text is
 inserted — `for (int ${1:i} = 0; $1 < ${2:n}; $1++)` arrives reading `for (int i = 0; i < n; i++)`, not
-with two gaps waiting to be typed into. Renaming the counter at the first stop rewrites the condition
-and the increment as you type, as one undo step per keystroke.
+with two gaps waiting to be typed into. Editing any copy updates its linked copies. Editing a nested
+field also updates mirrors of its enclosing fields, including parents of other linked copies.
+The session plans these changes before applying one exact batch in a named `Mirror Snippet` undo step
+after the user's edit; insertion itself is a named `Insert Snippet` step. If input filtering rejects
+any planned mirror, none of the other copies change: the user's edit stays and placeholder navigation
+ends. Later stops and the edited caret follow multiline edits and adjacent or empty mirrors.
+
+Replacing a parent default removes the child stops it covers, even when part of the replacement
+matches their old text. Copies outside that parent remain navigable; a covered nested `$0` moves to
+the end of the replacement. Overlapping linked fields and circular parent/mirror dependencies reject
+the template before insertion. Tab, Shift-Tab, `next()` and `previous()` flush pending typed input
+before navigating, so typing and switching stops in the same frame keeps ranges and mirrors current.
 
 Without a completion popup:
 
@@ -1568,9 +1878,13 @@ leaves the snippet. Moving *within* the snippet is not a reason to end it — cl
 placeholder to another is ordinary editing of a template still being filled in. Ending is not a
 failure: the text stays exactly as it is and only the Tab behaviour stops.
 
-Placeholders are tracked as line/column ranges over the snippet's own few lines, re-derived by diffing
-that region after each edit. `toOffset` walks every line above its argument, so a session holding
-document offsets would cost O(document) per keystroke in a large file.
+Placeholders are tracked as line/column ranges over the snippet's own few lines. Content events
+provide the original replacement and resulting insertion ranges when a change can be described
+exactly; legacy or ambiguous events fall back to a constrained region diff. Version checks reject
+stale or out-of-order reentrant notifications, and independent edits above or below the region keep
+the session current. `CodeDocument` maintains a lazy Fenwick index for line-length prefixes, so
+converting a line/column position to a UTF-16 offset is O(log lineCount) after the first query; line
+structure edits invalidate the index and rebuild it on demand.
 
 `insertFormat` is independent of `kind`, as in LSP: the kind picks the icon, the format decides whether
 the body is parsed. An item built with the eight-argument constructor stays `PLAIN_TEXT`, so an
@@ -1605,6 +1919,59 @@ public void provideSignatureHelp(CodeEditor editor, CodeEditorPosition position,
 defaults are handled, and the active one is highlighted in the panel.
 
 ## Navigation
+
+### Go to Line and Column
+
+The optional `CodeGoToLineDialog` provides a keyboard/touch navigation window. Install its scoped
+extension to add a command-palette entry and Ctrl/Command+G (using the editor's Command-as-Control
+setting):
+
+```java
+import com.lzt841.editor.navigation.CodeGoToLineDialog;
+import com.lzt841.editor.navigation.CodeGoToLineDialog.CodeGoToLineDialogStyle;
+import com.lzt841.editor.extensions.CodeGoToLineExtension;
+
+CodeGoToLineDialogStyle jumpStyle = new CodeGoToLineDialogStyle(fieldStyle, buttonStyle, labelStyle);
+jumpStyle.window.background = panelDrawable;
+CodeGoToLineExtension jumpExtension = new CodeGoToLineExtension(jumpStyle);
+editor.getExtensions().install(jumpExtension);
+
+// The editor must be attached to a visible Stage; the window adds/removes itself.
+editor.getCommands().execute(CodeGoToLineExtension.SHOW);
+CodeGoToLineDialog jump = jumpExtension.getDialog();
+jump.getLocationField().setText("12:5");
+// Users press Enter, tap Go, or cancel with Escape / Cancel.
+editor.getCommands().setShortcuts(CodeGoToLineExtension.SHOW, CodeKeyStroke.of(Input.Keys.F7));
+editor.getExtensions().uninstall(CodeGoToLineExtension.ID); // closes/disposes the window and releases its shortcut
+```
+
+Opening pre-fills and selects the current logical `line:column`. Input uses positive, 1-based decimal
+numbers: `12` means line 12, column 1; `12:5` specifies both. Whitespace around either number is
+accepted. Columns count UTF-16 code units, a tab counts as one, and line length + 1 is the insertion
+position at its end. Empty lines accept column 1, including a final empty line after a newline.
+Coordinates inside a surrogate pair snap to the pair's end through the existing editor API.
+
+Malformed, overflowing and out-of-range values disable Go and show a validation message. Invalid
+submissions stay open without moving the caret. Bounds refresh after document changes and are checked
+again when submitting. A successful jump clears the selection, expands folds hiding the destination,
+reveals the caret and focuses the editor. Navigation does not change text, document version, saved
+state or undo/redo entries, and does not emit a content-change event. Enter submits on its typed
+newline event, including typed-only mobile/IME input, so that newline is consumed by the window.
+
+Opening and cancelling preserve the caret and selection. Cancellation restores eligible previous
+keyboard/scroll focus; external focus changes close the window without taking focus back. Disabled,
+password-mode, hidden and detached editors cannot open it, and those changes close an open window on
+its next `act`. Read-only editors can navigate. If restoring focus or refreshing the fold structure
+invokes a host callback which edits the document, reopens the dialog, unloads the extension or changes
+availability, the pending jump is abandoned.
+
+`maxWidth`, `edgeMargin` and `controlHeight` are configurable through the style; mobile controls use
+at least 44 density-scaled units. The desktop and Android examples include a Go to Line / Column
+button. A standalone `new CodeGoToLineDialog(editor, jumpStyle)` also works without command
+registration; its host must call `dispose()` before destroying its Stage/fonts. All calls use the
+GDX thread, and styles, fonts and drawables remain host-owned.
+
+### Symbol Navigation
 
 Go to definition, find references and rename. The editor does not draw a results list or a rename
 dialog; it supplies the request, applies the answer, and leaves the UI to the host.

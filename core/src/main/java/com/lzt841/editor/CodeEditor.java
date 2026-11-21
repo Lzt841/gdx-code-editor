@@ -239,6 +239,10 @@ public class CodeEditor extends Widget {
     private final Array<CodeEditorContentListener> contentListenerScratch = new Array<>();
     private final Array<CodeEditorCaretListener> caretListenerScratch = new Array<>();
     private int contentNotifyDepth;
+    private int lastContentChangeVersion = document.getVersion();
+    private int exactChangeVersion = -1;
+    private CodeEditorTextRange pendingReplacedRange;
+    private CodeEditorTextRange pendingInsertedRange;
     private final Array<CodeEditorCaretListener> caretListeners = new Array<>();
     private final Array<CodeEditorInputInterceptor> inputInterceptors = new Array<>();
     private final Array<CodeEditorInputInterceptor> inputInterceptorScratch = new Array<>();
@@ -322,6 +326,8 @@ public class CodeEditor extends Widget {
     /** Diagnostic marks, drawn as squiggles under the range and as a gutter tick. */
     private final Array<CodeDiagnostic> diagnostics = new Array<>();
     private int diagnosticVersion = -1;
+    private long diagnosticRevision;
+    private final Array<CodeEditorDiagnosticListener> diagnosticListeners = new Array<>();
     /**
      * Semantic tokens per line, or null for a line with none.
      *
@@ -1491,6 +1497,7 @@ public class CodeEditor extends Widget {
         return true;
     }
 
+    /** Expands regex groups, then filters the inserted text. Unchanged text preserves editor state. */
     public boolean replaceCurrentSearchMatch(String replacement) {
         if (disabled || readOnly) {
             return false;
@@ -1506,10 +1513,14 @@ public class CodeEditor extends Widget {
             return false;
         }
 
-        String safeReplacement = expandReplacement(sanitizeInputText(replacement, true), target);
-        clearSelection();
         int versionBefore = document.getVersion();
-        document.beginCompoundEdit();
+        String safeReplacement = sanitizeInputText(expandReplacement(replacement == null ? "" : replacement, target), true);
+        // A host filter can edit the document or change editability. Never apply stale coordinates.
+        if (disabled || readOnly || document.getVersion() != versionBefore) return false;
+        CodeEditorTextRange replaced = normalizeEditRange(target.line, target.match.start, target.line, target.match.end);
+        if (safeReplacement.equals(getTextRange(replaced))) return false;
+        clearSelection();
+        document.beginCompoundEdit("Replace Match");
         try {
             replaceSearchMatch(target, safeReplacement);
         } finally {
@@ -1519,6 +1530,7 @@ public class CodeEditor extends Widget {
             clearCurrentSearchMatch();
             return false;
         }
+        noteExactContentChange(versionBefore, replaced);
         markPendingContentChange(CodeEditorContentChangeType.REPLACE_CURRENT);
         clearCurrentSearchMatch();
         onDocumentMutated();
@@ -1528,6 +1540,11 @@ public class CodeEditor extends Widget {
         return true;
     }
 
+    /**
+     * Replaces matches as one undo step and returns the number whose text actually changed.
+     * Regex groups are expanded against the original document, then each insertion is filtered once.
+     * An entirely unchanged replacement preserves the selection, folds, version and undo/redo history.
+     */
     public int replaceAllSearchMatches(String replacement) {
         if (disabled || readOnly) {
             return 0;
@@ -1538,27 +1555,38 @@ public class CodeEditor extends Widget {
             return 0;
         }
 
-        String safeReplacement = sanitizeInputText(replacement, true);
-        expandCollapsedRegionsForSearchMatches();
+        int preflightVersion = document.getVersion();
+        String template = replacement == null ? "" : replacement;
         Array<SearchMatchRef> matchesToReplace = new Array<>(flatSearchMatches);
 
         // Group references have to be resolved against the untouched document, so they are expanded
         // up front rather than inside the edit loop, which rewrites the text as it walks backwards.
-        String[] expanded = null;
-        if (needsReplacementExpansion(safeReplacement)) {
-            expanded = new String[matchesToReplace.size];
-            for (int i = 0; i < matchesToReplace.size; i++) {
-                expanded[i] = expandReplacement(safeReplacement, matchesToReplace.get(i));
+        String[] expanded = new String[matchesToReplace.size];
+        boolean expand = needsReplacementExpansion(template);
+        for (int i = 0; i < matchesToReplace.size; i++) {
+            expanded[i] = expand ? expandReplacement(template, matchesToReplace.get(i)) : template;
+        }
+        Array<SearchMatchRef> changedMatches = new Array<>(matchesToReplace.size);
+        Array<String> replacements = new Array<>(matchesToReplace.size);
+        for (int i = 0; i < matchesToReplace.size; i++) {
+            String filtered = sanitizeInputText(expanded[i], true);
+            if (disabled || readOnly || document.getVersion() != preflightVersion) return 0;
+            SearchMatchRef target = matchesToReplace.get(i);
+            if (!filtered.equals(document.getTextRange(target.line, target.match.start, target.line, target.match.end))) {
+                changedMatches.add(target);
+                replacements.add(filtered);
             }
         }
+        // A no-op must not expand folds, clear a selection, discard redo or notify listeners.
+        if (changedMatches.size == 0) return 0;
 
+        expandCollapsedRegionsForSearchMatches(changedMatches);
         clearSelection();
         markPendingContentChange(CodeEditorContentChangeType.REPLACE_ALL);
-        document.beginCompoundEdit();
+        document.beginCompoundEdit("Replace All");
         try {
-            for (int i = matchesToReplace.size - 1; i >= 0; i--) {
-                replaceSearchMatch(matchesToReplace.get(i),
-                    expanded == null ? safeReplacement : expanded[i], false);
+            for (int i = changedMatches.size - 1; i >= 0; i--) {
+                replaceSearchMatch(changedMatches.get(i), replacements.get(i), false);
             }
         } finally {
             document.endCompoundEdit();
@@ -1566,7 +1594,7 @@ public class CodeEditor extends Widget {
 
         clearCurrentSearchMatch();
         onDocumentMutated();
-        return matchesToReplace.size;
+        return changedMatches.size;
     }
 
     public boolean isLineNumbersFixed() {
@@ -2001,6 +2029,21 @@ public class CodeEditor extends Widget {
         return document.getText();
     }
 
+    /** Returns whether the current canonical document text differs from its saved baseline. */
+    public boolean isDirty() {
+        return document.isDirty();
+    }
+
+    /** Marks the current document text as saved without changing its content or undo history. */
+    public void markSaved() {
+        document.markSaved();
+    }
+
+    /** Marks a previously persisted text snapshot as saved, even if the document has since changed. */
+    public void markSaved(String persistedText) {
+        document.markSaved(persistedText);
+    }
+
     public int getDocumentVersion() {
         return document.getVersion();
     }
@@ -2045,7 +2088,7 @@ public class CodeEditor extends Widget {
     /** Converts a document character offset to a line/column position. */
     public CodeEditorPosition toPosition(int offset) {
         int line = document.lineAtOffset(offset);
-        int column = document.columnAtOffset(offset);
+        int column = document.columnAtOffset(offset, line);
         return new CodeEditorPosition(line, column, document.toOffset(line, column));
     }
 
@@ -2346,7 +2389,9 @@ public class CodeEditor extends Widget {
 
     /** Moves the caret to a document character offset. */
     public void setCursorOffset(int offset) {
-        setCursorPosition(document.lineAtOffset(offset), document.columnAtOffset(offset));
+        int line = document.lineAtOffset(offset);
+        int column = document.columnAtOffset(offset, line);
+        setCursorPosition(line, column);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -2503,22 +2548,23 @@ public class CodeEditor extends Widget {
         if (disabled || readOnly) {
             return false;
         }
-        return replaceRangeSanitized(startLine, startColumn, endLine, endColumn,
-            sanitizeInputText(replacement, true));
+        int versionBefore = document.getVersion();
+        String safe = sanitizeInputText(replacement, true);
+        if (disabled || readOnly || document.getVersion() != versionBefore) return false;
+        return replaceRangeSanitized(startLine, startColumn, endLine, endColumn, safe);
     }
 
     /** Applies text that has already passed the input filter and newline normalization. */
     private boolean replaceRangeSanitized(int startLine, int startColumn, int endLine, int endColumn, String safe) {
+        CodeEditorTextRange range = normalizeEditRange(startLine, startColumn, endLine, endColumn);
+        if (safe.equals(getTextRange(range))) return false;
         int versionBefore = document.getVersion();
         document.beginCompoundEdit();
         try {
-            document.deleteRange(startLine, startColumn, endLine, endColumn);
+            document.deleteRange(range.startLine, range.startColumn, range.endLine, range.endColumn);
             if (!safe.isEmpty()) {
-                // A deletion moves the caret to the start of the range. An insertion
-                // into an empty range needs to place it explicitly.
-                if (document.getVersion() == versionBefore) {
-                    document.moveCursorTo(startLine, startColumn);
-                }
+                // A deletion moves the caret to the start. An insertion into an empty range must do so explicitly.
+                if (range.isEmpty()) document.moveCursorTo(range.startLine, range.startColumn);
                 document.insertText(safe);
             }
         } finally {
@@ -2527,6 +2573,7 @@ public class CodeEditor extends Widget {
         if (document.getVersion() == versionBefore) {
             return false;
         }
+        noteExactContentChange(versionBefore, range);
         clearSelection();
         markPendingContentChange(CodeEditorContentChangeType.REPLACE_CURRENT);
         onDocumentMutated();
@@ -2567,7 +2614,7 @@ public class CodeEditor extends Widget {
      * appear in a menu as what it was. See {@link #getUndoLabel()}.
      */
     public boolean applyEdits(Array<CodeEditorTextEdit> edits, String label) {
-        return applyEdits(edits, label, false);
+        return applyEdits(edits, label, false, null);
     }
 
     /** {@link #applyEditsExact(Array, String)} without a history label. */
@@ -2582,23 +2629,37 @@ public class CodeEditor extends Widget {
      * skipped. Useful for structural edits which must never lose characters while moving old text.
      */
     public boolean applyEditsExact(Array<CodeEditorTextEdit> edits, String label) {
-        return applyEdits(edits, label, true);
+        return applyEditsExact(edits, label, null);
     }
 
-    private boolean applyEdits(Array<CodeEditorTextEdit> edits, String label, boolean exact) {
+    /**
+     * Exact batch with an optional final commit predicate, useful for versioned asynchronous tools.
+     * The predicate runs once after input filtering, immediately before mutation, and must be cheap
+     * and free of side effects. Returning false preserves the text, caret, selection and history.
+     * Document version and editable state are rechecked after the predicate. Filters run only once.
+     */
+    public boolean applyEditsExact(Array<CodeEditorTextEdit> edits, String label,
+                                   java.util.function.BooleanSupplier commitGuard) {
+        return applyEdits(edits, label, true, commitGuard);
+    }
+
+    private boolean applyEdits(Array<CodeEditorTextEdit> edits, String label, boolean exact,
+                               java.util.function.BooleanSupplier commitGuard) {
         if (disabled || readOnly || !canApplyEdits(edits)) {
             return false;
         }
         int preflightVersion = document.getVersion();
         // The caret must follow the text actually inserted, including normalized newlines. Filter
         // once up front so a rejected insertion is a no-op and stateful filters are not run twice.
-        Array<CodeEditorTextEdit> ordered = new Array<CodeEditorTextEdit>(edits.size);
-        for (int i = 0; i < edits.size; i++) {
-            CodeEditorTextEdit edit = edits.get(i);
+        Array<CodeEditorTextEdit> proposed = new Array<>(edits);
+        Array<CodeEditorTextEdit> ordered = new Array<>(proposed.size);
+        for (int i = 0; i < proposed.size; i++) {
+            CodeEditorTextEdit edit = proposed.get(i);
             CodeEditorTextEdit sanitized = new CodeEditorTextEdit(edit.range,
                 sanitizeInputText(edit.replacement, true));
+            if (disabled || readOnly || document.getVersion() != preflightVersion) return false;
             if (exact && !sanitized.replacement.equals(edit.replacement)) return false;
-            if (exact && sanitized.replacement.equals(getTextRange(edit.range))) continue;
+            if (sanitized.replacement.equals(getTextRange(edit.range))) continue;
             if (!sanitized.isNoOp()) {
                 ordered.add(sanitized);
             }
@@ -2606,7 +2667,8 @@ public class CodeEditor extends Widget {
         if (ordered.size == 0) {
             return false;
         }
-        if (exact && (disabled || readOnly || document.getVersion() != preflightVersion)) return false;
+        if (commitGuard != null && !commitGuard.getAsBoolean()) return false;
+        if (disabled || readOnly || document.getVersion() != preflightVersion) return false;
         // Stable, so two edits at the same position keep the caller's order; combined with the
         // descending walk below that inserts them left to right as listed.
         ordered.sort(EDIT_ORDER);
@@ -2666,6 +2728,17 @@ public class CodeEditor extends Widget {
             }
         }
         return true;
+    }
+
+    private CodeEditorTextRange normalizeEditRange(int startLine, int startColumn, int endLine, int endColumn) {
+        startLine = clamp(startLine, 0, document.getLineCount() - 1);
+        endLine = clamp(endLine, 0, document.getLineCount() - 1);
+        startColumn = document.snapColumn(startLine, clamp(startColumn, 0, document.getLineLength(startLine)));
+        endColumn = document.snapColumn(endLine, clamp(endColumn, 0, document.getLineLength(endLine)));
+        if (comparePositions(startLine, startColumn, endLine, endColumn) > 0) {
+            return new CodeEditorTextRange(endLine, endColumn, startLine, startColumn);
+        }
+        return new CodeEditorTextRange(startLine, startColumn, endLine, endColumn);
     }
 
     private boolean isRangeInBounds(CodeEditorTextRange range) {
@@ -2843,11 +2916,13 @@ public class CodeEditor extends Widget {
         if (disabled || readOnly) {
             return false;
         }
+        CodeEditorTextRange range = normalizeEditRange(startLine, startColumn, endLine, endColumn);
         int versionBefore = document.getVersion();
-        document.deleteRange(startLine, startColumn, endLine, endColumn);
+        document.deleteRange(range.startLine, range.startColumn, range.endLine, range.endColumn);
         if (document.getVersion() == versionBefore) {
             return false;
         }
+        noteExactContentChange(versionBefore, range);
         clearSelection();
         markPendingContentChange(CodeEditorContentChangeType.DELETE);
         onDocumentMutated();
@@ -2895,12 +2970,37 @@ public class CodeEditor extends Widget {
             }
         }
         diagnosticVersion = version;
+        notifyDiagnosticsChanged();
         return true;
     }
 
     public void clearDiagnostics() {
         diagnostics.clear();
         diagnosticVersion = -1;
+        notifyDiagnosticsChanged();
+    }
+
+    /**
+     * Independent diagnostic-batch revision. Every accepted set or clear advances it, including an
+     * identical batch at the same document version. Rejected outdated batches leave it untouched.
+     */
+    public long getDiagnosticRevision() {
+        return diagnosticRevision;
+    }
+
+    public void addDiagnosticListener(CodeEditorDiagnosticListener listener) {
+        if (listener != null && !diagnosticListeners.contains(listener, true)) diagnosticListeners.add(listener);
+    }
+
+    public void removeDiagnosticListener(CodeEditorDiagnosticListener listener) {
+        diagnosticListeners.removeValue(listener, true);
+    }
+
+    private void notifyDiagnosticsChanged() {
+        long revision = ++diagnosticRevision;
+        // Diagnostic publication is infrequent; a fresh snapshot also supports nested publication.
+        Array<CodeEditorDiagnosticListener> targets = new Array<>(diagnosticListeners);
+        for (int i = 0; i < targets.size; i++) targets.get(i).onDiagnosticsChanged(this, revision);
     }
 
     /** Version the last diagnostic batch describes, or -1 after clearing/before the first batch. */
@@ -3244,6 +3344,8 @@ public class CodeEditor extends Widget {
         }
         expandCollapsedRegionsForEdit(EditIntent.TAB);
         markPendingContentChange(CodeEditorContentChangeType.INSERT);
+        CodeEditorTextRange replaced = selectionOrCaretRange();
+        int versionBefore = document.getVersion();
         document.beginCompoundEdit();
         try {
             deleteSelectionIfPresent();
@@ -3251,6 +3353,7 @@ public class CodeEditor extends Widget {
         } finally {
             document.endCompoundEdit();
         }
+        noteExactContentChange(versionBefore, replaced);
         onDocumentMutated();
     }
 
@@ -3827,6 +3930,8 @@ public class CodeEditor extends Widget {
             return true;
         }
         markPendingContentChange(CodeEditorContentChangeType.INSERT);
+        CodeEditorTextRange replaced = selectionOrCaretRange();
+        int versionBefore = document.getVersion();
         document.beginCompoundEdit();
         try {
             deleteSelectionIfPresent();
@@ -3834,6 +3939,7 @@ public class CodeEditor extends Widget {
         } finally {
             document.endCompoundEdit();
         }
+        noteExactContentChange(versionBefore, replaced);
         onDocumentMutated();
         return true;
     }
@@ -3961,7 +4067,7 @@ public class CodeEditor extends Widget {
 
     @Override
     public void act(float delta) {
-        flushDeferredMutationProcessing();
+        flushPendingContentChanges();
         updateStructureAnalysisDebounce(delta);
         updateSymbolAnalysisDebounce(delta);
         updateWrapRemeasureDebounce(delta);
@@ -4001,7 +4107,7 @@ public class CodeEditor extends Widget {
 
     @Override
     public void draw(Batch batch, float parentAlpha) {
-        flushDeferredMutationProcessing();
+        flushPendingContentChanges();
         ensureLayout();
         float originalScaleX = style.font.getData().scaleX;
         float originalScaleY = style.font.getData().scaleY;
@@ -6571,23 +6677,33 @@ public class CodeEditor extends Widget {
 
     private void onDocumentMutatedDeferred() {
         // No invalidateLayout() for the same reason as onDocumentMutated: the deferred
-        // flushDeferredMutationProcessing() calls ensureLayout(), which patches incrementally.
+        // flushPendingContentChanges() calls ensureLayout(), which patches incrementally.
         resetPreferredColumn();
         refreshBlink();
         deferredMutationProcessingPending = true;
     }
 
-    private void flushDeferredMutationProcessing() {
-        if (!deferredMutationProcessingPending) {
+    /**
+     * Processes content changes deferred by typing or paste. Tools which are about to navigate using
+     * positions maintained by content listeners can call this before reading those positions.
+     * An open compound edit is still published only when it closes.
+     */
+    public void flushPendingContentChanges() {
+        if (!deferredMutationProcessingPending || document.isCompoundEditInProgress()) {
             return;
         }
         deferredMutationProcessingPending = false;
         ensureLayout();
         ensureCursorVisible();
-        notifyContentChanged();
+        if (document.getVersion() != lastContentChangeVersion) notifyContentChanged();
     }
 
     private void notifyContentChanged() {
+        deferredMutationProcessingPending = false;
+        int version = document.getVersion();
+        int previousVersion = lastContentChangeVersion;
+        // Advance before invoking listeners: a listener's synchronous edit starts a new transition.
+        lastContentChangeVersion = version;
         if (contentListeners.size == 0) {
             pendingContentChangeType = CodeEditorContentChangeType.UNKNOWN;
             resetPendingContentRange();
@@ -6608,16 +6724,20 @@ public class CodeEditor extends Widget {
             endLine = Math.max(startLine, Math.min(pendingChangeEndLine, lastLine));
         }
 
+        boolean exact = exactChangeVersion == version;
         CodeEditorContentChangeEvent event = new CodeEditorContentChangeEvent(
             this,
             type,
-            document.getVersion(),
+            version,
             document.getCursorLine(),
             document.getCursorColumn(),
             startLine,
             endLine,
             pendingChangeRemovedLines,
-            pendingChangeInsertedLines
+            pendingChangeInsertedLines,
+            previousVersion,
+            exact ? pendingReplacedRange : null,
+            exact ? pendingInsertedRange : null
         );
         resetPendingContentRange();
         // Over a snapshot, because a listener is allowed to edit the document and to remove itself.
@@ -6674,7 +6794,41 @@ public class CodeEditor extends Widget {
         pendingChangeInsertedLines = document.getLineCount();
     }
 
+    /**
+     * Records a contiguous replacement immediately after the edit, while the caret is at its end.
+     * A later edit can be folded into it only if it touches no text outside the first insertion
+     * (e.g. typing several characters in one frame). Never join disjoint changes by their bounds.
+     */
+    private void noteExactContentChange(int versionBefore, CodeEditorTextRange replaced) {
+        int version = document.getVersion();
+        if (version == versionBefore || contentListeners.size == 0) return;
+        int endLine = document.getCursorLine();
+        int endColumn = document.getCursorColumn();
+        if (versionBefore == lastContentChangeVersion) {
+            pendingReplacedRange = replaced;
+        } else if (versionBefore == exactChangeVersion && pendingInsertedRange != null
+            && comparePositions(replaced.startLine, replaced.startColumn,
+                pendingInsertedRange.startLine, pendingInsertedRange.startColumn) >= 0
+            && comparePositions(replaced.endLine, replaced.endColumn,
+                pendingInsertedRange.endLine, pendingInsertedRange.endColumn) <= 0) {
+            if (pendingInsertedRange.endLine == replaced.endLine) {
+                endColumn += pendingInsertedRange.endColumn - replaced.endColumn;
+            } else {
+                endColumn = pendingInsertedRange.endColumn;
+                endLine += pendingInsertedRange.endLine - replaced.endLine;
+            }
+        } else {
+            return;
+        }
+        pendingInsertedRange = new CodeEditorTextRange(pendingReplacedRange.startLine,
+            pendingReplacedRange.startColumn, endLine, endColumn);
+        exactChangeVersion = version;
+    }
+
     private void resetPendingContentRange() {
+        exactChangeVersion = -1;
+        pendingReplacedRange = null;
+        pendingInsertedRange = null;
         pendingChangeStartLine = Integer.MAX_VALUE;
         pendingChangeEndLine = -1;
         pendingChangeRemovedLines = 0;
@@ -6694,6 +6848,17 @@ public class CodeEditor extends Widget {
         // Deleting from between the halves of a pair orphans one surrogate half into the surrounding text.
         document.deleteRange(selection.startLine, selection.startColumn, selection.endLine, selection.endColumn);
         clearSelection();
+    }
+
+    private boolean deleteSelectionAndNotify(CodeEditorContentChangeType type) {
+        CodeEditorTextRange selection = getSelection();
+        if (selection == null) return false;
+        int versionBefore = document.getVersion();
+        deleteSelectionIfPresent();
+        noteExactContentChange(versionBefore, selection);
+        markPendingContentChange(type);
+        onDocumentMutated();
+        return true;
     }
 
     public void selectAllText() {
@@ -6795,11 +6960,15 @@ public class CodeEditor extends Widget {
     }
 
     private int firstSearchMatchAtOrAfter(int line, int column) {
+        return firstSearchMatchAtOrAfter(flatSearchMatches, line, column);
+    }
+
+    private static int firstSearchMatchAtOrAfter(Array<SearchMatchRef> matches, int line, int column) {
         int low = 0;
-        int high = flatSearchMatches.size;
+        int high = matches.size;
         while (low < high) {
             int mid = (low + high) >>> 1;
-            SearchMatchRef ref = flatSearchMatches.get(mid);
+            SearchMatchRef ref = matches.get(mid);
             if (comparePositions(ref.line, ref.match.start, line, column) < 0) {
                 low = mid + 1;
             } else {
@@ -6883,7 +7052,7 @@ public class CodeEditor extends Widget {
         document.insertText(replacement);
     }
 
-    private void expandCollapsedRegionsForSearchMatches() {
+    private void expandCollapsedRegionsForSearchMatches(Array<SearchMatchRef> matches) {
         if (collapsedLines.size == 0) {
             return;
         }
@@ -6893,8 +7062,8 @@ public class CodeEditor extends Widget {
             if (!region.collapsed) {
                 continue;
             }
-            int index = firstSearchMatchAtOrAfter(region.startLine + 1, 0);
-            if (index < flatSearchMatches.size && flatSearchMatches.get(index).line <= region.endLine) {
+            int index = firstSearchMatchAtOrAfter(matches, region.startLine + 1, 0);
+            if (index < matches.size && matches.get(index).line <= region.endLine) {
                 scratchExpandLines.add(region.startLine);
             }
         }
@@ -7142,10 +7311,7 @@ public class CodeEditor extends Widget {
             return false;
         }
         expandCollapsedRegionsForEdit(EditIntent.DELETE);
-        markPendingContentChange(CodeEditorContentChangeType.CUT);
-        deleteSelectionIfPresent();
-        onDocumentMutated();
-        return true;
+        return deleteSelectionAndNotify(CodeEditorContentChangeType.CUT);
     }
 
     public boolean pasteClipboard() {
@@ -7273,12 +7439,18 @@ public class CodeEditor extends Widget {
         document.clearUndoHistory();
     }
 
-    private void replaceSelectionWith(String text) {
-        replaceSelectionWith(text, false);
+    private CodeEditorTextRange selectionOrCaretRange() {
+        CodeEditorTextRange selection = getSelection();
+        if (selection != null) return selection;
+        int line = document.getCursorLine();
+        int column = document.getCursorColumn();
+        return new CodeEditorTextRange(line, column, line, column);
     }
 
     private void replaceSelectionWith(String text, boolean deferPostMutationProcessing) {
         expandCollapsedRegionsForEdit(EditIntent.INSERT);
+        CodeEditorTextRange replaced = selectionOrCaretRange();
+        int versionBefore = document.getVersion();
         document.beginCompoundEdit();
         try {
             deleteSelectionIfPresent();
@@ -7286,6 +7458,7 @@ public class CodeEditor extends Widget {
         } finally {
             document.endCompoundEdit();
         }
+        noteExactContentChange(versionBefore, replaced);
         if (deferPostMutationProcessing) {
             onDocumentMutatedDeferred();
         } else {
@@ -7364,12 +7537,7 @@ public class CodeEditor extends Widget {
     private boolean performDeleteAction(CodeEditorAction action) {
         if (action == CodeEditorAction.BACKSPACE) {
             expandCollapsedRegionsForEdit(EditIntent.BACKSPACE);
-            if (getSelectionRange() != null) {
-                markPendingContentChange(CodeEditorContentChangeType.DELETE);
-                deleteSelectionIfPresent();
-                onDocumentMutated();
-                return true;
-            }
+            if (deleteSelectionAndNotify(CodeEditorContentChangeType.DELETE)) return true;
 
             if (dispatchAutoEditBackspace()) {
                 return true;
@@ -7377,10 +7545,11 @@ public class CodeEditor extends Widget {
 
             int lineBefore = document.getCursorLine();
             int columnBefore = document.getCursorColumn();
+            int versionBefore = document.getVersion();
             document.backspace();
-            if (lineBefore == document.getCursorLine() && columnBefore == document.getCursorColumn()) {
-                return false;
-            }
+            if (versionBefore == document.getVersion()) return false;
+            noteExactContentChange(versionBefore, new CodeEditorTextRange(
+                document.getCursorLine(), document.getCursorColumn(), lineBefore, columnBefore));
             markPendingContentChange(CodeEditorContentChangeType.DELETE);
             onDocumentMutated();
             return true;
@@ -7388,18 +7557,18 @@ public class CodeEditor extends Widget {
 
         if (action == CodeEditorAction.DELETE) {
             expandCollapsedRegionsForEdit(EditIntent.DELETE);
-            if (getSelectionRange() != null) {
-                markPendingContentChange(CodeEditorContentChangeType.DELETE);
-                deleteSelectionIfPresent();
-                onDocumentMutated();
-                return true;
-            }
+            if (deleteSelectionAndNotify(CodeEditorContentChangeType.DELETE)) return true;
 
+            int line = document.getCursorLine();
+            int column = document.getCursorColumn();
+            int oldLength = document.getLineLength(line);
             int versionBefore = document.getVersion();
             document.deleteForward();
-            if (versionBefore == document.getVersion()) {
-                return false;
-            }
+            if (versionBefore == document.getVersion()) return false;
+            CodeEditorTextRange removed = column == oldLength
+                ? new CodeEditorTextRange(line, column, line + 1, 0)
+                : new CodeEditorTextRange(line, column, line, column + oldLength - document.getLineLength(line));
+            noteExactContentChange(versionBefore, removed);
             markPendingContentChange(CodeEditorContentChangeType.DELETE);
             onDocumentMutated();
             return true;
@@ -9100,6 +9269,7 @@ public class CodeEditor extends Widget {
             return "";
         }
         String source = normalizeLineBreaks ? text.replace("\r\n", "\n").replace('\r', '\n') : text;
+        if (inputFilter == null) return source;
         StringBuilder builder = new StringBuilder(source.length());
         for (int i = 0; i < source.length(); i++) {
             char current = source.charAt(i);
@@ -12904,17 +13074,25 @@ public class CodeEditor extends Widget {
                     return true;
                 }
                 markPendingContentChange(CodeEditorContentChangeType.INSERT);
+                CodeEditorTextRange replaced = selectionOrCaretRange();
+                int versionBefore = document.getVersion();
                 // Grouped only when there is genuinely more than one mutation to group: a closing brace
                 // that also dedents, or a keystroke that replaces a selection. A plain character is a
                 // single insertChar, and wrapping that in a group suppressed undo merging entirely --
                 // CodeDocument.recordUndo only consults the merge rule at compound depth 0, and
                 // endCompoundEdit resets the merge state on the way out. Grouping every keystroke made
                 // typing one undo step per character while Backspace, which is not grouped, merged.
-                if (character == '}' || hasSelection()) {
+                if (character == '}' || !replaced.isEmpty()) {
                     document.beginCompoundEdit();
                     try {
                         if (character == '}') {
                             document.dedentBeforeClosingBrace();
+                            if (document.getVersion() != versionBefore) {
+                                // Without a selection, dedent and typing replace one leading span.
+                                // With a selection they may touch disjoint spans; don't guess.
+                                replaced = replaced.isEmpty() ? new CodeEditorTextRange(replaced.startLine, 0,
+                                    replaced.endLine, replaced.endColumn) : null;
+                            }
                         }
                         deleteSelectionIfPresent();
                         document.insertChar(character);
@@ -12924,6 +13102,7 @@ public class CodeEditor extends Widget {
                 } else {
                     document.insertChar(character);
                 }
+                if (replaced != null) noteExactContentChange(versionBefore, replaced);
                 onDocumentMutatedDeferred();
                 // After insertion, so a trigger character sees the document as the user left it.
                 dispatchInterceptorAfterKeyTyped(character);
