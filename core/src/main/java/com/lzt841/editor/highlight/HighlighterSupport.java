@@ -102,6 +102,19 @@ final class HighlighterSupport {
         return index;
     }
 
+    /** Matches the Java identifier-start predicate used by the Java-like lexers, by code point. */
+    static int readJavaIdentifier(CharSequence line, int start) {
+        int index = start;
+        while (index < line.length()) {
+            int codePoint = Character.codePointAt(line, index);
+            if (!Character.isJavaIdentifierPart(codePoint)) {
+                break;
+            }
+            index += Character.charCount(codePoint);
+        }
+        return index;
+    }
+
     static int readNumber(CharSequence line, int start) {
         int index = start;
         if (index >= line.length()) {

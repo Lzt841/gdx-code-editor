@@ -150,8 +150,8 @@ public class KotlinCodeHighlighter extends AbstractIncrementalHighlighter {
                 index = end;
                 continue;
             }
-            if (Character.isJavaIdentifierStart(c)) {
-                int end = HighlighterSupport.readIdentifier(line, index);
+            if (Character.isJavaIdentifierStart(Character.codePointAt(line, index))) {
+                int end = HighlighterSupport.readJavaIdentifier(line, index);
                 if (wantSpans) {
                     HighlighterSupport.addSpan(spans, index, end, colorForWord(line, index, end, style));
                 }

@@ -4,6 +4,8 @@
 
 The library is designed for in-app script editors, config editors, lightweight IDE tools, and any Scene2D UI that needs an embeddable code editor.
 
+See [CHANGELOG.md](CHANGELOG.md) for release notes.
+
 ## Features
 
 - Scene2D `Widget`-based `CodeEditor`
@@ -15,6 +17,7 @@ The library is designed for in-app script editors, config editors, lightweight I
 - Fixed or scrolling line numbers
 - Search highlight and current-match highlight
 - Literal, whole-word and regular expression search, optionally confined to the selection
+- Optional Scene2D find and replace toolbar with live match counts and keyboard shortcuts
 - Find next / previous match
 - Replace current / replace all
 - Undo / redo with named compound edits and a configurable history budget
@@ -25,7 +28,15 @@ The library is designed for in-app script editors, config editors, lightweight I
 - Right-click / long-press integration hooks
 - Read-only and disabled modes
 - Rebindable keyboard shortcuts through a named-action keymap
+- String-ID command registry with metadata, enable conditions and exact shortcuts for host actions
+- Searchable, keyboard/touch command palette with live availability and shortcut hints
+- Runtime command shortcut rebinding, with atomic conflict checks
+- Optional extensions with scoped resources, install rollback and deterministic unload
+- Undoable uppercase/lowercase selection and trailing-whitespace cleanup extension
+- Whole-line move, duplicate and delete commands, preserving caret and selection direction
 - Code completion with a built-in popup and documentation side panel
+- Multiple named completion sources with async merging, cancellation and scoped extension registration
+- Reusable snippet-pack extensions with conditional availability and independent unload
 - Snippets with placeholder tabbing, mirrored stops, choices and variables
 - Hover tooltips and parameter hints
 - Go to definition, find references and rename, with a word-level fallback
@@ -46,6 +57,7 @@ The library is designed for in-app script editors, config editors, lightweight I
   - content, caret, hover and scroll observation
   - keyboard interception
   - key chord to named action mapping
+  - custom commands and extension lifecycle
   - navigation (definition, references, rename)
 
 ## Screenshots
@@ -77,7 +89,7 @@ Add the dependency:
 
 ```gradle
 dependencies {
-    implementation 'com.github.Lzt841:gdx-code-editor:v0.0.6'
+    implementation 'com.github.Lzt841:gdx-code-editor:v1.3.0'
 }
 ```
 
@@ -90,7 +102,7 @@ repositories {
 }
 
 dependencies {
-    implementation("com.github.Lzt841:gdx-code-editor:v0.0.6")
+    implementation("com.github.Lzt841:gdx-code-editor:v1.3.0")
 }
 ```
 
@@ -98,6 +110,7 @@ dependencies {
 
 ```java
 import com.badlogic.gdx.graphics.g2d.BitmapFont;
+import com.badlogic.gdx.graphics.Color;
 import com.badlogic.gdx.scenes.scene2d.Stage;
 import com.badlogic.gdx.scenes.scene2d.ui.Table;
 import com.lzt841.editor.CodeEditor;
@@ -149,6 +162,9 @@ editor.setHighlighter(BuiltinCodeHighlighters.plainText());
 ```
 
 All of them are incremental, so the editor only highlights the lines it draws.
+The Java, Kotlin, JavaScript and Python identifier scanners read complete Unicode code points and
+use consistent start/continuation rules. Dollar signs, currency symbols and supplementary letters
+cannot stall the scanner or turn a suffix inside an identifier into a standalone keyword.
 
 ## Semantic Highlighting
 
@@ -536,6 +552,31 @@ Set the symbol provider before the first analysis, or call `editor.setStructureP
 
 ## Search and Replace
 
+Add the optional toolbar to the same Stage as the editor, using your Scene2D styles:
+
+```java
+import com.lzt841.editor.search.CodeSearchBar;
+import com.badlogic.gdx.scenes.scene2d.ui.Label;
+import com.badlogic.gdx.scenes.scene2d.ui.TextButton;
+import com.badlogic.gdx.scenes.scene2d.ui.TextField;
+
+CodeSearchBar search = new CodeSearchBar(editor,
+    skin.get(TextField.TextFieldStyle.class),
+    skin.get(TextButton.TextButtonStyle.class),
+    skin.get(Label.LabelStyle.class));
+root.add(search).growX();
+root.row();
+root.add(editor).grow();
+stage.addCaptureListener(search.createShortcutListener());
+```
+
+The toolbar starts collapsed. **Find** (Ctrl/Cmd+F) opens it and can prefill a single-line editor
+selection. Enter and Shift+Enter in the find field move between matches; Escape closes the toolbar
+and clears the highlights. **Replace** (Ctrl/Cmd+H) shows the replacement field and the actions for
+one match or all matches. Read-only editors still support finding matches.
+
+You can also build your own interface on the editor's search API:
+
 ```java
 editor.setSearchText("value");
 editor.setSearchCaseSensitive(false);
@@ -572,9 +613,10 @@ if (!editor.isSearchPatternValid()) {
 editor.replaceAllSearchMatches("$2 = $1");
 ```
 
-A word character is a letter, a digit or `_`, the same definition double-click selection uses. Whole
-word applies to regex matches too, so `\w+` in whole-word mode will not report the tail of a longer
-identifier.
+A word character is a Unicode letter, a Unicode digit or `_`, the same definition double-click
+selection and completion word ranges use. The check works by code point, so a non-BMP letter is kept
+with the identifier instead of being treated as two unrelated UTF-16 `char`s. Whole-word applies to
+regex matches too, so `\w+` in whole-word mode will not report the tail of a longer identifier.
 
 Patterns are applied **one line at a time**. That is what keeps the per-line match cache usable on a
 100k line document, and it has two consequences worth knowing:
@@ -940,19 +982,32 @@ editor.insertTextAtCursor("text");
 editor.deleteRange(0, 0, 0, 4);
 editor.applyEdits(edits);                            // a rename, a quick fix, a formatter
 editor.applyEdits(edits, "Rename count to total");   // same, with a name for the undo step
+editor.applyEditsExact(edits, "Move Lines");         // rejects the batch if filtering would change text
 editor.runAsSingleUndoStep(() -> { /* several edits, one undo */ });
 ```
 
 `applyEdits` is the batch form. Positions in the array refer to the document as it is now, in any
-order; the editor sorts them, checks they are in bounds and do not overlap, and then applies
-last-to-first as one undo step. A bad batch is rejected whole, so a half-applied rename cannot happen.
+order; the editor sorts them, checks they are in bounds, do not overlap, and do not split a UTF-16
+surrogate pair, then applies them last-to-first as one undo step. A bad batch is rejected whole, so a
+half-applied rename cannot happen.
 The caret is carried along rather than being left at the document-first edit. `canApplyEdits` runs the
 same check without mutating anything.
+
+Batch replacements pass through the input filter and newline normalization once before editing. The
+caret follows the resulting text, so rejected characters and CR/CRLF line endings do not shift it to
+the wrong position. Empty deletions, empty replacements and batches with no effective edits return
+`false`, preserve the selection and undo/redo history, and emit no content-change event.
+
+Use `applyEditsExact` for edits which must retain every replacement character. It checks the same
+ranges and filters replacements once, but rejects the entire batch if any character is removed or
+newline normalization would alter a replacement. Supply LF newlines. Identical replacements are
+skipped; a fully unchanged/rejected batch keeps the selection, caret, document version and history.
+This makes moving existing text safe even if the host has since installed a more restrictive filter.
 
 ## Keyboard Shortcuts
 
 Every chord goes through a `CodeKeymap`, so anything can be rebound. A new editor starts with
-`CodeKeymap.editorDefaults()`, which is exactly the set the editor always had:
+`CodeKeymap.editorDefaults()`, with the following bindings:
 
 | Chord | Action |
 | --- | --- |
@@ -961,6 +1016,7 @@ Every chord goes through a `CodeKeymap`, so anything can be rebound. A new edito
 | Enter, Numpad Enter | `NEW_LINE` |
 | Tab, Shift-Tab | `INDENT`, `DEDENT` |
 | F2 | `TOGGLE_FOLD` |
+| F8, Shift-F8 | `DIAGNOSTIC_NEXT`, `DIAGNOSTIC_PREVIOUS` |
 | Ctrl-Z, Ctrl-Shift-Z, Ctrl-Y | `UNDO`, `REDO`, `REDO` |
 | Ctrl-A, Ctrl-C, Ctrl-X, Ctrl-V | `SELECT_ALL`, `COPY`, `CUT`, `PASTE` |
 | Ctrl-Space | `COMPLETION_TRIGGER` |
@@ -1002,6 +1058,235 @@ completion.getPopupKeymap()
 
 Navigation has the same split: F12, Shift-F12 and Shift-F6 live on `CodeNavigationController.getKeymap()`,
 not on the editor's, so they cannot collide with fold-on-F2.
+
+## Commands and Extensions
+
+Use `editor.getCommands()` for custom actions without extending `CodeEditorAction`. The registry is
+created lazily, shared with `editor.getExtensions()`, and belongs to one editor. A menu, toolbar or
+command picker can use the same command and its current enable condition:
+
+```java
+import com.badlogic.gdx.Input;
+import com.badlogic.gdx.utils.Disposable;
+import com.lzt841.editor.CodeEditorCommand;
+import com.lzt841.editor.CodeKeyStroke;
+
+Disposable registration = editor.getCommands().register(new CodeEditorCommand(
+    "app.insertTodo", "Insert TODO", "Editing", true,
+    e -> !e.isPasswordMode(),
+    e -> e.insertTextAtCursor("// TODO: ")
+), CodeKeyStroke.ctrlAlt(Input.Keys.T));
+
+boolean available = editor.getCommands().isEnabled("app.insertTodo");
+boolean handled = editor.getCommands().execute("app.insertTodo");
+
+// Snapshots in registration order; all query terms must match ID, label or category.
+editor.getCommands().findCommands("editing todo", true); // enabled commands only
+editor.getCommands().getCommands();
+editor.getCommands().getShortcuts("app.insertTodo");
+registration.dispose(); // removes this registration and its shortcuts, once
+```
+
+IDs must be nonblank without surrounding whitespace. Duplicate IDs or custom shortcut chords throw
+`IllegalArgumentException` before registering anything. Custom shortcuts require an exact modifier
+match, honor the editor keymap's Ctrl/Command policy, and do not use its Shift/movement fallbacks.
+The registry participates in input interceptor registration order; earlier interceptors may consume
+the key first. A handled custom command takes precedence over the built-in keymap without changing
+that map. Unregistering restores normal routing. A false result lets later handlers process the key;
+it can also mean the command is missing, disabled, or made no change. `executeShortcut(stroke)` is an
+explicit entry point for a host key router.
+
+Commands may opt into `consumeShortcutOnNoOp` through the final boolean argument of the full
+`CodeEditorCommand` constructor. Their registered key is then consumed even when the command is
+unavailable or returns false, preventing a boundary/no-op from falling back to a different editor
+action. Character suppression applies as usual. This is opt-in: existing commands keep their routing.
+Direct `execute(id)` and `executeShortcut(stroke)` still report the actual handler result.
+
+Handled keyboard commands also suppress their following character events until key release or the
+next key-down/focus loss, so a plain-letter shortcut does not insert that letter as well. Input interceptors can
+observe `onKeyUp` for their own transient state; releases reach every interceptor, even when disabled.
+
+Rebind a command without unloading its extension or replacing its registration handle:
+
+```java
+editor.getCommands().setShortcuts("app.insertTodo", CodeKeyStroke.ctrlShift(Input.Keys.T));
+editor.getCommands().setShortcuts("app.insertTodo"); // remove shortcuts, keep the command
+long revision = editor.getCommands().getRevision(); // registration/shortcut changes, not enable conditions
+```
+
+`setShortcuts` returns false for an unknown ID. Invalid or conflicting bindings throw before changing
+any old binding; the command keeps its registration order and original disposal handle. Unloading an
+extension also removes its rebound shortcuts. Disposed registries reject registrations and rebinding.
+
+### Command Palette
+
+The optional `CodeCommandPalette` is a Scene2D modal window which searches all registered commands by
+ID, label and category. A scoped extension supplies the open command and Ctrl/Command+Shift+P shortcut:
+
+```java
+import com.lzt841.editor.commands.CodeCommandPalette;
+import com.lzt841.editor.commands.CodeCommandPalette.CodeCommandPaletteStyle;
+import com.lzt841.editor.extensions.CodeCommandPaletteExtension;
+import com.lzt841.editor.extensions.CodeStandardCommandsExtension;
+
+CodeCommandPaletteStyle paletteStyle = new CodeCommandPaletteStyle(fieldStyle, buttonStyle, labelStyle);
+paletteStyle.window.background = panelDrawable;
+paletteStyle.scroll = scrollPaneStyle; // optional scrollbar appearance
+CodeCommandPaletteExtension paletteExtension = new CodeCommandPaletteExtension(paletteStyle);
+editor.getExtensions().install(new CodeStandardCommandsExtension());
+editor.getExtensions().install(paletteExtension);
+
+CodeCommandPalette palette = paletteExtension.getPalette();
+palette.open(); // editor must be attached to a Stage; the window adds/removes itself
+palette.open("view wrap");
+palette.setEnabledOnly(true); // default false: unavailable commands are visible but disabled
+palette.setExecutionListener((command, handled) -> {
+    // Update host feedback after the palette closes and the command returns.
+});
+// User-configured bindings can replace the default open shortcut:
+editor.getCommands().setShortcuts(CodeCommandPaletteExtension.SHOW, CodeKeyStroke.of(Input.Keys.F6));
+editor.getExtensions().uninstall(CodeCommandPaletteExtension.ID); // closes and disposes the palette
+```
+
+Up/Down wrap through matches, Page Up/Down move a page, Enter runs the selected available command,
+and Escape closes. Touch/click runs a row; Run and Close buttons provide explicit touch actions.
+Home/End and normal query editing remain with the search field. IME Enter is supported without a
+key-down event. A modal outside click dismisses the palette without moving the editor's caret.
+The palette stays inside the Stage when resized and scrolls long result lists. Mobile controls use
+at least 44 density-scaled units per row; `maxWidth`, `maxHeight`, `edgeMargin`, `rowHeight` and
+`maxVisibleRows` can be adjusted through the style. Styles, fonts and drawables remain host-owned.
+
+Opening and filtering preserve the editor selection. Closing restores the previous valid keyboard
+and scroll focus; execution restores focus before invoking the command, so a handler can then focus
+its own UI. External focus changes close the palette without taking focus back. Disabled/password
+editors cannot open it, and those mode changes, editor removal or registry disposal close an open
+palette on its next `act`. Read-only editors can still browse and execute view or copy commands.
+Registration and shortcut changes refresh on the next `act`; external enable conditions are polled
+every `refreshInterval` seconds (default 0.15) while open, or immediately with `refresh()`. Closed
+palettes do not poll. Availability and command identity are checked again at execution, including
+after focus restoration; a removed/reused ID cannot execute a replacement through a stale row.
+
+The palette shows actual registry shortcuts, including runtime rebindings. It does not infer the
+independent native keymap's bindings. `CodeStandardCommandsExtension` exposes ten unbound commands:
+undo, redo, select all, copy/cut selection, paste, word wrap, line-number visibility and next/previous
+diagnostic. Existing native keys remain unchanged. History requires a writable editor and an actual
+undo/redo entry, clipboard copy/cut require a selection, and diagnostic commands reject stale analysis.
+Content commands are unavailable in password mode; view toggles remain callable directly. Paste
+availability does not inspect clipboard contents; an empty/rejected paste returns false. A false/no-op
+handler still closes the palette and reports its result to the execution listener.
+
+All commands are disabled when the editor is disabled. `requiresEditable=true` also blocks read-only
+execution; the optional condition supplies other restrictions such as selection or password mode.
+Commands that only affect a host view can remain available in read-only/password mode. Handlers use
+the existing edit APIs and can group multiple mutations with `runAsSingleUndoStep(label, edits)`.
+The registry does not automatically wrap view commands or asynchronous work in an undo group.
+
+### Scoped Extension Lifecycle
+
+An extension can register commands, content/caret listeners and input interceptors through its
+`CodeExtensionContext`. The scope removes them on unload and rolls them back if installation throws:
+
+```java
+import com.lzt841.editor.extensions.CodeEditorExtension;
+import com.lzt841.editor.extensions.CodeExtensionContext;
+
+editor.getExtensions().install(new CodeEditorExtension() {
+    @Override public String getId() { return "app.todo"; }
+
+    @Override public void install(CodeExtensionContext context) {
+        context.registerCommand(new CodeEditorCommand("app.todo.insert", "Insert TODO",
+            "Editing", true, e -> !e.isPasswordMode(),
+            e -> e.insertTextAtCursor("// TODO: ")));
+        context.addContentListener((source, event) -> {
+            // Schedule your analysis for this document version.
+        });
+        // context.addCaretListener(...);
+        // context.addInputInterceptor(...);
+        // context.own(disposableResource);
+        // context.onDispose(controller::uninstall); // also suitable for request cancellation
+    }
+
+    @Override public void uninstall() {
+        // Optional final hook, after the scoped resources have been released.
+    }
+});
+
+editor.getExtensions().getInstalledIds(); // independent snapshot, installation order
+editor.getExtensions().uninstall("app.todo");
+editor.getExtensions().clear(); // reusable; directly registered host commands remain
+// When destroying the editor, before its Stage/fonts are disposed:
+editor.getExtensions().dispose(); // terminal, idempotent; also clears host commands
+```
+
+Use a separate extension instance for each editor. Run registry and lifecycle calls on the GDX
+thread. Resources are released in reverse registration order and extensions in reverse installation
+order, continuing after cleanup errors and preserving additional failures as suppressed exceptions.
+The same disposable is owned once per scope by identity. Listener registrations are isolated even
+when extensions share a listener object. A closed scope rejects new registrations and suppresses
+callbacks still present in an in-progress dispatch. Lifecycle callbacks may register resources but
+must not recursively install, unload, clear or dispose the manager. An unsuccessful installation
+does not receive the `uninstall()` hook. Arbitrary side effects need an `own`/`onDispose` cleanup;
+they cannot be rolled back automatically. Removing the actor from a Stage does not unload extensions.
+
+### Built-in Text Editing Extension
+
+```java
+import com.lzt841.editor.extensions.CodeTextEditingExtension;
+
+editor.getExtensions().install(new CodeTextEditingExtension());
+editor.getCommands().execute(CodeTextEditingExtension.UPPERCASE_SELECTION);
+editor.getCommands().execute(CodeTextEditingExtension.LOWERCASE_SELECTION);
+editor.getCommands().execute(CodeTextEditingExtension.TRIM_TRAILING_WHITESPACE);
+editor.getExtensions().uninstall(CodeTextEditingExtension.ID);
+```
+
+Uppercase uses Ctrl+Shift+U; lowercase uses Ctrl+Alt+U. Both require a selection, use locale-independent
+Unicode case mapping, and keep the transformed text selected using its actual filtered length.
+Trailing-whitespace cleanup removes ASCII spaces and tabs at line ends throughout the document,
+preserving line breaks, non-breaking spaces and indentation before content. It has no default shortcut.
+Each changed command is one named undo step; already-normalized input creates no edit. All three
+commands respect read-only, disabled and password modes. The extension is opt-in and unloading it
+removes all three commands and their shortcuts.
+
+### Whole-Line Editing Extension
+
+```java
+import com.lzt841.editor.extensions.CodeLineEditingExtension;
+
+editor.getExtensions().install(new CodeLineEditingExtension());
+editor.getCommands().execute(CodeLineEditingExtension.MOVE_UP);
+editor.getCommands().execute(CodeLineEditingExtension.DUPLICATE_DOWN);
+editor.getExtensions().uninstall(CodeLineEditingExtension.ID);
+
+// Menu/palette-only commands, without default key bindings:
+editor.getExtensions().install(new CodeLineEditingExtension(false));
+```
+
+| Command constant | Default shortcut |
+| --- | --- |
+| `MOVE_UP` / `MOVE_DOWN` | Alt+Up / Alt+Down |
+| `DUPLICATE_UP` / `DUPLICATE_DOWN` | Alt+Shift+Up / Alt+Shift+Down |
+| `DELETE` | Ctrl/Command+Shift+K, following the editor keymap policy |
+
+The commands appear in the command palette under **Lines**. Without a selection they operate on the
+caret's logical document line; with a selection they operate on every touched logical line. An end
+at the next line's column zero excludes that next line. Wrapped screen rows are not separate lines.
+Moves swap the entire block with its neighboring line. Copies keep the caret or selection on the new
+copy, while moves retain its relative position; forward/backward selection direction is preserved.
+An exclusive endpoint moved past the document end is represented by the final line's end column.
+
+Deleting a block includes one adjacent separator so it does not leave a phantom empty line. Deleting
+all content leaves one empty document line. A selected deletion collapses at the first surviving line,
+column zero; a caret-only deletion retains its column where possible. The final empty line of a file
+with a trailing newline can be deleted to remove that newline.
+
+Every content-changing operation uses `applyEditsExact` and is one named undo step. If a filter would
+remove a character or separator, the whole operation is rejected. Pure deletion inserts nothing to
+filter. An unavailable move at the document boundary changes neither text nor selection; swapping
+identical neighboring text still moves the caret without creating a content edit or undo entry.
+Registered line-editing chords are reserved even on no-ops, so Alt+Up/Down cannot unexpectedly fall
+back to ordinary movement and collapse the selection. All five commands require a writable, enabled
+editor outside password mode. Unloading the extension removes its commands and any rebound keys.
 
 ## Auto Edit Strategies
 
@@ -1123,7 +1408,14 @@ public class MyProvider implements CodeCompletionProvider {
 ```
 
 `request.prefix` is the typed text, `request.replaceRange` is what an accepted item replaces. Stale
-responses are discarded automatically, so a slow provider cannot repopulate a dismissed popup.
+responses are discarded automatically when a newer request is made, the popup is dismissed, or the
+document version, caret position or selection changes before the response arrives. Read-only,
+disabled and password-mode editors neither request nor accept completions. Uninstalling the
+controller cancels pending requests, including requests triggered before installation. If the editor
+changes to one of those modes while the popup is open, its next completion interaction dismisses it
+without consuming the editor key. Prefix filtering compares Unicode code points, including
+case-insensitive matches for supplementary letters. Typing those letters keeps the popup open;
+completing a non-word code point such as an emoji dismisses it.
 
 For a fixed word list:
 
@@ -1133,6 +1425,80 @@ new CodeCompletionController(editor, new KeywordCompletionProvider("if", "else",
 
 Customise the popup through `CodeCompletionPopup.CodeCompletionPopupStyle`, or subclass it and
 override `drawItem`.
+
+### Completion Sources and Extension Packs
+
+The existing `(editor, myProvider)` constructor still uses exactly that provider. Use the shared
+registry to combine host completions with independently installed extensions:
+
+```java
+import com.badlogic.gdx.utils.Disposable;
+import com.lzt841.editor.completion.CodeCompletionItem;
+import com.lzt841.editor.completion.KeywordCompletionProvider;
+import com.lzt841.editor.extensions.CodeCompletionExtension;
+import com.lzt841.editor.extensions.CodeSnippetExtension;
+
+// A host contribution survives getExtensions().clear(); dispose its handle to remove it explicitly.
+Disposable keywords = editor.getCompletionProviders().register("app.keywords",
+    new KeywordCompletionProvider("if", "else", "for"));
+
+CodeCompletionExtension completionExtension = new CodeCompletionExtension();
+editor.getExtensions().install(completionExtension);
+editor.getExtensions().install(new CodeSnippetExtension("app.javaSnippets",
+    CodeCompletionItem.snippet("fori", "for (int ${1:i} = 0; $1 < ${2:count}; $1++) {\n\t$0\n}", "for loop"),
+    CodeCompletionItem.snippet("sout", "System.out.println(${1:value});$0", "print value")));
+
+completionExtension.getController().triggerManually();
+editor.getExtensions().uninstall("app.javaSnippets"); // closes stale results; host keywords remain
+```
+
+`CodeCompletionExtension` owns the controller, popup, active snippet session and the
+`editor.completion.trigger` command. Ctrl-Space uses the existing editor keymap; the command also
+appears as **Show Completions** in a command palette. The command focuses the editor before requesting
+results. Unloading the extension cancels requests and removes the popup and command. A bare
+`new CodeCompletionController(editor)` also uses the shared registry; install/uninstall it yourself
+when using that form. Avoid installing two controllers on the same editor at once.
+
+Custom extensions register providers through their scope:
+
+```java
+// Inside CodeEditorExtension.install(context):
+context.registerCompletionProvider("app.language", myProvider,
+    request -> !request.editor.isInStringOrComment(request.line, request.column));
+```
+
+Provider IDs must be unique and non-blank. A duplicate is rejected without replacing the existing
+source. Returned registration handles remove only their original source, even when its ID is reused.
+Scope unload and failed-install rollback remove the scope's contributions. Providers remain
+host-owned: use `context.own(...)` separately if a provider has resources the scope should dispose.
+The extension manager's `dispose()` closes the shared registry as well as its commands and scopes.
+
+Each request snapshots all registered sources, evaluates their conditions and waits for every enabled
+source to respond once. Responses may arrive in any order; the merged output follows registration
+order before the controller applies its usual relevance sorting. Equivalent label, match text,
+insertion text and insertion format are deduplicated with the first source winning. Plain text and
+snippet insertions stay distinct. Arrays are copied on delivery and null candidates are ignored.
+Register individual providers directly; nesting registries is rejected.
+
+An empty source must still respond, and asynchronous providers must deliver from the GDX thread.
+`response.isCancelled()` lets a provider avoid work after dismissal, editing, supersession, unload or
+disposal. It does not interrupt background tasks; marshal back to the GDX thread before checking it
+or calling `complete`. A source that never responds keeps its request pending until cancellation.
+Runtime exceptions in a source, condition or trigger check are reported and do not block healthy
+sources. Use `setFailureListener((id, exception) -> ...)` on the registry for host error reporting;
+otherwise errors are logged through `Gdx.app.error` when an application is available.
+
+Registration changes invalidate pending snapshots and dismiss installed shared-registry controllers;
+late callbacks cannot reopen the popup or commit stale candidates. Trigger again to query the new
+sources. Conditions are evaluated per request. Call `editor.getCompletionProviders().invalidate()`
+after changing external state used by a condition, such as the active language, to dismiss results
+from the old state immediately. `getRevision()` reports these changes for host caches.
+
+`CodeSnippetProvider` can also be used directly with snippet-format items. Its pack and result arrays
+are independent snapshots. Labels may carry decorations: set an item's `filterText` to the prefix
+users type, and retain detail, documentation and priority as with other completion items. Snippet
+packs use the existing placeholder, mirror, choice and variable engine; they do not introduce their
+own text-edit path. They add no punctuation triggers of their own.
 
 ### Documentation Side Panel
 
@@ -1285,13 +1651,43 @@ was thinking is treated as stale for the same reason.
 Defaults are F12, Shift+F12 and Shift+F6, in this controller's own keymap rather than the editor's.
 Rename is not on F2 because this editor has always folded with F2.
 
+F4 and Shift+F4 browse the next and previous retained navigation result, wrapping at either end.
+This reuses the provider's answer, so browsing references does not repeat a full-document scan or
+language-server request. A host can also use the same API from buttons:
+
+```java
+// Once a definition/reference request has delivered its results:
+navigation.navigateToNextTarget();
+navigation.navigateToPreviousTarget();
+int count = navigation.getTargetCount();       // allocation-free
+int index = navigation.getLastTargetIndex();   // zero-based; -1 before the first visit
+Array<CodeNavigationTarget> snapshot = navigation.getLastTargets();
+```
+
+Results retain provider order and expire after a document edit, a new navigation request or
+`uninstall()`. Invalid local ranges and null entries are ignored; result browsing skips external
+targets the host cannot open. Snapshot arrays can be modified without changing the controller's
+retained list. When a host handles `onMultipleTargets`, browsing starts at its chosen target, or at
+the first/last result if no target has been chosen yet.
+
+Delayed navigation replies are accepted only while the document version, caret and selection still
+match the request. For a host-owned results list, pass the original request to `navigateTo(target,
+request)` to reject a selection made after the document has changed. Disabled and password-mode
+editors neither request nor accept navigation. Read-only editors can navigate, but cannot rename;
+rename also rechecks the editor mode when asynchronous edits arrive. Uninstalling cancels pending
+navigation and rename responses, including requests made before `install()`.
+
 ```java
 navigation.getKeymap()
     .unbindAction(CodeEditorAction.NAVIGATE_RENAME)
     .bind(CodeKeyStroke.ctrl(Input.Keys.F2), CodeEditorAction.NAVIGATE_RENAME);
 ```
 
-The word-level fallback cannot tell two same-named locals apart, matches inside strings and comments,
+`getWordRangeAt` and `getWordPrefixAt` treat `$` as part of an identifier, while whole-word search and
+double-click selection keep their existing Unicode letter/digit/underscore boundaries.
+The word-level fallback recognises Unicode code points, including supplementary letters and `$` in
+identifiers, so a partial name beside those characters is not treated as a separate occurrence. It
+cannot tell two same-named locals apart, matches inside strings and comments,
 and never leaves the current document. Anything that needs to be right about scope needs a provider
 that understands the language.
 
@@ -1304,14 +1700,37 @@ editor.setDiagnostics(found);
 
 CodeDiagnostic worst = editor.getPrimaryDiagnosticAt(line, column);
 Array<CodeDiagnostic> all = editor.getDiagnosticsAt(line, column);
+
+CodeDiagnostic next = editor.navigateToNextDiagnostic();
+CodeDiagnostic previous = editor.navigateToPreviousDiagnostic();
+CodeDiagnostic nextError = editor.navigateToNextDiagnostic(CodeDiagnosticSeverity.ERROR);
 editor.clearDiagnostics();
 ```
 
 Each range gets a squiggle and a severity-coloured tick in the gutter. Colours and squiggle geometry
 come from `CodeEditorStyle` (`diagnosticErrorColor`, `diagnosticSquiggleAmplitude`, and so on).
 
-Diagnostics are not tied to a document version: after an edit their positions still refer to the text
-as it was, so push a fresh set from a `CodeEditorContentListener`.
+F8 and Shift-F8 visit the next and previous diagnostic in document order, wrapping at either end.
+Navigation expands a folded target and works in read-only editors. Marks at the same caret position
+form one stop, returning the most severe message. Pass `WARNING` to include errors and warnings,
+`ERROR` for errors only, or `null` for every severity. Invalid ranges are skipped.
+
+For background analysis, capture the document version before reading the text, then publish the
+results on the GDX thread:
+
+```java
+int version = editor.getDocumentVersion();  // capture before starting analysis
+// ... analyse a snapshot and produce found ...
+boolean accepted = editor.setDiagnostics(found, version); // false if the text has changed
+boolean stale = editor.isDiagnosticsStale();
+int analysedVersion = editor.getDiagnosticVersion();      // -1 before a batch or after clear
+```
+
+Rejected batches preserve the existing marks. The unversioned overload assumes the current document
+version. After an edit, existing marks keep their original coordinates and `isDiagnosticsStale()`
+becomes true, even when the last batch was empty. Navigation leaves the caret and selection in place
+until a fresh batch arrives. Push updated results from a `CodeEditorContentListener`, or call
+`clearDiagnostics()` to discard the old analysis.
 
 ## Interaction Hooks
 
@@ -1521,12 +1940,29 @@ The sidebar has a **Stress Test** section that generates 1,000 / 10,000 / 100,00
 card showing average and worst frame time, `setText` cost, a timed typing burst, and a timed jump to the
 last line (the worst case for lazy highlighting, since the lexer state cache has to reach the end). The
 **Tooling** section toggles completion, its documentation side panel, hover, parameter hints,
-navigation and demo diagnostics. The demo provider attaches documentation to every candidate, so the
-panel has something to show. **Auto Close Brackets** installs `CodeBracketAutoEditStrategy`, **Keymap**
+navigation and demo diagnostics. **Previous Result (Shift-F4)** and **Next Result (F4)** browse the
+last definition/reference results and show the result index in the Last Event card.
+**Previous Diagnostic** and **Next Diagnostic (F8)** jump between
+marks; the Last Event card shows the message or explains when the analysis needs refreshing. The demo
+provider attaches documentation to every candidate, so the panel has something to show.
+The **Extensions** section loads/unloads `CodeTextEditingExtension` and runs its three text commands;
+the Last Event card explains missing selections, blocked modes and no-op results.
+It also opens the **Command Palette (Ctrl-Shift-P)** and toggles the standard command extension.
+**Line Editing** independently toggles the five whole-line commands. With it enabled, Alt+Up/Down
+moves lines, Alt+Shift+Up/Down duplicates them, and Ctrl+Shift+K deletes the current or selected lines.
+The desktop **Snippet Pack** toggle adds/removes snippet completion independently of document and
+keyword completions; enable **Completion**, type `fori` and press Ctrl-Space to try it. The Android
+controls include **Command Palette** and **Show Completions**, with a snippet pack and the completion,
+standard-command and text-editing extensions installed.
+Android also offers **Duplicate Lines** and **Delete Lines** buttons; all five line commands are in
+the command palette.
+**Auto Close Brackets** installs `CodeBracketAutoEditStrategy`, **Keymap**
 rebinds undo to Ctrl-D and folding to F3 so you can see the keymap take effect, and **Demo Line Marks**
-pushes bars, gutter icons and a highlighted execution line. The **Search** section adds **Whole Word**,
-**Regex** (the button shows `(bad)` for a pattern that will not compile) and **Search In**, which
-confines matching to the current selection.
+pushes bars, gutter icons and a highlighted execution line. On desktop and Android, **Find** above
+the editor shows the match count and any regex error as you type. The toolbar includes case,
+whole-word, regex and selection scope options.
+
+Run the editor's regression tests with `./gradlew :core:test`.
 
 **Go to Next Symbol** cycles through the symbol tree, and the Perf card's `Symbols:` line shows the
 breadcrumb at the caret. That breadcrumb is cached and recomputed only when the caret or the document

@@ -3,6 +3,7 @@ package com.lzt841.editor.completion;
 import com.badlogic.gdx.math.Vector2;
 import com.badlogic.gdx.scenes.scene2d.Stage;
 import com.badlogic.gdx.utils.Array;
+import com.badlogic.gdx.utils.Disposable;
 import com.lzt841.editor.CodeEditor;
 import com.lzt841.editor.CodeEditorCaretListener;
 import com.lzt841.editor.CodeEditorInputInterceptor;
@@ -54,9 +55,10 @@ public class CodeCompletionController {
     };
 
     private int requestSerial;
-    private int lastRequestVersion = -1;
     private boolean open;
     private boolean installed;
+    private Disposable registrySubscription;
+    private long lastRegistryRevision = -1;
     private CodeEditorTextRange replaceRange;
     private CodeSnippetSession snippetSession;
     private String currentPrefix = "";
@@ -70,6 +72,11 @@ public class CodeCompletionController {
     private float documentationMaxWidth = 360f;
     /** Chords used while the list is open. Separate from the editor's map, so Up/Down do not clash. */
     private CodeKeymap popupKeymap = CodeKeymap.completionDefaults();
+
+    /** Uses the editor's shared completion sources, including scoped extension contributions. */
+    public CodeCompletionController(CodeEditor editor) {
+        this(editor, editor == null ? null : editor.getCompletionProviders());
+    }
 
     public CodeCompletionController(CodeEditor editor, CodeCompletionProvider provider) {
         this(editor, provider, null);
@@ -105,6 +112,11 @@ public class CodeCompletionController {
         if (installed) {
             return;
         }
+        if (provider instanceof CodeCompletionRegistry) {
+            CodeCompletionRegistry registry = (CodeCompletionRegistry) provider;
+            if (registry.isDisposed()) return;
+            registrySubscription = registry.addChangeListener(this::dismiss);
+        }
         Stage stage = editor.getStage();
         if (stage != null && popup.getStage() != stage) {
             stage.addActor(popup);
@@ -115,18 +127,24 @@ public class CodeCompletionController {
     }
 
     public void uninstall() {
-        if (!installed) {
-            return;
+        if (registrySubscription != null) {
+            registrySubscription.dispose();
+            registrySubscription = null;
         }
+        // A provider can be triggered directly before installation; those requests need cancelling
+        // as well, otherwise their delayed result can reopen a controller the host has disposed.
         cancelSnippet();
-        editor.removeCaretListener(caretWatcher);
-        editor.removeInputInterceptor(inputInterceptor);
+        dismiss();
+        if (installed) {
+            editor.removeCaretListener(caretWatcher);
+            editor.removeInputInterceptor(inputInterceptor);
+            installed = false;
+        }
+        // Direct triggers can attach these actors even without install().
         popup.remove();
         if (documentationPanel != null) {
             documentationPanel.remove();
         }
-        dismiss();
-        installed = false;
     }
 
     public CodeCompletionPopup getPopup() {
@@ -222,7 +240,8 @@ public class CodeCompletionController {
 
     /** Opens the popup at the caret, asking the provider for a fresh list. */
     public void trigger(CodeCompletionTrigger reason, char triggerCharacter) {
-        if (editor.isReadOnly() || editor.isDisabled()) {
+        if (!canComplete()) {
+            dismiss();
             return;
         }
         if (editor.isInStringOrComment(editor.getCursorLine(), editor.getCursorColumn())) {
@@ -254,6 +273,10 @@ public class CodeCompletionController {
      * which case the editor should not also handle it.
      */
     public boolean handleKeyDown(int keycode) {
+        if (!canComplete()) {
+            dismiss();
+            return false;
+        }
         if (!open) {
             // The opening chord lives in the editor's keymap, since no popup exists yet to own it.
             if (editor.getKeymap().actionForCurrentKeyDown(keycode) == CodeEditorAction.COMPLETION_TRIGGER) {
@@ -301,11 +324,31 @@ public class CodeCompletionController {
      * character is a trigger, and dismisses it when the character is a word terminator.
      */
     public void onCharacterTyped(char character) {
+        if (!canComplete()) {
+            dismiss();
+            return;
+        }
         if (isTriggerCharacter(character)) {
             trigger(CodeCompletionTrigger.CHARACTER, character);
             return;
         }
-        if (open && !isWordCharacter(character) && !isTriggerCharacter(character)) {
+        // GDX delivers supplementary characters as two keyTyped callbacks. Leave the popup open for
+        // the high surrogate; once the low surrogate arrives, classify the complete code point.
+        if (Character.isHighSurrogate(character)) {
+            return;
+        }
+        int codePoint = character;
+        if (Character.isLowSurrogate(character)) {
+            int line = editor.getCursorLine();
+            int column = editor.getCursorColumn();
+            String text = editor.getLineText(line);
+            if (column >= 2 && column <= text.length()
+                && Character.isHighSurrogate(text.charAt(column - 2))
+                && text.charAt(column - 1) == character) {
+                codePoint = Character.toCodePoint(text.charAt(column - 2), character);
+            }
+        }
+        if (open && !isWordCharacter(codePoint)) {
             dismiss();
         }
     }
@@ -321,6 +364,10 @@ public class CodeCompletionController {
     }
 
     public boolean accept(CodeCompletionItem item) {
+        if (!canComplete() || (lastRegistryRevision >= 0 && lastRegistryRevision != registryRevision())) {
+            dismiss();
+            return false;
+        }
         if (item == null) {
             return false;
         }
@@ -393,6 +440,7 @@ public class CodeCompletionController {
      */
     private void request(CodeCompletionTrigger reason, char triggerCharacter) {
         final int serial = ++requestSerial;
+        final CodeEditorTextRange requestSelection = editor.getSelection();
         int line = editor.getCursorLine();
         int column = editor.getCursorColumn();
         String prefix = editor.getWordPrefixAtCursor();
@@ -402,13 +450,15 @@ public class CodeCompletionController {
             ? new CodeEditorTextRange(line, column, line, column)
             : new CodeEditorTextRange(word.startLine, word.startColumn, line, column);
 
-        lastRequestVersion = editor.getDocumentVersion();
+        final int requestVersion = editor.getDocumentVersion();
+        final long sourceRevision = registryRevision();
+        lastRegistryRevision = sourceRevision;
         final CodeCompletionRequest request = new CodeCompletionRequest(
             editor,
             line,
             column,
             editor.getCursorOffset(),
-            lastRequestVersion,
+            requestVersion,
             prefix,
             target,
             reason,
@@ -420,13 +470,34 @@ public class CodeCompletionController {
 
             @Override
             public void complete(Array<CodeCompletionItem> items) {
-                if (delivered || serial != requestSerial) {
-                    return;
-                }
+                if (isCancelled()) return;
                 delivered = true;
                 onItemsReady(request, items);
             }
+
+            @Override
+            public boolean isCancelled() {
+                // Serial numbers cancel explicit dismissals and newer requests. The version check
+                // also cancels a still-pending response when the user edits the document without
+                // causing a new provider request; otherwise stale candidates could replace the list
+                // for a prefix the provider never saw.
+                CodeEditorTextRange selection = editor.getSelection();
+                return delivered || serial != requestSerial || sourceRevision != registryRevision() || !canComplete()
+                    || editor.getDocumentVersion() != request.documentVersion
+                    || editor.getCursorLine() != request.line
+                    || editor.getCursorColumn() != request.column
+                    || (requestSelection == null ? selection != null : !requestSelection.equals(selection));
+            }
         });
+    }
+
+    private boolean canComplete() {
+        return !editor.isReadOnly() && !editor.isDisabled() && !editor.isPasswordMode()
+            && (!(provider instanceof CodeCompletionRegistry) || !((CodeCompletionRegistry) provider).isDisposed());
+    }
+
+    private long registryRevision() {
+        return provider instanceof CodeCompletionRegistry ? ((CodeCompletionRegistry) provider).getRevision() : -1;
     }
 
     private void onItemsReady(CodeCompletionRequest request, Array<CodeCompletionItem> items) {
@@ -457,6 +528,7 @@ public class CodeCompletionController {
         if (filtered.size == 0) {
             open = false;
             popup.setVisible(false);
+            popup.setItems(null, "");
             hideDocumentation();
             return;
         }
@@ -478,13 +550,19 @@ public class CodeCompletionController {
             return true;
         }
         String text = item.matchText();
-        if (text.length() < prefix.length()) {
-            return false;
-        }
-        for (int i = 0; i < prefix.length(); i++) {
-            if (Character.toLowerCase(text.charAt(i)) != Character.toLowerCase(prefix.charAt(i))) {
+        int textIndex = 0;
+        int prefixIndex = 0;
+        while (prefixIndex < prefix.length()) {
+            if (textIndex >= text.length()) {
                 return false;
             }
+            int textCodePoint = Character.codePointAt(text, textIndex);
+            int prefixCodePoint = Character.codePointAt(prefix, prefixIndex);
+            if (Character.toLowerCase(textCodePoint) != Character.toLowerCase(prefixCodePoint)) {
+                return false;
+            }
+            textIndex += Character.charCount(textCodePoint);
+            prefixIndex += Character.charCount(prefixCodePoint);
         }
         return true;
     }
@@ -512,7 +590,7 @@ public class CodeCompletionController {
             return exactA ? -1 : 1;
         }
         if (a.priority != b.priority) {
-            return b.priority - a.priority;
+            return b.priority < a.priority ? -1 : 1;
         }
         int lengthDelta = a.matchText().length() - b.matchText().length();
         if (lengthDelta != 0) {
@@ -647,8 +725,8 @@ public class CodeCompletionController {
         return false;
     }
 
-    private static boolean isWordCharacter(char character) {
-        return Character.isLetterOrDigit(character) || character == '_' || character == '$';
+    private static boolean isWordCharacter(int codePoint) {
+        return Character.isLetterOrDigit(codePoint) || codePoint == '_' || codePoint == '$';
     }
 
     /** Default style, derived from the editor's own so the popup matches without extra setup. */

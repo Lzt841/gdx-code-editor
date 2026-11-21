@@ -20,6 +20,13 @@ public interface CodeEditorInputInterceptor {
     }
 
     /**
+     * Observes a key release, including while the editor is disabled, so temporary keyboard state can
+     * be cleared. Every registered interceptor receives it; releases are not consumed.
+     */
+    default void onKeyUp(CodeEditor editor, int keycode) {
+    }
+
+    /**
      * Called before the character is inserted.
      *
      * @return true to consume it, so nothing is typed

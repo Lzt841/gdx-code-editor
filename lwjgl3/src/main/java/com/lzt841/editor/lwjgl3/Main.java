@@ -37,6 +37,7 @@ import com.lzt841.editor.CodeEditorContentListener;
 import com.lzt841.editor.CodeEditorPosition;
 import com.lzt841.editor.CodeBracketAutoEditStrategy;
 import com.lzt841.editor.CodeEditorAction;
+import com.lzt841.editor.CodeEditorCommand;
 import com.lzt841.editor.CodeKeyStroke;
 import com.lzt841.editor.CodeIndentStrategy;
 import com.lzt841.editor.CodeLineMark;
@@ -71,6 +72,14 @@ import com.lzt841.editor.highlight.CodeSemanticTokenType;
 import com.lzt841.editor.input.CodeEditorInteractionContext;
 import com.lzt841.editor.input.CodeEditorInteractionListener;
 import com.lzt841.editor.input.CodeEditorInteractionMode;
+import com.lzt841.editor.search.CodeSearchBar;
+import com.lzt841.editor.extensions.CodeTextEditingExtension;
+import com.lzt841.editor.extensions.CodeCommandPaletteExtension;
+import com.lzt841.editor.extensions.CodeCompletionExtension;
+import com.lzt841.editor.extensions.CodeSnippetExtension;
+import com.lzt841.editor.extensions.CodeLineEditingExtension;
+import com.lzt841.editor.extensions.CodeStandardCommandsExtension;
+import com.lzt841.editor.commands.CodeCommandPalette.CodeCommandPaletteStyle;
 import com.lzt841.editor.structure.BraceCodeStructureProvider;
 import com.lzt841.editor.structure.CodeStructureProvider;
 import com.lzt841.editor.structure.CodeSymbol;
@@ -106,8 +115,7 @@ public class Main extends ApplicationAdapter {
     private Label eventLabel;
     private Label popupTitleLabel;
     private Label popupDetailLabel;
-    private TextField searchField;
-    private TextField replaceField;
+    private CodeSearchBar searchBar;
 
     private TextButton profileButton;
     private TextButton interactionButton;
@@ -122,21 +130,12 @@ public class Main extends ApplicationAdapter {
     private TextButton overscrollButton;
     private TextButton rainbowBracketButton;
     private TextButton rainbowGuideButton;
-    private TextButton previousMatchButton;
-    private TextButton nextMatchButton;
-    private TextButton applySearchButton;
-    private TextButton replaceCurrentButton;
-    private TextButton replaceAllButton;
     private TextButton undoButton;
     private TextButton redoButton;
     private TextButton selectAllButton;
     private TextButton copyButton;
     private TextButton cutButton;
     private TextButton pasteButton;
-    private TextButton searchCaseButton;
-    private TextButton searchWholeWordButton;
-    private TextButton searchRegexButton;
-    private TextButton searchRangeButton;
     private TextButton zoomInButton;
     private TextButton zoomOutButton;
     private TextButton zoomResetButton;
@@ -172,6 +171,11 @@ public class Main extends ApplicationAdapter {
     private TextButton signatureHelpButton;
     private TextButton diagnosticsButton;
     private TextButton semanticHighlightButton;
+    private TextButton textEditingExtensionButton;
+    private TextButton standardCommandsButton;
+    private TextButton lineEditingExtensionButton;
+    private TextButton snippetExtensionButton;
+    private CodeSnippetExtension demoSnippetExtension;
     private boolean semanticHighlightEnabled;
     private TextButton navigationButton;
     private TextButton goToDefinitionButton;
@@ -196,6 +200,7 @@ public class Main extends ApplicationAdapter {
     private CodeHoverController hoverController;
     private CodeSignatureHelpController signatureHelpController;
     private CodeNavigationController navigationController;
+    private CodeCommandPaletteExtension commandPaletteExtension;
     private boolean diagnosticsEnabled;
 
     private DemoProfile[] profiles;
@@ -234,11 +239,25 @@ public class Main extends ApplicationAdapter {
         editor.setRainbowBracketsEnabled(true);
         editor.setRainbowGuidesEnabled(true);
         editor.setTransientCaretHandleEnabled(true);
-        editor.setSearchText("value");
         editor.setReadOnly(false);
         editor.setDisabled(false);
         editor.setInteractionMode(CodeEditorInteractionMode.AUTO);
         editor.setInteractionListener(new DebugInteractionListener());
+        CodeCommandPaletteStyle paletteStyle = new CodeCommandPaletteStyle(debugTextFieldStyle, debugButtonStyle, debugLabelStyle);
+        paletteStyle.window.background = popupBackground;
+        paletteStyle.scroll = debugScrollStyle;
+        commandPaletteExtension = new CodeCommandPaletteExtension(paletteStyle);
+        editor.getExtensions().install(new CodeStandardCommandsExtension());
+        editor.getExtensions().install(new CodeLineEditingExtension());
+        editor.getExtensions().install(commandPaletteExtension);
+        commandPaletteExtension.getPalette().setExecutionListener((command, handled) ->
+            lastEventText = command.label + (handled ? ": completed" : ": not applied"));
+        DemoCompletionProvider demoCompletion = new DemoCompletionProvider();
+        editor.getCompletionProviders().register("demo.document", demoCompletion);
+        com.badlogic.gdx.utils.Array<CodeCompletionItem> snippets = new com.badlogic.gdx.utils.Array<>();
+        demoCompletion.addSnippets(snippets);
+        demoSnippetExtension = new CodeSnippetExtension("demo.snippets", snippets.toArray(CodeCompletionItem.class));
+        editor.getExtensions().install(demoSnippetExtension);
         editor.addContentListener(new CodeEditorContentListener() {
             @Override
             public void onContentChanged(CodeEditor editor, CodeEditorContentChangeEvent event) {
@@ -270,8 +289,15 @@ public class Main extends ApplicationAdapter {
         editorFrame.pad(10f);
         // Do not clip the frame: selection handles hang below the caret and must remain visible.
         editorFrame.setClip(false);
+        searchBar = new CodeSearchBar(editor, debugTextFieldStyle, debugButtonStyle, debugLabelStyle);
+        searchBar.setBackground(sidebarBackground);
+        searchBar.pad(5f, 6f, 6f, 6f);
+        editorFrame.add(searchBar).growX().minWidth(0f);
+        editorFrame.row();
         editorFrame.add(editor).expand().fill();
+        searchBar.toFront();
         root.add(editorFrame).expand().fill();
+        stage.addCaptureListener(searchBar.createShortcutListener());
 
         popupMenu = createPopupMenu();
         stage.addActor(popupMenu);
@@ -322,6 +348,9 @@ public class Main extends ApplicationAdapter {
 
     @Override
     public void dispose() {
+        if (editor != null) {
+            editor.getExtensions().dispose();
+        }
         // The atlas belongs to the rich-text profile and the emoji font to every profile; neither is freed
         // by anything else.
         if (imageProvider != null) {
@@ -348,6 +377,7 @@ public class Main extends ApplicationAdapter {
         debugButtonStyle.checked = buttonDown;
         debugButtonStyle.font = font;
         debugButtonStyle.fontColor = new Color(0.88f, 0.92f, 0.96f, 1f);
+        debugButtonStyle.disabledFontColor = new Color(0.56f, 0.63f, 0.72f, 1f);
         debugButtonStyle.downFontColor = new Color(1f, 1f, 1f, 1f);
 
         debugLabelStyle = new Label.LabelStyle(font, new Color(0.84f, 0.89f, 0.94f, 1f));
@@ -360,9 +390,12 @@ public class Main extends ApplicationAdapter {
         debugTextFieldStyle.disabledFontColor = new Color(0.56f, 0.63f, 0.72f, 1f);
         debugTextFieldStyle.messageFont = font;
         debugTextFieldStyle.messageFontColor = new Color(0.46f, 0.55f, 0.63f, 1f);
-        debugTextFieldStyle.background = new TextureRegionDrawable(region).tint(new Color(0.071f, 0.102f, 0.137f, 1f));
-        debugTextFieldStyle.focusedBackground = new TextureRegionDrawable(region).tint(new Color(0.094f, 0.137f, 0.184f, 1f));
-        debugTextFieldStyle.disabledBackground = new TextureRegionDrawable(region).tint(new Color(0.055f, 0.078f, 0.105f, 1f));
+        TextureRegionDrawable fieldBackground = new TextureRegionDrawable(region);
+        fieldBackground.setLeftWidth(8f);
+        fieldBackground.setRightWidth(8f);
+        debugTextFieldStyle.background = fieldBackground.tint(new Color(0.085f, 0.12f, 0.16f, 1f));
+        debugTextFieldStyle.focusedBackground = fieldBackground.tint(new Color(0.14f, 0.21f, 0.28f, 1f));
+        debugTextFieldStyle.disabledBackground = fieldBackground.tint(new Color(0.055f, 0.078f, 0.105f, 1f));
         debugTextFieldStyle.cursor = new TextureRegionDrawable(region).tint(new Color(0.98f, 0.83f, 0.43f, 1f));
         debugTextFieldStyle.selection = new TextureRegionDrawable(region).tint(new Color(0.231f, 0.447f, 0.686f, 0.55f));
         cardBackground = new TextureRegionDrawable(region).tint(new Color(0.063f, 0.09f, 0.121f, 1f));
@@ -478,70 +511,6 @@ public class Main extends ApplicationAdapter {
                 editor.setRainbowGuidesEnabled(!editor.isRainbowGuidesEnabled());
             }
         });
-        previousMatchButton = createActionButton("", new Runnable() {
-            @Override
-            public void run() {
-                if (!editor.findPreviousSearchMatch()) {
-                    lastEventText = "Search: no previous match";
-                } else {
-                    lastEventText = "Search: moved to previous match";
-                }
-            }
-        });
-        nextMatchButton = createActionButton("", new Runnable() {
-            @Override
-            public void run() {
-                if (!editor.findNextSearchMatch()) {
-                    lastEventText = "Search: no next match";
-                } else {
-                    lastEventText = "Search: moved to next match";
-                }
-            }
-        });
-        searchField = new TextField(editor.getSearchText(), debugTextFieldStyle);
-        searchField.setMessageText("Search text");
-        searchField.setTextFieldFilter(new TextField.TextFieldFilter() {
-            @Override
-            public boolean acceptChar(TextField textField, char c) {
-                return c != '\r';
-            }
-        });
-        replaceField = new TextField("", debugTextFieldStyle);
-        replaceField.setMessageText("Replacement");
-        replaceField.setTextFieldFilter(new TextField.TextFieldFilter() {
-            @Override
-            public boolean acceptChar(TextField textField, char c) {
-                return c != '\r';
-            }
-        });
-        applySearchButton = createActionButton("", new Runnable() {
-            @Override
-            public void run() {
-                editor.setSearchText(searchField.getText());
-                lastEventText = editor.getSearchMatchCount() > 0
-                    ? "Search: found " + editor.getSearchMatchCount() + " matches"
-                    : "Search: no matches";
-            }
-        });
-        replaceCurrentButton = createActionButton("", new Runnable() {
-            @Override
-            public void run() {
-                editor.setSearchText(searchField.getText());
-                if (editor.replaceCurrentSearchMatch(replaceField.getText())) {
-                    lastEventText = "Replace: current or next match updated";
-                } else {
-                    lastEventText = "Replace: no editable match";
-                }
-            }
-        });
-        replaceAllButton = createActionButton("", new Runnable() {
-            @Override
-            public void run() {
-                editor.setSearchText(searchField.getText());
-                int replaced = editor.replaceAllSearchMatches(replaceField.getText());
-                lastEventText = "Replace all: " + replaced + " matches updated";
-            }
-        });
         undoButton = createActionButton("", new Runnable() {
             @Override
             public void run() {
@@ -590,50 +559,6 @@ public class Main extends ApplicationAdapter {
             public void run() {
                 if (!editor.pasteClipboard()) {
                     lastEventText = "Paste: editor is not editable";
-                }
-            }
-        });
-        searchCaseButton = createActionButton("", new Runnable() {
-            @Override
-            public void run() {
-                editor.setSearchCaseSensitive(!editor.isSearchCaseSensitive());
-                editor.setSearchText(searchField.getText());
-                lastEventText = "Search case: " + (editor.isSearchCaseSensitive() ? "Sensitive" : "Ignore case");
-            }
-        });
-        searchWholeWordButton = createActionButton("", new Runnable() {
-            @Override
-            public void run() {
-                editor.setSearchWholeWord(!editor.isSearchWholeWord());
-                editor.setSearchText(searchField.getText());
-                lastEventText = "Search whole word: " + onOff(editor.isSearchWholeWord())
-                    + " (" + editor.getSearchMatchCount() + " matches)";
-            }
-        });
-        searchRegexButton = createActionButton("", new Runnable() {
-            @Override
-            public void run() {
-                editor.setSearchRegexEnabled(!editor.isSearchRegexEnabled());
-                editor.setSearchText(searchField.getText());
-                if (!editor.isSearchPatternValid()) {
-                    lastEventText = "Search regex: bad pattern (" + editor.getSearchRegexError() + ")";
-                } else {
-                    lastEventText = "Search regex: " + onOff(editor.isSearchRegexEnabled())
-                        + " (" + editor.getSearchMatchCount() + " matches)";
-                }
-            }
-        });
-        searchRangeButton = createActionButton("", new Runnable() {
-            @Override
-            public void run() {
-                if (editor.getSearchRange() != null) {
-                    editor.clearSearchRange();
-                    lastEventText = "Search range: whole document";
-                } else if (editor.setSearchRangeToSelection()) {
-                    lastEventText = "Search range: selection ("
-                        + editor.getSearchMatchCount() + " matches)";
-                } else {
-                    lastEventText = "Search range: select something first";
                 }
             }
         });
@@ -887,6 +812,43 @@ public class Main extends ApplicationAdapter {
                 toggleSemanticHighlight();
             }
         });
+        textEditingExtensionButton = createActionButton("", () -> {
+            if (editor.getExtensions().isInstalled(CodeTextEditingExtension.ID)) {
+                editor.getExtensions().uninstall(CodeTextEditingExtension.ID);
+                lastEventText = "Text editing extension unloaded; commands and shortcuts removed";
+            } else {
+                editor.getExtensions().install(new CodeTextEditingExtension());
+                lastEventText = "Text editing extension loaded. Select text, then use Ctrl-Shift-U or Ctrl-Alt-U.";
+            }
+            if (!editor.isDisabled()) stage.setKeyboardFocus(editor);
+        });
+        standardCommandsButton = createActionButton("", () -> {
+            if (editor.getExtensions().isInstalled(CodeStandardCommandsExtension.ID)) {
+                editor.getExtensions().uninstall(CodeStandardCommandsExtension.ID);
+                lastEventText = "Standard commands unloaded";
+            } else {
+                editor.getExtensions().install(new CodeStandardCommandsExtension());
+                lastEventText = "Standard commands loaded; open the command palette to browse them";
+            }
+        });
+        lineEditingExtensionButton = createActionButton("", () -> {
+            if (editor.getExtensions().isInstalled(CodeLineEditingExtension.ID)) {
+                editor.getExtensions().uninstall(CodeLineEditingExtension.ID);
+                lastEventText = "Line editing unloaded; its commands and shortcuts were removed";
+            } else {
+                editor.getExtensions().install(new CodeLineEditingExtension());
+                lastEventText = "Line editing loaded: Alt-Up/Down moves, Alt-Shift-Up/Down duplicates, Ctrl-Shift-K deletes";
+            }
+        });
+        snippetExtensionButton = createActionButton("", () -> {
+            if (editor.getExtensions().isInstalled(demoSnippetExtension.getId())) {
+                editor.getExtensions().uninstall(demoSnippetExtension.getId());
+                lastEventText = "Snippet pack unloaded; document completion remains available";
+            } else {
+                editor.getExtensions().install(demoSnippetExtension);
+                lastEventText = "Snippet pack loaded. Enable completion, type fori and press Ctrl-Space.";
+            }
+        });
 
         TextButton reloadButton = createActionButton("Reload Current Sample", new Runnable() {
             @Override
@@ -903,7 +865,7 @@ public class Main extends ApplicationAdapter {
                 if (editor.isReadOnly()) {
                     editor.setReadOnly(false);
                 }
-                editor.setText(profiles[profileIndex].text);
+                editor.setCursorPosition(0, 0);
                 lastEventText = "Cursor/sample reset";
             }
         });
@@ -947,32 +909,6 @@ public class Main extends ApplicationAdapter {
         sidebar.add(rainbowBracketButton);
         sidebar.row();
         sidebar.add(rainbowGuideButton);
-        sidebar.row();
-        sidebar.add(new Label("Search", debugTitleStyle)).padBottom(2f);
-        sidebar.row();
-        sidebar.add(searchField);
-        sidebar.row();
-        sidebar.add(applySearchButton);
-        sidebar.row();
-        sidebar.add(searchCaseButton);
-        sidebar.row();
-        sidebar.add(searchWholeWordButton);
-        sidebar.row();
-        sidebar.add(searchRegexButton);
-        sidebar.row();
-        sidebar.add(searchRangeButton);
-        sidebar.row();
-        sidebar.add(previousMatchButton);
-        sidebar.row();
-        sidebar.add(nextMatchButton);
-        sidebar.row();
-        sidebar.add(new Label("Replace", debugTitleStyle)).padBottom(2f);
-        sidebar.row();
-        sidebar.add(replaceField);
-        sidebar.row();
-        sidebar.add(replaceCurrentButton);
-        sidebar.row();
-        sidebar.add(replaceAllButton);
         sidebar.row();
         sidebar.add(new Label("Edit Actions", debugTitleStyle)).padBottom(2f);
         sidebar.row();
@@ -1052,13 +988,46 @@ public class Main extends ApplicationAdapter {
         sidebar.row();
         sidebar.add(findReferencesButton);
         sidebar.row();
+        sidebar.add(createActionButton("Previous Result (Shift-F4)", () -> navigateResult(false)));
+        sidebar.row();
+        sidebar.add(createActionButton("Next Result (F4)", () -> navigateResult(true)));
+        sidebar.row();
         sidebar.add(renameField);
         sidebar.row();
         sidebar.add(renameButton);
         sidebar.row();
         sidebar.add(diagnosticsButton);
         sidebar.row();
+        sidebar.add(createActionButton("Previous Diagnostic", () -> navigateDiagnostic(false)));
+        sidebar.row();
+        sidebar.add(createActionButton("Next Diagnostic (F8)", () -> navigateDiagnostic(true)));
+        sidebar.row();
         sidebar.add(semanticHighlightButton).padBottom(14f);
+        sidebar.row();
+        sidebar.add(new Label("Extensions", debugTitleStyle)).padBottom(2f);
+        sidebar.row();
+        sidebar.add(createActionButton("Command Palette (Ctrl-Shift-P)", () -> {
+            if (!editor.getCommands().execute(CodeCommandPaletteExtension.SHOW)) {
+                lastEventText = "Command palette requires an enabled editor outside password mode.";
+            }
+        }));
+        sidebar.row();
+        sidebar.add(standardCommandsButton);
+        sidebar.row();
+        sidebar.add(lineEditingExtensionButton);
+        sidebar.row();
+        sidebar.add(textEditingExtensionButton);
+        sidebar.row();
+        sidebar.add(snippetExtensionButton);
+        sidebar.row();
+        sidebar.add(createActionButton("Uppercase Selection (Ctrl-Shift-U)",
+            () -> executeExtensionCommand(CodeTextEditingExtension.UPPERCASE_SELECTION)));
+        sidebar.row();
+        sidebar.add(createActionButton("Lowercase Selection (Ctrl-Alt-U)",
+            () -> executeExtensionCommand(CodeTextEditingExtension.LOWERCASE_SELECTION)));
+        sidebar.row();
+        sidebar.add(createActionButton("Trim Trailing Whitespace",
+            () -> executeExtensionCommand(CodeTextEditingExtension.TRIM_TRAILING_WHITESPACE))).padBottom(14f);
         sidebar.row();
         sidebar.add(new Label("Current State", debugTitleStyle)).padBottom(2f);
         sidebar.row();
@@ -1112,8 +1081,11 @@ public class Main extends ApplicationAdapter {
         popupCopyButton = createPopupActionButton("Copy Selection", new Runnable() {
             @Override
             public void run() {
-                if (activePopupContext == null || activePopupContext.selectedText.isEmpty()) {
+                if (activePopupContext == null || activePopupContext.selectedText == null
+                    || activePopupContext.selectedText.isEmpty()) {
                     lastEventText = "Popup: no selection to copy";
+                } else if (editor.isPasswordMode()) {
+                    lastEventText = "Popup: copying is unavailable in password mode";
                 } else if (editor.copySelection()) {
                     lastEventText = "Popup: copied selection";
                 } else {
@@ -1125,13 +1097,9 @@ public class Main extends ApplicationAdapter {
         popupSearchButton = createPopupActionButton("Search Selection", new Runnable() {
             @Override
             public void run() {
-                if (activePopupContext == null || activePopupContext.selectedText.isEmpty()) {
-                    lastEventText = "Popup: no selection to search";
-                } else {
-                    editor.setSearchText(activePopupContext.selectedText);
-                    lastEventText = "Popup: search = " + shorten(activePopupContext.selectedText, 28);
+                if (activePopupContext != null) {
+                    searchBar.openForText(activePopupContext.selectedText, false);
                 }
-                refreshDebugPanel();
                 hidePopupMenu();
             }
         });
@@ -1181,15 +1149,20 @@ public class Main extends ApplicationAdapter {
 
     private void showPopupMenu(CodeEditorInteractionContext context, String triggerLabel) {
         activePopupContext = context;
+        boolean passwordMode = editor.isPasswordMode();
+        boolean hasSelection = context.selectedText != null && !context.selectedText.isEmpty();
         popupTitleLabel.setText(triggerLabel + " Menu");
+        String selectionSummary = passwordMode
+            ? "(hidden)"
+            : (hasSelection ? shorten(context.selectedText, 36) : "(none)");
         popupDetailLabel.setText(
             "At " + (context.line + 1) + ":" + (context.column + 1)
-                + "\nSelection: " + (context.selectedText.isEmpty() ? "(none)" : shorten(context.selectedText, 36))
+                + "\nSelection: " + selectionSummary
         );
 
-        boolean hasSelection = !context.selectedText.isEmpty();
-        popupCopyButton.setDisabled(!hasSelection);
-        popupSearchButton.setDisabled(!hasSelection);
+        popupCopyButton.setDisabled(passwordMode || !hasSelection);
+        popupSearchButton.setDisabled(!hasSelection || passwordMode
+            || context.selectedText.indexOf('\n') >= 0);
 
         popupMenu.pack();
         popupStagePosition.set(context.x, context.y);
@@ -1248,16 +1221,6 @@ public class Main extends ApplicationAdapter {
         rainbowBracketButton.setText("Rainbow Brackets: " + onOff(editor.isRainbowBracketsEnabled()));
         rainbowGuideButton.setText("Rainbow Guides: " + onOff(editor.isRainbowGuidesEnabled()));
         clipAreaButton.setText("Custom Clip Inset: " + onOff(customClipInsetEnabled));
-        applySearchButton.setText("Apply Search");
-        previousMatchButton.setText("Previous Match");
-        nextMatchButton.setText("Next Match");
-        searchCaseButton.setText("Search Case: " + (editor.isSearchCaseSensitive() ? "Sensitive" : "Ignore Case"));
-        searchWholeWordButton.setText("Whole Word: " + onOff(editor.isSearchWholeWord()));
-        searchRegexButton.setText("Regex: " + onOff(editor.isSearchRegexEnabled())
-            + (editor.isSearchPatternValid() ? "" : " (bad)"));
-        searchRangeButton.setText("Search In: " + (editor.getSearchRange() != null ? "Selection" : "Document"));
-        replaceCurrentButton.setText("Replace Current");
-        replaceAllButton.setText("Replace All");
         undoButton.setText("Undo: " + onOff(editor.canUndo()));
         redoButton.setText("Redo: " + onOff(editor.canRedo()));
         selectAllButton.setText("Select All");
@@ -1287,6 +1250,14 @@ public class Main extends ApplicationAdapter {
             + (navigationController == null ? "" : "  F12 / Shift-F12 / Shift-F6"));
         diagnosticsButton.setText("Demo Diagnostics: " + onOff(diagnosticsEnabled));
         semanticHighlightButton.setText("Semantic Tokens: " + onOff(semanticHighlightEnabled));
+        textEditingExtensionButton.setText("Text Editing Extension: "
+            + onOff(editor.getExtensions().isInstalled(CodeTextEditingExtension.ID)));
+        standardCommandsButton.setText("Standard Commands: "
+            + onOff(editor.getExtensions().isInstalled(CodeStandardCommandsExtension.ID)));
+        lineEditingExtensionButton.setText("Line Editing: "
+            + onOff(editor.getExtensions().isInstalled(CodeLineEditingExtension.ID)));
+        snippetExtensionButton.setText("Snippet Pack: "
+            + onOff(editor.getExtensions().isInstalled(demoSnippetExtension.getId())));
 
         // Read this before building the string: describing the symbol path flushes the pending pass, so
         // evaluating it inline would always report "Off" and hide the very thing this line is for.
@@ -1338,12 +1309,6 @@ public class Main extends ApplicationAdapter {
                 + "   Overscroll: " + onOff(editor.isOverscrollEnabled()) + "\n"
                 + "Rainbow brackets: " + onOff(editor.isRainbowBracketsEnabled())
                 + "   Rainbow guides: " + onOff(editor.isRainbowGuidesEnabled()) + "\n"
-                + "Search: " + (editor.getSearchText().isEmpty() ? "(none)" : editor.getSearchText())
-                + "  " + (editor.hasCurrentSearchMatch() ? editor.getCurrentSearchMatchOrdinal() : 0)
-                + "/" + editor.getSearchMatchCount() + "\n"
-                + "Whole word: " + onOff(editor.isSearchWholeWord())
-                + "   Regex: " + onOff(editor.isSearchRegexEnabled())
-                + "   In: " + (editor.getSearchRange() != null ? "selection" : "document") + "\n"
                 + "Zoom: " + formatZoom(editor.getZoomScale()) + "\n"
                 + "Handle test: Select Word/Line, then drag blue bulbs"
         );
@@ -1352,7 +1317,6 @@ public class Main extends ApplicationAdapter {
                 + "Cursor: " + (editor.getCursorLine() + 1) + ":" + (editor.getCursorColumn() + 1) + "\n"
                 + "Selection: " + onOff(editor.hasSelection()) + "\n"
                 + "Undo/Redo: " + onOff(editor.canUndo()) + "/" + onOff(editor.canRedo()) + "\n"
-                + "Matches: " + editor.getSearchMatchCount() + "\n"
                 + "Tips: double-click word, drag handles, toggle custom clip, long-press for menu."
         );
         eventLabel.setText(lastEventText);
@@ -1428,6 +1392,7 @@ public class Main extends ApplicationAdapter {
         builder.append("}\n");
 
         long start = System.nanoTime();
+        editor.clearSearchRange();
         editor.setText(builder.toString());
         lastSetTextNanos = System.nanoTime() - start;
         editor.setCursorPosition(0, 0);
@@ -1494,12 +1459,13 @@ public class Main extends ApplicationAdapter {
 
     private void toggleCompletion() {
         if (completionController != null) {
-            completionController.uninstall();
+            editor.getExtensions().uninstall(CodeCompletionExtension.ID);
             completionController = null;
             return;
         }
-        completionController = new CodeCompletionController(editor, new DemoCompletionProvider());
-        completionController.install();
+        CodeCompletionExtension extension = new CodeCompletionExtension();
+        editor.getExtensions().install(extension);
+        completionController = extension.getController();
     }
 
     /** Turns the documentation side panel on and off, to compare the list with and without it. */
@@ -1545,7 +1511,36 @@ public class Main extends ApplicationAdapter {
         navigationController = new CodeNavigationController(editor, new WordCodeNavigationProvider());
         navigationController.setListener(new DemoNavigationListener());
         navigationController.install();
-        lastEventText = "Navigation: F12 definition, Shift-F12 references, Shift-F6 rename";
+        lastEventText = "Navigation: F12 definition, Shift-F12 references, F4 / Shift-F4 results, Shift-F6 rename";
+    }
+
+    private void executeExtensionCommand(String id) {
+        CodeEditorCommand command = editor.getCommands().getCommand(id);
+        if (command == null) {
+            lastEventText = "Turn on Text Editing Extension first.";
+        } else if (editor.isDisabled() || editor.isReadOnly() || editor.isPasswordMode()) {
+            lastEventText = command.label + ": requires an enabled, writable editor outside password mode.";
+        } else if (!editor.getCommands().isEnabled(id)) {
+            lastEventText = command.label + ": select some text first.";
+        } else {
+            lastEventText = command.label + (editor.getCommands().execute(id) ? ": completed" : ": no changes needed");
+        }
+        if (!editor.isDisabled()) stage.setKeyboardFocus(editor);
+    }
+
+    private void navigateResult(boolean forward) {
+        if (navigationController == null) {
+            lastEventText = "Navigation: turn it on first";
+            return;
+        }
+        boolean moved = forward ? navigationController.navigateToNextTarget()
+            : navigationController.navigateToPreviousTarget();
+        if (!moved) {
+            lastEventText = "No current navigation results. Run Find References (Shift-F12) first.";
+        }
+        if (!editor.isDisabled()) {
+            stage.setKeyboardFocus(editor);
+        }
     }
 
     /** Marks every occurrence of "value" so the squiggles and gutter ticks are visible. */
@@ -1741,6 +1736,24 @@ public class Main extends ApplicationAdapter {
         }
     }
 
+    private void navigateDiagnostic(boolean forward) {
+        CodeDiagnostic target = forward
+            ? editor.navigateToNextDiagnostic() : editor.navigateToPreviousDiagnostic();
+        if (target != null) {
+            lastEventText = target.severity + " at " + (editor.getCursorLine() + 1)
+                + ":" + (editor.getCursorColumn() + 1) + " - " + target.message;
+        } else if (editor.isDisabled()) {
+            lastEventText = "Diagnostics: enable the editor to navigate";
+        } else if (editor.isDiagnosticsStale()) {
+            lastEventText = "Diagnostics are out of date. Toggle Demo Diagnostics off and on to refresh.";
+        } else {
+            lastEventText = "No diagnostics to navigate. Turn on Demo Diagnostics to add marks.";
+        }
+        if (!editor.isDisabled()) {
+            stage.setKeyboardFocus(editor);
+        }
+    }
+
     private void toggleDiagnostics() {
         diagnosticsEnabled = !diagnosticsEnabled;
         if (!diagnosticsEnabled) {
@@ -1792,7 +1805,6 @@ public class Main extends ApplicationAdapter {
                     null
                 ));
             }
-            addSnippets(items);
             // Identifiers from nearby lines, so the list reflects the actual document.
             int from = Math.max(0, request.line - 200);
             int to = Math.min(request.editor.getLineCount() - 1, request.line + 200);
@@ -1968,7 +1980,7 @@ public class Main extends ApplicationAdapter {
 
     /**
      * The host-side of navigation. A real IDE would show a results list and a rename dialog; the demo
-     * uses the status line, and for several targets it just cycles through them on each request.
+     * uses the status line; F4 and Shift-F4 browse the results retained by the controller.
      */
     private final class DemoNavigationListener implements CodeNavigationListener {
         @Override
@@ -1983,7 +1995,7 @@ public class Main extends ApplicationAdapter {
             CodeNavigationRequest request,
             com.badlogic.gdx.utils.Array<CodeNavigationTarget> targets
         ) {
-            // Cycle through the list so Shift-F12 / Find References is useful without a picker UI.
+            // Start after the current occurrence; F4 / Shift-F4 can then reuse the retained results.
             int currentLine = editor.getCursorLine();
             int currentColumn = editor.getCursorColumn();
             int next = 0;
@@ -1995,10 +2007,6 @@ public class Main extends ApplicationAdapter {
                 }
             }
             CodeNavigationTarget current = targets.get(next);
-            lastEventText = "Navigation: " + targets.size + " " + kindLabel(request)
-                + (request.hasWord() ? " of '" + request.word + "'" : "")
-                + " — " + (next + 1) + "/" + targets.size
-                + " at " + (current.getLine() + 1) + ":" + (current.getColumn() + 1);
             controller.navigateTo(current, request);
             return true;
         }
@@ -2010,7 +2018,7 @@ public class Main extends ApplicationAdapter {
             CodeNavigationTarget target
         ) {
             lastEventText = "Navigation: " + target.documentId + " is another document, not opened";
-            return true;
+            return false;
         }
 
         @Override
@@ -2019,11 +2027,10 @@ public class Main extends ApplicationAdapter {
             CodeNavigationRequest request,
             CodeNavigationTarget target
         ) {
-            if (request == null || request.kind == CodeNavigationKind.REFERENCES) {
-                return;
-            }
             lastEventText = "Navigation: " + kindLabel(request)
-                + (request.hasWord() ? " of '" + request.word + "'" : "")
+                + (request != null && request.hasWord() ? " of '" + request.word + "'" : "")
+                + (controller.getLastTargetIndex() < 0 ? ""
+                    : " " + (controller.getLastTargetIndex() + 1) + "/" + controller.getTargetCount())
                 + " at " + (target.getLine() + 1) + ":" + (target.getColumn() + 1);
         }
 
@@ -2210,6 +2217,7 @@ public class Main extends ApplicationAdapter {
         DemoProfile profile = profiles[profileIndex];
         editor.setHighlighter(profile.highlighter);
         editor.setStructureProvider(profile.structureProvider);
+        editor.clearSearchRange();
         editor.setText(profile.text);
         // The image atlas belongs to the one profile that uses it: swapped out here rather than left
         // loaded for the other languages, whose text contains no image columns anyway. The listener goes
@@ -2231,9 +2239,6 @@ public class Main extends ApplicationAdapter {
             // would leave a supplementary-plane codepoint as two notdef boxes.
             editor.setInlineImageProvider(emojiProvider);
             editor.setInlineImageListener(null);
-        }
-        if (searchField != null) {
-            searchField.setText(editor.getSearchText());
         }
         lastEventText = "Loaded sample: " + profile.name;
     }

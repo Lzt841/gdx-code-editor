@@ -9,7 +9,7 @@ import com.badlogic.gdx.utils.IntMap;
  * Maps key chords to {@link CodeEditorAction}s.
  *
  * <p>Install one on the editor with {@link CodeEditor#setKeymap(CodeKeymap)}. The built-in defaults
- * reproduce the chords the editor has always used, so installing nothing changes nothing:
+ * cover movement, editing and diagnostic navigation:
  *
  * <pre>{@code
  * editor.getKeymap().unbindAction(CodeEditorAction.TOGGLE_FOLD)
@@ -52,6 +52,8 @@ public class CodeKeymap {
         map.bind(Input.Keys.TAB, CodeEditorAction.INDENT);
         map.bind(CodeKeyStroke.shift(Input.Keys.TAB), CodeEditorAction.DEDENT);
         map.bind(Input.Keys.F2, CodeEditorAction.TOGGLE_FOLD);
+        map.bind(Input.Keys.F8, CodeEditorAction.DIAGNOSTIC_NEXT);
+        map.bind(CodeKeyStroke.shift(Input.Keys.F8), CodeEditorAction.DIAGNOSTIC_PREVIOUS);
 
         map.bind(CodeKeyStroke.ctrl(Input.Keys.Z), CodeEditorAction.UNDO);
         map.bind(CodeKeyStroke.ctrlShift(Input.Keys.Z), CodeEditorAction.REDO);

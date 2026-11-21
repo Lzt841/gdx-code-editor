@@ -37,6 +37,15 @@ import com.lzt841.editor.highlight.CodeHighlighter;
 import com.lzt841.editor.input.CodeEditorInteractionContext;
 import com.lzt841.editor.input.CodeEditorInteractionListener;
 import com.lzt841.editor.input.CodeEditorInteractionMode;
+import com.lzt841.editor.search.CodeSearchBar;
+import com.lzt841.editor.commands.CodeCommandPalette.CodeCommandPaletteStyle;
+import com.lzt841.editor.extensions.CodeCommandPaletteExtension;
+import com.lzt841.editor.extensions.CodeCompletionExtension;
+import com.lzt841.editor.extensions.CodeSnippetExtension;
+import com.lzt841.editor.extensions.CodeLineEditingExtension;
+import com.lzt841.editor.completion.CodeCompletionItem;
+import com.lzt841.editor.extensions.CodeStandardCommandsExtension;
+import com.lzt841.editor.extensions.CodeTextEditingExtension;
 import com.lzt841.editor.structure.BraceCodeStructureProvider;
 import com.lzt841.editor.structure.CodeStructureProvider;
 import com.lzt841.editor.structure.PythonIndentCodeStructureProvider;
@@ -50,11 +59,8 @@ public class AndroidDebugApp extends ApplicationAdapter {
     private Stage stage;
     private CodeEditor editor;
     private Table root;
-    private Table controlsTable;
-    private ScrollPane controlsPane;
     private Cell<ScrollPane> controlsPaneCell;
-    private TextField searchField;
-    private TextField replaceField;
+    private CodeSearchBar searchBar;
     private Label stateLabel;
     private Label eventLabel;
     private DemoProfile[] profiles;
@@ -74,15 +80,19 @@ public class AndroidDebugApp extends ApplicationAdapter {
     private TextButton zoomButton;
     private TextButton zoomEnabledButton;
     private TextButton overscrollButton;
-    private final Vector2 focusScrollTmp = new Vector2();
     private final Vector2 popupStageTmp = new Vector2();
     private Table popupMenu;
     private Label popupTitleLabel;
     private Label popupDetailLabel;
+    private Cell<Label> popupDetailCell;
+    private TextButton popupCopyButton;
+    private TextButton popupSearchButton;
     private CodeEditorInteractionContext activePopupContext;
+    private float uiScale = 1f;
 
     @Override
     public void create() {
+        uiScale = resolveUiScale();
         font = createUiFont();
         whitePixel = createWhitePixel();
         profiles = createProfiles();
@@ -118,21 +128,45 @@ public class AndroidDebugApp extends ApplicationAdapter {
         fieldStyle.messageFontColor = new Color(0.55f, 0.63f, 0.72f, 1f);
         fieldStyle.cursor = new TextureRegionDrawable(region).tint(new Color(0.98f, 0.83f, 0.43f, 1f));
         fieldStyle.selection = new TextureRegionDrawable(region).tint(new Color(0.231f, 0.447f, 0.686f, 0.55f));
-        fieldStyle.background = new TextureRegionDrawable(region).tint(new Color(0.071f, 0.102f, 0.137f, 1f));
+        TextureRegionDrawable fieldBackground = new TextureRegionDrawable(region);
+        fieldBackground.setLeftWidth(dp(12f));
+        fieldBackground.setRightWidth(dp(12f));
+        fieldStyle.background = fieldBackground.tint(new Color(0.085f, 0.12f, 0.16f, 1f));
+        fieldStyle.focusedBackground = fieldBackground.tint(new Color(0.14f, 0.21f, 0.28f, 1f));
+        fieldStyle.disabledBackground = fieldBackground.tint(new Color(0.055f, 0.078f, 0.105f, 1f));
         TextButton.TextButtonStyle buttonStyle = new TextButton.TextButtonStyle();
         buttonStyle.up = new TextureRegionDrawable(region).tint(new Color(0.109f, 0.164f, 0.219f, 1f));
         buttonStyle.down = new TextureRegionDrawable(region).tint(new Color(0.176f, 0.274f, 0.356f, 1f));
         buttonStyle.checked = buttonStyle.down;
         buttonStyle.font = font;
         buttonStyle.fontColor = new Color(0.9f, 0.94f, 0.98f, 1f);
+        buttonStyle.disabledFontColor = fieldStyle.disabledFontColor = new Color(0.52f, 0.62f, 0.72f, 1f);
         popupTitleLabel = new Label("", titleStyle);
         popupDetailLabel = new Label("", popupMutedStyle);
         popupDetailLabel.setWrap(true);
+        CodeCommandPaletteStyle paletteStyle = new CodeCommandPaletteStyle(fieldStyle, buttonStyle, labelStyle);
+        paletteStyle.window.background = panel;
+        paletteStyle.maxWidth = dp(680f);
+        paletteStyle.maxHeight = dp(460f);
+        paletteStyle.edgeMargin = dp(12f);
+        paletteStyle.rowHeight = dp(44f);
+        CodeCommandPaletteExtension paletteExtension = new CodeCommandPaletteExtension(paletteStyle);
+        editor.getExtensions().install(new CodeStandardCommandsExtension());
+        editor.getExtensions().install(new CodeTextEditingExtension());
+        editor.getExtensions().install(new CodeLineEditingExtension());
+        editor.getExtensions().install(new CodeSnippetExtension("demo.snippets",
+            CodeCompletionItem.snippet("fori", "for (int ${1:i} = 0; $1 < ${2:count}; $1++) {\n\t$0\n}", "for loop"),
+            CodeCompletionItem.snippet("ifelse", "if (${1:condition}) {\n\t$2\n} else {\n\t$0\n}", "if / else"),
+            CodeCompletionItem.snippet("sout", "System.out.println(${1:value});$0", "print value")));
+        editor.getExtensions().install(new CodeCompletionExtension());
+        editor.getExtensions().install(paletteExtension);
+        paletteExtension.getPalette().setExecutionListener((command, handled) ->
+            lastEvent = command.label + (handled ? ": completed" : ": not applied"));
 
         root = new Table();
         root.setFillParent(true);
-        root.pad(12f);
-        root.defaults().pad(6f);
+        root.pad(dp(12f));
+        root.defaults().pad(dp(6f));
         stage.addActor(root);
 
         Label title = new Label("Android Portrait Debug", titleStyle);
@@ -149,17 +183,24 @@ public class AndroidDebugApp extends ApplicationAdapter {
 
         Table editorCard = new Table();
         editorCard.setBackground(card);
-        editorCard.pad(8f);
+        editorCard.pad(dp(8f));
         // Handles hang below the caret; parent clip would cut them and the editor edges.
         editorCard.setClip(false);
-        editorCard.add(editor).grow();
+        searchBar = new CodeSearchBar(editor, fieldStyle, buttonStyle, labelStyle);
+        searchBar.setBackground(panel);
+        searchBar.pad(dp(8f));
+        editorCard.add(searchBar).growX().minWidth(0f);
+        editorCard.row();
+        editorCard.add(editor).grow().minHeight(0f);
+        searchBar.toFront();
+        stage.addCaptureListener(searchBar.createShortcutListener());
         root.add(editorCard).grow().minHeight(0f);
         root.row();
 
-        controlsTable = new Table();
+        Table controlsTable = new Table();
         controlsTable.setBackground(panel);
-        controlsTable.pad(10f);
-        controlsTable.defaults().growX().padBottom(6f);
+        controlsTable.pad(dp(10f));
+        controlsTable.defaults().growX().padBottom(dp(6f));
 
         sampleButton = button("Sample", buttonStyle, new Runnable() {
             @Override
@@ -251,63 +292,40 @@ public class AndroidDebugApp extends ApplicationAdapter {
             }
         });
 
-        searchField = new TextField("value", fieldStyle);
-        searchField.setMessageText("Search");
-        replaceField = new TextField("", fieldStyle);
-        replaceField.setMessageText("Replace");
-        TextButton searchButton = button("Apply Search", buttonStyle, new Runnable() {
-            @Override
-            public void run() {
-                editor.setSearchText(searchField.getText());
-                lastEvent = "Search: " + editor.getSearchMatchCount() + " matches";
-            }
-        });
-        TextButton prevButton = button("Prev Match", buttonStyle, new Runnable() {
-            @Override
-            public void run() {
-                if (!editor.findPreviousSearchMatch()) {
-                    lastEvent = "Search: no previous match";
-                }
-            }
-        });
-        TextButton nextButton = button("Next Match", buttonStyle, new Runnable() {
-            @Override
-            public void run() {
-                if (!editor.findNextSearchMatch()) {
-                    lastEvent = "Search: no next match";
-                }
-            }
-        });
-        TextButton replaceCurrentButton = button("Replace Current", buttonStyle, new Runnable() {
-            @Override
-            public void run() {
-                editor.setSearchText(searchField.getText());
-                if (!editor.replaceCurrentSearchMatch(replaceField.getText())) {
-                    lastEvent = "Replace: no editable match";
-                }
-            }
-        });
-        TextButton replaceAllButton = button("Replace All", buttonStyle, new Runnable() {
-            @Override
-            public void run() {
-                editor.setSearchText(searchField.getText());
-                int count = editor.replaceAllSearchMatches(replaceField.getText());
-                lastEvent = "Replace all: " + count + " matches";
-            }
-        });
-
         stateLabel = new Label("", labelStyle);
         stateLabel.setWrap(true);
         eventLabel = new Label("", labelStyle);
         eventLabel.setWrap(true);
 
         Label quickTitle = new Label("Quick Toggles", titleStyle);
-        Label searchTitle = new Label("Search And Replace", titleStyle);
         Label stateTitle = new Label("State", titleStyle);
 
         controlsTable.add(sampleButton).colspan(2);
         controlsTable.row();
-        controlsTable.add(quickTitle).colspan(2).left().padTop(2f).padBottom(2f);
+        controlsTable.add(button("Command Palette", buttonStyle, () -> {
+            if (!editor.getCommands().execute(CodeCommandPaletteExtension.SHOW)) {
+                lastEvent = "Enable the editor and leave password mode to open commands.";
+            }
+        })).colspan(2);
+        controlsTable.row();
+        controlsTable.add(button("Show Completions", buttonStyle, () -> {
+            if (!editor.getCommands().execute(CodeCompletionExtension.TRIGGER)) {
+                lastEvent = "Completion requires a writable editor outside password mode.";
+            }
+        })).colspan(2);
+        controlsTable.row();
+        controlsTable.add(button("Duplicate Lines", buttonStyle, () -> {
+            boolean changed = editor.getCommands().execute(CodeLineEditingExtension.DUPLICATE_DOWN);
+            lastEvent = changed ? "Duplicated current/selected lines" : "Line duplication was not applied";
+            if (changed) stage.setKeyboardFocus(editor);
+        }));
+        controlsTable.add(button("Delete Lines", buttonStyle, () -> {
+            boolean changed = editor.getCommands().execute(CodeLineEditingExtension.DELETE);
+            lastEvent = changed ? "Deleted current/selected lines" : "Line deletion was not applied";
+            if (changed) stage.setKeyboardFocus(editor);
+        }));
+        controlsTable.row();
+        controlsTable.add(quickTitle).colspan(2).left().padTop(dp(2f)).padBottom(dp(2f));
         controlsTable.row();
         controlsTable.add(wrapButton);
         controlsTable.add(lineNumberButton);
@@ -329,31 +347,17 @@ public class AndroidDebugApp extends ApplicationAdapter {
         controlsTable.add(undoButton);
         controlsTable.add(redoButton);
         controlsTable.row();
-        controlsTable.add(searchTitle).colspan(2).left().padTop(6f).padBottom(2f);
-        controlsTable.row();
-        controlsTable.add(searchField).colspan(2);
-        controlsTable.row();
-        controlsTable.add(searchButton).colspan(2);
-        controlsTable.row();
-        controlsTable.add(prevButton);
-        controlsTable.add(nextButton);
-        controlsTable.row();
-        controlsTable.add(replaceField).colspan(2);
-        controlsTable.row();
-        controlsTable.add(replaceCurrentButton);
-        controlsTable.add(replaceAllButton);
-        controlsTable.row();
-        controlsTable.add(stateTitle).colspan(2).left().padTop(6f).padBottom(2f);
+        controlsTable.add(stateTitle).colspan(2).left().padTop(dp(6f)).padBottom(dp(2f));
         controlsTable.row();
         controlsTable.add(stateLabel).colspan(2);
         controlsTable.row();
         controlsTable.add(eventLabel).colspan(2);
 
-        controlsPane = new ScrollPane(controlsTable);
+        ScrollPane controlsPane = new ScrollPane(controlsTable);
         controlsPane.setFadeScrollBars(false);
         controlsPane.setScrollingDisabled(true, false);
         controlsPane.setOverscroll(false, true);
-        controlsPaneCell = root.add(controlsPane).growX().minHeight(220f);
+        controlsPaneCell = root.add(controlsPane).growX();
 
         popupMenu = createPopupMenu(buttonStyle);
         stage.addActor(popupMenu);
@@ -382,7 +386,6 @@ public class AndroidDebugApp extends ApplicationAdapter {
         refreshLabels();
         ScreenUtils.clear(0.047f, 0.071f, 0.102f, 1f);
         stage.act(Gdx.graphics.getDeltaTime());
-        keepFocusedControlVisible();
         stage.draw();
     }
 
@@ -394,6 +397,7 @@ public class AndroidDebugApp extends ApplicationAdapter {
 
     @Override
     public void dispose() {
+        if (editor != null) editor.getExtensions().dispose();
         stage.dispose();
         whitePixel.dispose();
         font.dispose();
@@ -409,7 +413,7 @@ public class AndroidDebugApp extends ApplicationAdapter {
 
     private TextButton button(String text, TextButton.TextButtonStyle style, final Runnable action) {
         final TextButton button = new TextButton(text, style);
-        button.pad(10f, 12f, 10f, 12f);
+        button.pad(dp(10f), dp(12f), dp(10f), dp(12f));
         button.addListener(new ClickListener() {
             @Override
             public void clicked(com.badlogic.gdx.scenes.scene2d.InputEvent event, float x, float y) {
@@ -425,39 +429,41 @@ public class AndroidDebugApp extends ApplicationAdapter {
         Table popup = new Table();
         popup.setVisible(false);
         popup.setBackground(createSolidDrawable(new Color(0.078f, 0.114f, 0.153f, 0.98f)));
-        popup.pad(12f);
-        popup.defaults().growX().padBottom(6f);
+        popup.pad(dp(12f));
+        popup.defaults().growX().padBottom(dp(6f));
 
-        popup.add(popupTitleLabel).left().padBottom(2f);
+        popup.add(popupTitleLabel).left().padBottom(dp(2f));
         popup.row();
-        popup.add(popupDetailLabel).width(260f).padBottom(10f);
+        popupDetailCell = popup.add(popupDetailLabel).width(dp(260f)).padBottom(dp(10f));
         popup.row();
-        popup.add(createPopupButton("Copy Selection", buttonStyle, new Runnable() {
+        popupCopyButton = createPopupButton("Copy Selection", buttonStyle, new Runnable() {
             @Override
             public void run() {
-                if (activePopupContext == null || activePopupContext.selectedText.isEmpty()) {
+                if (activePopupContext == null || activePopupContext.selectedText == null
+                    || activePopupContext.selectedText.isEmpty()) {
                     lastEvent = "Popup: no selection to copy";
+                } else if (editor.isPasswordMode()) {
+                    lastEvent = "Popup: copying is unavailable in password mode";
+                } else if (editor.copySelection()) {
+                    lastEvent = "Popup: copied selection";
                 } else {
-                    Gdx.app.getClipboard().setContents(activePopupContext.selectedText);
-                    lastEvent = "Popup: copied " + Math.min(activePopupContext.selectedText.length(), 24) + " chars";
+                    lastEvent = "Popup: clipboard refused the selection";
                 }
                 hidePopupMenu();
             }
-        }));
+        });
+        popup.add(popupCopyButton);
         popup.row();
-        popup.add(createPopupButton("Search Selection", buttonStyle, new Runnable() {
+        popupSearchButton = createPopupButton("Search Selection", buttonStyle, new Runnable() {
             @Override
             public void run() {
-                if (activePopupContext == null || activePopupContext.selectedText.isEmpty()) {
-                    lastEvent = "Popup: no selection to search";
-                } else {
-                    searchField.setText(activePopupContext.selectedText);
-                    editor.setSearchText(activePopupContext.selectedText);
-                    lastEvent = "Popup: search = " + shorten(activePopupContext.selectedText, 28);
+                if (activePopupContext != null) {
+                    searchBar.openForText(activePopupContext.selectedText, false);
                 }
                 hidePopupMenu();
             }
-        }));
+        });
+        popup.add(popupSearchButton);
         popup.row();
         popup.add(createPopupButton("Select All", buttonStyle, new Runnable() {
             @Override
@@ -492,7 +498,7 @@ public class AndroidDebugApp extends ApplicationAdapter {
 
     private TextButton createPopupButton(String text, TextButton.TextButtonStyle style, final Runnable action) {
         final TextButton button = new TextButton(text, style);
-        button.pad(8f, 12f, 8f, 12f);
+        button.pad(dp(8f), dp(12f), dp(8f), dp(12f));
         button.addListener(new ClickListener() {
             @Override
             public void clicked(InputEvent event, float x, float y) {
@@ -509,16 +515,27 @@ public class AndroidDebugApp extends ApplicationAdapter {
             return;
         }
         activePopupContext = context;
+        boolean passwordMode = editor.isPasswordMode();
+        boolean hasSelection = context.selectedText != null && !context.selectedText.isEmpty();
+        popupCopyButton.setDisabled(passwordMode || !hasSelection);
+        popupSearchButton.setDisabled(passwordMode || !hasSelection
+            || context.selectedText.indexOf('\n') >= 0);
         popupTitleLabel.setText("Long Press Menu");
+        String selectionSummary = passwordMode
+            ? "(hidden)"
+            : (hasSelection ? shorten(context.selectedText, 32) : "(none)");
         popupDetailLabel.setText(
             "At " + (context.line + 1) + ":" + (context.column + 1)
-                + "\nSelection: " + (context.selectedText.isEmpty() ? "(none)" : shorten(context.selectedText, 32))
+                + "\nSelection: " + selectionSummary
         );
         popupMenu.pack();
 
-        float margin = 14f;
-        float desiredWidth = Math.min(stage.getViewport().getWorldWidth() - margin * 2f, 320f);
-        popupMenu.setWidth(Math.max(220f, desiredWidth));
+        float stageWidth = stage.getViewport().getWorldWidth();
+        float margin = Math.min(dp(14f), stageWidth * 0.04f);
+        float availableWidth = Math.max(1f, stageWidth - margin * 2f);
+        float desiredWidth = Math.min(availableWidth, dp(320f));
+        popupDetailCell.width(Math.max(1f, Math.min(dp(260f), desiredWidth - dp(24f))));
+        popupMenu.setWidth(desiredWidth);
         popupMenu.invalidateHierarchy();
         popupMenu.pack();
 
@@ -527,12 +544,12 @@ public class AndroidDebugApp extends ApplicationAdapter {
 
         float x = Math.max(margin, Math.min(
             popupStageTmp.x - popupMenu.getWidth() * 0.2f,
-            stage.getViewport().getWorldWidth() - popupMenu.getWidth() - margin
+            stageWidth - popupMenu.getWidth() - margin
         ));
-        float y = popupStageTmp.y - popupMenu.getHeight() - 12f;
+        float y = popupStageTmp.y - popupMenu.getHeight() - dp(12f);
         if (y < margin) {
             y = Math.min(
-                popupStageTmp.y + 12f,
+                popupStageTmp.y + dp(12f),
                 stage.getViewport().getWorldHeight() - popupMenu.getHeight() - margin
             );
         }
@@ -572,7 +589,6 @@ public class AndroidDebugApp extends ApplicationAdapter {
             "Highlighter: " + profile.description + "\n"
                 + "Cursor: " + (editor.getCursorLine() + 1) + ":" + (editor.getCursorColumn() + 1) + "\n"
                 + "Selection: " + onOff(editor.hasSelection()) + "\n"
-                + "Matches: " + editor.getSearchMatchCount() + "\n"
                 + "Line numbers: " + onOff(editor.isLineNumbersVisible())
                 + "   Fixed gutter: " + onOff(editor.isLineNumbersFixed()) + "\n"
                 + "Scrollbars: " + onOff(editor.isScrollbarsVisible())
@@ -591,6 +607,7 @@ public class AndroidDebugApp extends ApplicationAdapter {
         DemoProfile profile = profiles[index];
         editor.setHighlighter(profile.highlighter);
         editor.setStructureProvider(profile.structureProvider);
+        editor.clearSearchRange();
         editor.setText(profile.text);
         lastEvent = "Loaded sample: " + profile.name;
     }
@@ -611,26 +628,28 @@ public class AndroidDebugApp extends ApplicationAdapter {
             .gutterColor(new Color(0.022f, 0.031f, 0.043f, 1f))
             .textColor(new Color(0.93f, 0.96f, 0.99f, 1f))
             .gutterTextColor(new Color(0.64f, 0.72f, 0.8f, 1f))
-            .textBaselineOffset(-9f)
+            .textBaselineOffset(dp(-9f))
             .build();
-        style.gutterMinWidth = 58f;
-        style.gutterLeftPadding = 10f;
-        style.gutterFoldIndicatorGap = 10f;
-        style.foldIndicatorSize = 14f;
-        style.foldIndicatorRightPadding = 10f;
-        style.textLeftPadding = 18f;
-        style.textRightPadding = 28f;
-        style.rowPadding = 8f;
-        style.scrollbarHitWidth = 28f;
-        style.scrollbarGap = 12f;
-        style.scrollbarMargin = 5f;
-        style.scrollbarMinThumbSize = 32f;
+        style.gutterMinWidth = dp(58f);
+        style.gutterLeftPadding = dp(10f);
+        style.gutterFoldIndicatorGap = dp(10f);
+        style.foldIndicatorSize = dp(14f);
+        style.foldIndicatorRightPadding = dp(10f);
+        style.textLeftPadding = dp(18f);
+        style.textRightPadding = dp(28f);
+        style.rowPadding = dp(8f);
+        style.scrollbarWidth = dp(8f);
+        style.scrollbarHitWidth = dp(28f);
+        style.scrollbarGap = dp(12f);
+        style.scrollbarMargin = dp(5f);
+        style.scrollbarMinThumbSize = dp(32f);
+        style.scrollbarHitInset = dp(6f);
         style.selectionHandleTouchRadiusMultiplier = 1.25f;
-        style.guideSpacing = 20f;
-        style.guideOffsetX = -7f;
-        style.foldBadgeGap = 12f;
-        style.foldBadgeHorizontalPadding = 14f;
-        style.foldBadgeVerticalPadding = 5f;
+        style.guideSpacing = dp(20f);
+        style.guideOffsetX = dp(-7f);
+        style.foldBadgeGap = dp(12f);
+        style.foldBadgeHorizontalPadding = dp(14f);
+        style.foldBadgeVerticalPadding = dp(5f);
         return style;
     }
 
@@ -679,13 +698,13 @@ public class AndroidDebugApp extends ApplicationAdapter {
         final Color tint = new Color(color);
         return new BaseDrawable() {
             {
-                setMinWidth(14f);
-                setMinHeight(14f);
+                setMinWidth(dp(14f));
+                setMinHeight(dp(14f));
             }
 
             @Override
             public void draw(Batch batch, float x, float y, float width, float height) {
-                float thickness = Math.max(1.6f, Math.min(width, height) * 0.16f);
+                float thickness = Math.max(dp(1.6f), Math.min(width, height) * 0.16f);
                 if (collapsed) {
                     drawSegment(batch, x + width * 0.34f, y + height * 0.22f, x + width * 0.7f, y + height * 0.5f, thickness, tint);
                     drawSegment(batch, x + width * 0.34f, y + height * 0.78f, x + width * 0.7f, y + height * 0.5f, thickness, tint);
@@ -735,7 +754,7 @@ public class AndroidDebugApp extends ApplicationAdapter {
         FileHandle fontFile = resolveAndroidFontFile();
         if (fontFile == null) {
             BitmapFont fallback = new BitmapFont();
-            fallback.getData().setScale(1.7f);
+            fallback.getData().setScale(1.1f * uiScale);
             fallback.setUseIntegerPositions(false);
             return fallback;
         }
@@ -743,7 +762,7 @@ public class AndroidDebugApp extends ApplicationAdapter {
         fontGenerator = new FreeTypeFontGenerator(fontFile);
         fontPacker = new PixmapPacker(512, 512, Pixmap.Format.RGBA8888, 2, false);
         FreeTypeFontGenerator.FreeTypeFontParameter parameter = new FreeTypeFontGenerator.FreeTypeFontParameter();
-        parameter.size = 30;
+        parameter.size = Math.max(1, Math.round(16f * uiScale));
         parameter.minFilter = Texture.TextureFilter.Linear;
         parameter.magFilter = Texture.TextureFilter.Linear;
         parameter.incremental = true;
@@ -760,29 +779,18 @@ public class AndroidDebugApp extends ApplicationAdapter {
             return;
         }
         float worldHeight = stage.getViewport().getWorldHeight();
-        float controlsHeight = Math.max(220f, Math.min(worldHeight * 0.42f, 420f));
+        float controlsHeight = Math.min(worldHeight * 0.34f, dp(360f));
         controlsPaneCell.height(controlsHeight);
         root.invalidateHierarchy();
     }
 
-    private void keepFocusedControlVisible() {
-        if (controlsPane == null || controlsTable == null || stage == null) {
-            return;
-        }
-        Actor focus = stage.getKeyboardFocus();
-        if (focus == null || !isDescendantOf(focus, controlsTable)) {
-            return;
-        }
-        focusScrollTmp.set(0f, 0f);
-        focus.localToAscendantCoordinates(controlsTable, focusScrollTmp);
-        controlsPane.scrollTo(
-            Math.max(0f, focusScrollTmp.x - 12f),
-            Math.max(0f, focusScrollTmp.y - 24f),
-            focus.getWidth() + 24f,
-            focus.getHeight() + 48f,
-            false,
-            true
-        );
+    private float resolveUiScale() {
+        float density = Gdx.graphics == null ? 1f : Gdx.graphics.getDensity();
+        return density > 0f ? density : 1f;
+    }
+
+    private float dp(float value) {
+        return value * uiScale;
     }
 
     private boolean isDescendantOf(Actor actor, Actor parent) {

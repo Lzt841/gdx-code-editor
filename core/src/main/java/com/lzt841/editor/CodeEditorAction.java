@@ -56,7 +56,17 @@ public enum CodeEditorAction {
      * Shift+F6 by default; starts a rename of the symbol under the caret. Not F2, which this editor
      * has always used for {@link #TOGGLE_FOLD}.
      */
-    NAVIGATE_RENAME;
+    NAVIGATE_RENAME,
+
+    /** F8 by default; moves to the next current diagnostic and wraps at the end. */
+    DIAGNOSTIC_NEXT,
+    /** Shift+F8 by default; moves to the previous current diagnostic and wraps at the start. */
+    DIAGNOSTIC_PREVIOUS,
+
+    /** F4 in the navigation controller; visits the next retained navigation result. */
+    NAVIGATE_NEXT_TARGET,
+    /** Shift+F4 in the navigation controller; visits the previous retained navigation result. */
+    NAVIGATE_PREVIOUS_TARGET;
 
     /**
      * Whether extra Ctrl/Alt on top of this action's default chord should still fire it. Historical

@@ -5,8 +5,9 @@ package com.lzt841.editor.navigation;
  *
  * <p>Async by design, like the completion and hover providers: answer through
  * {@link CodeNavigationResponse#complete} whenever the answer is ready, from the GDX thread. A
- * response that arrives after the user has asked something else is dropped by the controller, so an
- * out-of-date language server reply is harmless.
+ * response is ignored after a newer request, cancellation or uninstall, or if the document version,
+ * caret or selection no longer matches. Disabled and password-mode editors do not request or accept
+ * navigation results; read-only editors may navigate.
  *
  * <p>Renaming is a separate interface, {@link CodeRenameProvider}, because plenty of backends can
  * answer where a symbol lives without being able to rewrite it safely.

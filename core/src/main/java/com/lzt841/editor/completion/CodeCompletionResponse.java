@@ -12,4 +12,10 @@ public interface CodeCompletionResponse {
      * (the popup then closes) and may be retained by the editor, so do not mutate it afterwards.
      */
     void complete(Array<CodeCompletionItem> items);
+
+    /**
+     * Whether the caller no longer needs this response. Check on the GDX thread before starting or
+     * delivering expensive work. Existing sinks default to false; complete remains one-shot.
+     */
+    default boolean isCancelled() { return false; }
 }

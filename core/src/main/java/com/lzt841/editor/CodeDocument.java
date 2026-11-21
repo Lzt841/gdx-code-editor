@@ -190,8 +190,24 @@ public class CodeDocument {
 
     public void moveCursorTo(int line, int column) {
         cursorLine = clamp(line, 0, lines.size - 1);
-        cursorColumn = clamp(column, 0, lines.get(cursorLine).length());
+        CharSequence text = lines.get(cursorLine);
+        cursorColumn = snapColumn(text, clamp(column, 0, text.length()));
         resetMergeState();
+    }
+
+    static boolean splitsSurrogatePair(CharSequence text, int column) {
+        return column > 0 && column < text.length()
+            && Character.isHighSurrogate(text.charAt(column - 1))
+            && Character.isLowSurrogate(text.charAt(column));
+    }
+
+    /** A UTF-16 column inside a supplementary character resolves to its end. */
+    static int snapColumn(CharSequence text, int column) {
+        return splitsSurrogatePair(text, column) ? column + 1 : column;
+    }
+
+    int snapColumn(int line, int column) {
+        return snapColumn(lines.get(line), column);
     }
 
     public void moveCursorLeft() {
@@ -295,6 +311,10 @@ public class CodeDocument {
     }
 
     public void deleteRange(int startLine, int startColumn, int endLine, int endColumn) {
+        startLine = clamp(startLine, 0, lines.size - 1);
+        endLine = clamp(endLine, 0, lines.size - 1);
+        startColumn = snapColumn(startLine, clamp(startColumn, 0, lines.get(startLine).length()));
+        endColumn = snapColumn(endLine, clamp(endColumn, 0, lines.get(endLine).length()));
         if (startLine > endLine || (startLine == endLine && startColumn > endColumn)) {
             int tempLine = startLine;
             int tempColumn = startColumn;
@@ -304,10 +324,6 @@ public class CodeDocument {
             endColumn = tempColumn;
         }
 
-        startLine = clamp(startLine, 0, lines.size - 1);
-        endLine = clamp(endLine, 0, lines.size - 1);
-        startColumn = clamp(startColumn, 0, lines.get(startLine).length());
-        endColumn = clamp(endColumn, 0, lines.get(endLine).length());
         if (startLine == endLine && startColumn == endColumn) {
             return;
         }
@@ -333,6 +349,10 @@ public class CodeDocument {
     }
 
     public String getTextRange(int startLine, int startColumn, int endLine, int endColumn) {
+        startLine = clamp(startLine, 0, lines.size - 1);
+        endLine = clamp(endLine, 0, lines.size - 1);
+        startColumn = snapColumn(startLine, clamp(startColumn, 0, lines.get(startLine).length()));
+        endColumn = snapColumn(endLine, clamp(endColumn, 0, lines.get(endLine).length()));
         if (startLine > endLine || (startLine == endLine && startColumn > endColumn)) {
             int tempLine = startLine;
             int tempColumn = startColumn;
@@ -341,11 +361,6 @@ public class CodeDocument {
             endLine = tempLine;
             endColumn = tempColumn;
         }
-
-        startLine = clamp(startLine, 0, lines.size - 1);
-        endLine = clamp(endLine, 0, lines.size - 1);
-        startColumn = clamp(startColumn, 0, lines.get(startLine).length());
-        endColumn = clamp(endColumn, 0, lines.get(endLine).length());
 
         if (startLine == endLine) {
             return lines.get(startLine).substring(startColumn, endColumn);
@@ -882,8 +897,12 @@ public class CodeDocument {
         }
         if (collected.size == 1) {
             UndoEntry only = collected.first();
-            only.label = label;
-            pushToUndoStack(only);
+            // Even one mutation can move the caret inside the group before or after editing, as a
+            // formatter does when it preserves the caller's caret. Keep the group's boundary positions.
+            UndoEntry grouped = new UndoEntry(only.startLine, only.removedLines, only.insertedCount,
+                compoundCursorLine, compoundCursorColumn, cursorLine, cursorColumn);
+            grouped.label = label;
+            pushToUndoStack(grouped);
         } else {
             UndoEntry composite = UndoEntry.composite(collected, compoundCursorLine, compoundCursorColumn);
             composite.inverseCursorLine = cursorLine;
@@ -902,8 +921,13 @@ public class CodeDocument {
         if (entry.children != null) {
             Array<UndoEntry> inverses = new Array<>(entry.children.size);
             if (reverseOrder) {
+                // Undo applies children right to left, but the inverse is replayed left to right.
+                // Reserve slots once so large Replace All groups do not shift the array for every child.
+                for (int i = 0; i < entry.children.size; i++) {
+                    inverses.add(null);
+                }
                 for (int i = entry.children.size - 1; i >= 0; i--) {
-                    inverses.add(applyEntry(entry.children.get(i), true));
+                    inverses.set(i, applyEntry(entry.children.get(i), true));
                 }
             } else {
                 for (int i = 0; i < entry.children.size; i++) {
@@ -913,6 +937,8 @@ public class CodeDocument {
             cursorLine = clamp(entry.cursorLine, 0, lines.size - 1);
             cursorColumn = clamp(entry.cursorColumn, 0, lines.get(cursorLine).length());
             UndoEntry inverse = UndoEntry.composite(inverses, entry.inverseCursorLine, entry.inverseCursorColumn);
+            inverse.inverseCursorLine = entry.cursorLine;
+            inverse.inverseCursorColumn = entry.cursorColumn;
             // Carried across, or the label would survive undo but vanish on redo.
             inverse.label = entry.label;
             return inverse;

@@ -30,7 +30,9 @@ public interface CodeRenameProvider {
     /**
      * Produces the edits for {@code request} and delivers them to {@code response}, or calls
      * {@link CodeRenameResponse#fail} with a reason. May answer later, from the GDX thread; a reply
-     * that arrives after the document has moved on is dropped by the controller.
+     * that arrives after the document has changed is rejected by the controller. Read-only, disabled
+     * and password-mode editors cannot request or apply renames. Moving the caret alone does not
+     * invalidate an explicitly requested rename.
      */
     void provideRenameEdits(CodeRenameRequest request, CodeRenameResponse response);
 }

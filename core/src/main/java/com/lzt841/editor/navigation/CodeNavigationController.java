@@ -24,14 +24,16 @@ import com.lzt841.editor.CodeKeymap;
  * <p>With no provider it uses {@link WordCodeNavigationProvider}, so identifier-level navigation and
  * rename work immediately; pass a real one for a language that has a backend.
  *
- * <p>Defaults are F12 for definition, Shift+F12 for references and Shift+F6 for rename, in this
+ * <p>Defaults are F12 for definition, Shift+F12 for references, F4/Shift+F4 for browsing retained
+ * results and Shift+F6 for rename, in this
  * controller's own keymap rather than the editor's — the same split the completion popup uses. Rename
  * is not on F2 because this editor has always folded with F2, and silently taking that away from
  * existing keymaps would be a worse default than an unfamiliar chord.
  *
  * <p>Results the controller cannot act on alone — several targets, a target in another file, the new
- * name for a rename — go to a {@link CodeNavigationListener}. Without one, a definition jumps to the
- * first target, references do nothing beyond a single hit, and rename does nothing at all.
+ * name for a rename — go to a {@link CodeNavigationListener}. Without one, navigation jumps to the
+ * first local target and F4/Shift+F4 browse the rest. Opening another document or asking for a new name
+ * still needs the host.
  */
 public class CodeNavigationController {
     private final CodeEditor editor;
@@ -47,6 +49,8 @@ public class CodeNavigationController {
 
     private CodeNavigationListener listener;
     private CodeKeymap keymap = navigationDefaults();
+    private CodeNavigationRequest lastTargetRequest;
+    private int lastTargetIndex = -1;
     private int requestSerial;
     private boolean installed;
 
@@ -79,16 +83,19 @@ public class CodeNavigationController {
             this.renameProvider = renameProvider != null ? renameProvider : fallback;
         } else {
             this.provider = provider;
-            this.renameProvider = renameProvider;
+            this.renameProvider = renameProvider != null ? renameProvider
+                : provider instanceof CodeRenameProvider ? (CodeRenameProvider) provider : null;
         }
     }
 
-    /** F12, Shift+F12, Shift+F6. Independent of the editor's keymap. */
+    /** F12, Shift+F12, Shift+F6, F4 and Shift+F4. Independent of the editor's keymap. */
     public static CodeKeymap navigationDefaults() {
         CodeKeymap map = new CodeKeymap();
         map.bind(Input.Keys.F12, CodeEditorAction.NAVIGATE_TO_DEFINITION);
         map.bind(CodeKeyStroke.shift(Input.Keys.F12), CodeEditorAction.NAVIGATE_FIND_REFERENCES);
         map.bind(CodeKeyStroke.shift(Input.Keys.F6), CodeEditorAction.NAVIGATE_RENAME);
+        map.bind(Input.Keys.F4, CodeEditorAction.NAVIGATE_NEXT_TARGET);
+        map.bind(CodeKeyStroke.shift(Input.Keys.F4), CodeEditorAction.NAVIGATE_PREVIOUS_TARGET);
         return map;
     }
 
@@ -101,14 +108,12 @@ public class CodeNavigationController {
     }
 
     public void uninstall() {
-        if (!installed) {
-            return;
+        cancel();
+        clearTargets();
+        if (installed) {
+            editor.removeInputInterceptor(inputInterceptor);
+            installed = false;
         }
-        editor.removeInputInterceptor(inputInterceptor);
-        // Anything still in flight is now stale.
-        requestSerial++;
-        lastTargets.clear();
-        installed = false;
     }
 
     public boolean isInstalled() {
@@ -143,12 +148,35 @@ public class CodeNavigationController {
     }
 
     /**
-     * Targets from the most recent request that produced any, in document order. Not a live view: it is
-     * replaced on the next request and cleared by {@link #uninstall()}. Handy for a host that shows a
-     * results panel and wants to redraw it later without asking again.
+     * Snapshot of the latest navigation results, in provider order. Cleared by the next navigation
+     * request, a document edit, or {@link #uninstall()}. Mutating this array does not affect the
+     * retained results. Handy for a host that shows a results list without asking the provider again.
      */
     public Array<CodeNavigationTarget> getLastTargets() {
-        return lastTargets;
+        invalidateStaleTargets();
+        return new Array<CodeNavigationTarget>(lastTargets);
+    }
+
+    /** Number of retained results; unlike {@link #getLastTargets()}, does not allocate a snapshot. */
+    public int getTargetCount() {
+        invalidateStaleTargets();
+        return lastTargets.size;
+    }
+
+    /** Index of the last successfully visited result, or -1 if none was visited or results expired. */
+    public int getLastTargetIndex() {
+        invalidateStaleTargets();
+        return lastTargetIndex;
+    }
+
+    /** Visits the next retained result, wrapping at the end. Does not ask the provider again. */
+    public boolean navigateToNextTarget() {
+        return navigateAdjacentTarget(true);
+    }
+
+    /** Visits the preceding retained result, wrapping at the beginning. */
+    public boolean navigateToPreviousTarget() {
+        return navigateAdjacentTarget(false);
     }
 
     /** Asks for the definition of the symbol under the caret. */
@@ -165,16 +193,22 @@ public class CodeNavigationController {
      * Asks the provider for {@code kind} at the caret and routes the answer.
      *
      * <p>Returns immediately: the provider may answer on a later frame. Only the newest request's
-     * answer is used, so pressing F12 twice quickly cannot navigate twice.
+     * answer is used, and only while the document version, caret and selection still match. Disabled
+     * and password-mode editors do not request navigation.
      */
     public void request(CodeNavigationKind kind) {
+        final int serial = ++requestSerial;
+        clearTargets();
+        if (!canNavigate()) {
+            return;
+        }
         int line = editor.getCursorLine();
         int column = editor.getCursorColumn();
+        final CodeEditorTextRange selection = editor.getSelection();
         CodeEditorTextRange wordRange = editor.getWordRangeAt(line, column);
         String word = wordRange == null ? "" : editor.getTextRange(wordRange);
         final CodeNavigationRequest request = new CodeNavigationRequest(
             editor, kind, line, column, editor.getDocumentVersion(), wordRange, word);
-        final int serial = ++requestSerial;
         provider.provideTargets(request, new CodeNavigationResponse() {
             private boolean delivered;
 
@@ -184,6 +218,11 @@ public class CodeNavigationController {
                     return;
                 }
                 delivered = true;
+                if (!canNavigate() || editor.getDocumentVersion() != request.documentVersion
+                    || editor.getCursorLine() != request.line || editor.getCursorColumn() != request.column
+                    || (selection == null ? editor.getSelection() != null : !selection.equals(editor.getSelection()))) {
+                    return;
+                }
                 deliverTargets(request, targets);
             }
         });
@@ -193,24 +232,41 @@ public class CodeNavigationController {
      * Moves the caret to {@code target}, or hands it to the listener when it is in another document.
      *
      * <p>A host calls this with whatever the user picked out of a results list. {@code request} may be
-     * null, and is only passed through to the listener.
+     * null. When supplied, its editor and document version must still match, so a results list cannot
+     * navigate using positions from an earlier document. Read-only navigation is allowed; disabled
+     * and password-mode editors cannot navigate.
      *
      * @return whether the caret moved, or the host reported it opened the other document
      */
     public boolean navigateTo(CodeNavigationTarget target, CodeNavigationRequest request) {
-        if (target == null) {
+        return navigateTo(target, request, -1);
+    }
+
+    private boolean navigateTo(CodeNavigationTarget target, CodeNavigationRequest request, int resultIndex) {
+        if (target == null || !canNavigate()
+            || (request != null && (request.editor != editor
+                || request.documentVersion != editor.getDocumentVersion()))) {
             return false;
         }
         if (!target.isCurrentDocument()) {
-            return listener != null && listener.onNavigateToOtherDocument(this, request, target);
+            if (listener == null) {
+                return false;
+            }
+            cancel();
+            CodeNavigationRequest retainedRequest = lastTargetRequest;
+            boolean navigated = listener.onNavigateToOtherDocument(this, request, target);
+            if (navigated && lastTargetRequest == retainedRequest) {
+                updateTargetIndex(target, resultIndex);
+            }
+            return navigated;
         }
-        if (target.getLine() < 0 || target.getLine() >= editor.getLineCount()) {
-            // A stale target: something deleted the lines it pointed at. Rejected rather than clamped,
-            // the same way goToSymbol treats a stale symbol, so a caller can tell the difference.
+        if (!isValidRange(target.range)) {
             return false;
         }
+        cancel();
         editor.setCursorPosition(target.getLine(), target.getColumn());
         editor.scrollLineToCenter(target.getLine());
+        updateTargetIndex(target, resultIndex);
         if (listener != null) {
             listener.onNavigated(this, request, target);
         }
@@ -230,13 +286,14 @@ public class CodeNavigationController {
      *     renameable position, or no listener took the request
      */
     public boolean requestRename() {
-        if (renameProvider == null || editor.isReadOnly() || editor.isDisabled()) {
+        cancel();
+        if (renameProvider == null || !canRename()) {
             return false;
         }
         int line = editor.getCursorLine();
         int column = editor.getCursorColumn();
         CodeEditorTextRange range = renameProvider.prepareRename(editor, line, column);
-        if (range == null) {
+        if (!isValidRange(range)) {
             if (listener != null) {
                 listener.onRenameFailed(this, "nothing to rename here");
             }
@@ -263,18 +320,19 @@ public class CodeNavigationController {
      * listener.
      */
     public void renameTo(String newName) {
+        final int serial = ++requestSerial;
         if (renameProvider == null) {
             failRename("renaming is not supported here");
             return;
         }
-        if (editor.isReadOnly() || editor.isDisabled()) {
-            failRename("the editor is read-only");
+        if (!canRename()) {
+            failRename("renaming is unavailable in the current editor mode");
             return;
         }
         int line = editor.getCursorLine();
         int column = editor.getCursorColumn();
         CodeEditorTextRange range = renameProvider.prepareRename(editor, line, column);
-        if (range == null) {
+        if (!isValidRange(range)) {
             failRename("nothing to rename here");
             return;
         }
@@ -285,7 +343,6 @@ public class CodeNavigationController {
         }
         final CodeRenameRequest request = new CodeRenameRequest(
             editor, line, column, editor.getDocumentVersion(), range, oldName, newName);
-        final int serial = ++requestSerial;
         renameProvider.provideRenameEdits(request, new CodeRenameResponse() {
             private boolean delivered;
 
@@ -316,7 +373,7 @@ public class CodeNavigationController {
 
     /** Runs an action from this controller's keymap. Public so a menu item can reuse it. */
     public boolean performAction(CodeEditorAction action) {
-        if (action == null) {
+        if (action == null || !canNavigate()) {
             return false;
         }
         switch (action) {
@@ -331,6 +388,12 @@ public class CodeNavigationController {
                 // nothing useful, and swallowing it keeps the key from folding a region instead.
                 requestRename();
                 return true;
+            case NAVIGATE_NEXT_TARGET:
+                navigateToNextTarget();
+                return true;
+            case NAVIGATE_PREVIOUS_TARGET:
+                navigateToPreviousTarget();
+                return true;
             default:
                 return false;
         }
@@ -342,28 +405,43 @@ public class CodeNavigationController {
     }
 
     private void deliverTargets(CodeNavigationRequest request, Array<CodeNavigationTarget> targets) {
-        lastTargets.clear();
-        if (targets == null || targets.size == 0) {
+        clearTargets();
+        if (targets != null) {
+            for (int i = 0; i < targets.size; i++) {
+                CodeNavigationTarget target = targets.get(i);
+                if (target != null && (!target.isCurrentDocument() || isValidRange(target.range))) {
+                    lastTargets.add(target);
+                }
+            }
+        }
+        if (lastTargets.size == 0) {
             if (listener != null) {
                 listener.onNoTarget(this, request);
             }
             return;
         }
-        lastTargets.addAll(targets);
-        if (targets.size == 1) {
-            navigateTo(targets.first(), request);
+        lastTargetRequest = request;
+        if (lastTargets.size == 1) {
+            navigateTo(lastTargets.first(), request);
             return;
         }
-        if (listener != null && listener.onMultipleTargets(this, request, targets)) {
+        if (listener != null && listener.onMultipleTargets(this, request, getLastTargets())) {
+            return;
+        }
+        if (lastTargetRequest != request || lastTargets.size == 0) {
             return;
         }
         // No host list to show. Going to the first target is right for a definition that resolved
         // ambiguously; for references it is a poor substitute for a list, which is why the listener
         // gets first refusal.
-        navigateTo(targets.first(), request);
+        navigateToNextTarget();
     }
 
     private void applyRename(CodeRenameRequest request, Array<CodeEditorTextEdit> edits) {
+        if (!canRename()) {
+            failRename("renaming is unavailable in the current editor mode");
+            return;
+        }
         if (edits == null || edits.size == 0) {
             failRename("no occurrences to rename");
             return;
@@ -394,5 +472,82 @@ public class CodeNavigationController {
         if (listener != null) {
             listener.onRenameFailed(this, message);
         }
+    }
+
+    private boolean navigateAdjacentTarget(boolean forward) {
+        invalidateStaleTargets();
+        if (!canNavigate() || lastTargets.size == 0) {
+            return false;
+        }
+        CodeNavigationRequest request = lastTargetRequest;
+        int count = lastTargets.size;
+        int index = lastTargetIndex;
+        for (int visited = 0; visited < count; visited++) {
+            index = forward ? (index + 1) % count : (index <= 0 ? count - 1 : index - 1);
+            if (navigateTo(lastTargets.get(index), request, index)) {
+                return true;
+            }
+            // A host can open another file, clear results or start a new request in its callback.
+            invalidateStaleTargets();
+            if (lastTargetRequest != request || !canNavigate()) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    private void updateTargetIndex(CodeNavigationTarget target, int resultIndex) {
+        invalidateStaleTargets();
+        if (resultIndex >= 0 && resultIndex < lastTargets.size && lastTargets.get(resultIndex) == target) {
+            lastTargetIndex = resultIndex;
+            return;
+        }
+        for (int i = 0; i < lastTargets.size; i++) {
+            CodeNavigationTarget candidate = lastTargets.get(i);
+            if (candidate.range.equals(target.range)
+                && (candidate.documentId == null ? target.documentId == null
+                    : candidate.documentId.equals(target.documentId))) {
+                lastTargetIndex = i;
+                return;
+            }
+        }
+    }
+
+    private void invalidateStaleTargets() {
+        if (lastTargetRequest != null && lastTargetRequest.documentVersion != editor.getDocumentVersion()) {
+            clearTargets();
+        }
+    }
+
+    private void clearTargets() {
+        lastTargets.clear();
+        lastTargetRequest = null;
+        lastTargetIndex = -1;
+    }
+
+    private boolean canNavigate() {
+        return !editor.isDisabled() && !editor.isPasswordMode();
+    }
+
+    private boolean canRename() {
+        return canNavigate() && !editor.isReadOnly();
+    }
+
+    private boolean isValidRange(CodeEditorTextRange range) {
+        if (range == null || range.startLine < 0 || range.endLine < range.startLine
+            || range.endLine >= editor.getLineCount() || range.startColumn < 0 || range.endColumn < 0
+            || range.startColumn > editor.getLineLength(range.startLine)
+            || range.endColumn > editor.getLineLength(range.endLine)
+            || (range.startLine == range.endLine && range.startColumn > range.endColumn)) {
+            return false;
+        }
+        return isCodePointBoundary(range.startLine, range.startColumn)
+            && isCodePointBoundary(range.endLine, range.endColumn);
+    }
+
+    private boolean isCodePointBoundary(int line, int column) {
+        return column == 0 || column == editor.getLineLength(line)
+            || !Character.isHighSurrogate(editor.getCharAt(line, column - 1))
+            || !Character.isLowSurrogate(editor.getCharAt(line, column));
     }
 }

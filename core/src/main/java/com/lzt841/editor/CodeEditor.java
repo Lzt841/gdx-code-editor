@@ -43,6 +43,8 @@ import com.lzt841.editor.highlight.CodeSemanticTokenType;
 import com.lzt841.editor.highlight.CodeTextStyle;
 import com.lzt841.editor.highlight.IncrementalCodeHighlighter;
 import com.lzt841.editor.highlight.JavaCodeHighlighter;
+import com.lzt841.editor.extensions.CodeExtensionManager;
+import com.lzt841.editor.completion.CodeCompletionRegistry;
 import com.lzt841.editor.input.CodeEditorInteractionContext;
 import com.lzt841.editor.input.CodeEditorInteractionListener;
 import com.lzt841.editor.input.CodeEditorInteractionMode;
@@ -239,6 +241,9 @@ public class CodeEditor extends Widget {
     private int contentNotifyDepth;
     private final Array<CodeEditorCaretListener> caretListeners = new Array<>();
     private final Array<CodeEditorInputInterceptor> inputInterceptors = new Array<>();
+    private final Array<CodeEditorInputInterceptor> inputInterceptorScratch = new Array<>();
+    private int inputDispatchDepth;
+    private CodeExtensionManager extensionManager;
     private final Array<CodeEditorHoverListener> hoverListeners = new Array<>();
     private final Array<CodeEditorScrollListener> scrollListeners = new Array<>();
     /** Scratch copy used while notifying, so a listener may unregister from its own callback. */
@@ -316,6 +321,7 @@ public class CodeEditor extends Widget {
     private boolean searchDirty;
     /** Diagnostic marks, drawn as squiggles under the range and as a gutter tick. */
     private final Array<CodeDiagnostic> diagnostics = new Array<>();
+    private int diagnosticVersion = -1;
     /**
      * Semantic tokens per line, or null for a line with none.
      *
@@ -613,7 +619,8 @@ public class CodeEditor extends Widget {
     private int searchAnalyzedVersion = -1;
     private int searchDirtyFrom = Integer.MAX_VALUE;
     private int searchDirtyTo = -1;
-    private Array<Array<SearchMatch>> searchMatches = new Array<>();
+    private static final Array<SearchMatch> EMPTY_SEARCH_MATCHES = new Array<>(0);
+    private final Array<Array<SearchMatch>> searchMatches = new Array<>();
     private final Array<SearchMatchRef> flatSearchMatches = new Array<>();
     private int currentSearchMatchLine = -1;
     private int currentSearchMatchStart = -1;
@@ -1037,8 +1044,28 @@ public class CodeEditor extends Widget {
     }
 
     /**
+     * Lazy per-editor extension scope. Call clear() to unload extensions for reuse, or dispose() when
+     * destroying the editor. Removing this actor from a Stage does not dispose its extensions.
+     */
+    public CodeExtensionManager getExtensions() {
+        if (extensionManager == null) extensionManager = new CodeExtensionManager(this);
+        return extensionManager;
+    }
+
+    /** Shared command registry for host actions, extension commands, menus and exact shortcuts. */
+    public CodeCommandRegistry getCommands() {
+        return getExtensions().getCommands();
+    }
+
+    /** Shared completion sources for host code and independently installed extensions. */
+    public CodeCompletionRegistry getCompletionProviders() {
+        return getExtensions().getCompletionProviders();
+    }
+
+    /**
      * Registers an interceptor that sees keyboard input before the editor. Used by overlays such as a
-     * completion popup, which needs Up, Down, Enter and Escape for itself.
+     * completion popup, which needs Up, Down, Enter and Escape for itself. Registration changes take
+     * effect on the next dispatch; callbacks may safely add/remove interceptors or reenter dispatch.
      */
     public void addInputInterceptor(CodeEditorInputInterceptor interceptor) {
         if (interceptor != null && !inputInterceptors.contains(interceptor, true)) {
@@ -1055,21 +1082,36 @@ public class CodeEditor extends Widget {
     }
 
     private boolean dispatchInterceptorKeyDown(int keycode) {
-        for (int i = 0; i < inputInterceptors.size; i++) {
-            if (inputInterceptors.get(i).onKeyDown(this, keycode)) {
-                return true;
+        Array<CodeEditorInputInterceptor> targets = borrowInputInterceptorSnapshot();
+        try {
+            for (int i = 0; i < targets.size; i++) {
+                if (targets.get(i).onKeyDown(this, keycode)) return true;
             }
+            return false;
+        } finally {
+            releaseInputInterceptorSnapshot(targets);
         }
-        return false;
     }
 
     private boolean dispatchInterceptorKeyTyped(char character) {
-        for (int i = 0; i < inputInterceptors.size; i++) {
-            if (inputInterceptors.get(i).onKeyTyped(this, character)) {
-                return true;
+        Array<CodeEditorInputInterceptor> targets = borrowInputInterceptorSnapshot();
+        try {
+            for (int i = 0; i < targets.size; i++) {
+                if (targets.get(i).onKeyTyped(this, character)) return true;
             }
+            return false;
+        } finally {
+            releaseInputInterceptorSnapshot(targets);
         }
-        return false;
+    }
+
+    private void dispatchInterceptorKeyUp(int keycode) {
+        Array<CodeEditorInputInterceptor> targets = borrowInputInterceptorSnapshot();
+        try {
+            for (int i = 0; i < targets.size; i++) targets.get(i).onKeyUp(this, keycode);
+        } finally {
+            releaseInputInterceptorSnapshot(targets);
+        }
     }
 
     /**
@@ -1114,9 +1156,26 @@ public class CodeEditor extends Widget {
     }
 
     private void dispatchInterceptorAfterKeyTyped(char character) {
-        for (int i = 0; i < inputInterceptors.size; i++) {
-            inputInterceptors.get(i).afterKeyTyped(this, character);
+        Array<CodeEditorInputInterceptor> targets = borrowInputInterceptorSnapshot();
+        try {
+            for (int i = 0; i < targets.size; i++) targets.get(i).afterKeyTyped(this, character);
+        } finally {
+            releaseInputInterceptorSnapshot(targets);
         }
+    }
+
+    private Array<CodeEditorInputInterceptor> borrowInputInterceptorSnapshot() {
+        if (inputDispatchDepth++ == 0) {
+            inputInterceptorScratch.clear();
+            inputInterceptorScratch.addAll(inputInterceptors);
+            return inputInterceptorScratch;
+        }
+        return new Array<>(inputInterceptors);
+    }
+
+    private void releaseInputInterceptorSnapshot(Array<CodeEditorInputInterceptor> snapshot) {
+        inputDispatchDepth--;
+        if (snapshot == inputInterceptorScratch) inputInterceptorScratch.clear();
     }
 
     /**
@@ -1449,13 +1508,18 @@ public class CodeEditor extends Widget {
 
         String safeReplacement = expandReplacement(sanitizeInputText(replacement, true), target);
         clearSelection();
-        markPendingContentChange(CodeEditorContentChangeType.REPLACE_CURRENT);
+        int versionBefore = document.getVersion();
         document.beginCompoundEdit();
         try {
             replaceSearchMatch(target, safeReplacement);
         } finally {
             document.endCompoundEdit();
         }
+        if (document.getVersion() == versionBefore) {
+            clearCurrentSearchMatch();
+            return false;
+        }
+        markPendingContentChange(CodeEditorContentChangeType.REPLACE_CURRENT);
         clearCurrentSearchMatch();
         onDocumentMutated();
         if (!searchText.isEmpty() && flatSearchMatches.size > 0) {
@@ -1475,14 +1539,8 @@ public class CodeEditor extends Widget {
         }
 
         String safeReplacement = sanitizeInputText(replacement, true);
+        expandCollapsedRegionsForSearchMatches();
         Array<SearchMatchRef> matchesToReplace = new Array<>(flatSearchMatches);
-        expandCollapsedRegionsForSearchMatches(matchesToReplace);
-        ensureLayout();
-        matchesToReplace = new Array<>(flatSearchMatches);
-        if (matchesToReplace.size == 0) {
-            clearCurrentSearchMatch();
-            return 0;
-        }
 
         // Group references have to be resolved against the untouched document, so they are expanded
         // up front rather than inside the edit loop, which rewrites the text as it walks backwards.
@@ -1928,6 +1986,7 @@ public class CodeEditor extends Widget {
         markPendingContentChange(CodeEditorContentChangeType.SET_TEXT);
         document.setText(text);
         clearSelection();
+        clearCurrentSearchMatch();
         invalidateLayout();
         ensureLayout();
         ensureCursorVisible();
@@ -2144,20 +2203,30 @@ public class CodeEditor extends Widget {
      *
      * <p>This is the range a completion normally replaces: for {@code foo.ba|r} it returns
      * {@code bar}, and for {@code foo.|} it returns {@code null}.
+     * Identifier characters are Unicode letters/digits, underscore and dollar sign; this does not
+     * change the word boundaries used by whole-word search or double-click selection.
      */
     public CodeEditorTextRange getWordRangeAt(int line, int column) {
         if (line < 0 || line >= document.getLineCount()) {
             return null;
         }
         CharSequence text = document.getLineSequence(line);
-        int safeColumn = Math.max(0, Math.min(column, text.length()));
+        int safeColumn = document.snapColumn(line, Math.max(0, Math.min(column, text.length())));
         int start = safeColumn;
-        while (start > 0 && isWordChar(text.charAt(start - 1))) {
-            start--;
+        while (start > 0) {
+            int codePoint = Character.codePointBefore(text, start);
+            if (!isIdentifierCodePoint(codePoint)) {
+                break;
+            }
+            start -= Character.charCount(codePoint);
         }
         int end = safeColumn;
-        while (end < text.length() && isWordChar(text.charAt(end))) {
-            end++;
+        while (end < text.length()) {
+            int codePoint = Character.codePointAt(text, end);
+            if (!isIdentifierCodePoint(codePoint)) {
+                break;
+            }
+            end += Character.charCount(codePoint);
         }
         if (start == end) {
             return null;
@@ -2179,10 +2248,14 @@ public class CodeEditor extends Widget {
             return "";
         }
         CharSequence text = document.getLineSequence(line);
-        int end = Math.max(0, Math.min(column, text.length()));
+        int end = document.snapColumn(line, Math.max(0, Math.min(column, text.length())));
         int start = end;
-        while (start > 0 && isWordChar(text.charAt(start - 1))) {
-            start--;
+        while (start > 0) {
+            int codePoint = Character.codePointBefore(text, start);
+            if (!isIdentifierCodePoint(codePoint)) {
+                break;
+            }
+            start -= Character.charCount(codePoint);
         }
         return start == end ? "" : text.subSequence(start, end).toString();
     }
@@ -2248,10 +2321,9 @@ public class CodeEditor extends Widget {
         int safeEndLine = clamp(endLine, 0, document.getLineCount() - 1);
         // Both edges obey the same rule as an editor-placed boundary: neither may fall inside a pair.
         selectionAnchorLine = safeStartLine;
-        selectionAnchorColumn = snapBoundaryOffSurrogate(safeStartLine,
+        selectionAnchorColumn = document.snapColumn(safeStartLine,
             clamp(startColumn, 0, document.getLineLength(safeStartLine)));
-        document.moveCursorTo(safeEndLine,
-            snapBoundaryOffSurrogate(safeEndLine, clamp(endColumn, 0, document.getLineLength(safeEndLine))));
+        document.moveCursorTo(safeEndLine, endColumn);
         preferredCursorX = -1f;
         ensureCursorVisible();
         refreshBlink();
@@ -2265,9 +2337,7 @@ public class CodeEditor extends Widget {
     /** Moves the caret, clearing any selection, and scrolls it into view. */
     public void setCursorPosition(int line, int column) {
         clearSelection();
-        int safeLine = clamp(line, 0, document.getLineCount() - 1);
-        document.moveCursorTo(safeLine,
-            snapBoundaryOffSurrogate(safeLine, clamp(column, 0, document.getLineLength(safeLine))));
+        document.moveCursorTo(line, column);
         preferredCursorX = -1f;
         expandCollapsedRegionContainingLine(document.getCursorLine());
         ensureCursorVisible();
@@ -2427,29 +2497,38 @@ public class CodeEditor extends Widget {
      * end of the inserted text. This is what a completion popup calls to commit a candidate: pass the
      * word range being completed and the full candidate text.
      *
-     * @return false when the editor is read-only or disabled
+     * @return false when the editor is read-only or disabled, or when the operation changes no text
      */
     public boolean replaceRange(int startLine, int startColumn, int endLine, int endColumn, String replacement) {
         if (disabled || readOnly) {
             return false;
         }
-        String safe = sanitizeInputText(replacement, true);
-        clearSelection();
-        markPendingContentChange(CodeEditorContentChangeType.REPLACE_CURRENT);
+        return replaceRangeSanitized(startLine, startColumn, endLine, endColumn,
+            sanitizeInputText(replacement, true));
+    }
+
+    /** Applies text that has already passed the input filter and newline normalization. */
+    private boolean replaceRangeSanitized(int startLine, int startColumn, int endLine, int endColumn, String safe) {
+        int versionBefore = document.getVersion();
         document.beginCompoundEdit();
         try {
             document.deleteRange(startLine, startColumn, endLine, endColumn);
             if (!safe.isEmpty()) {
-                // Placed explicitly, because insertText goes to the caret and deleteRange only moves
-                // the caret when it actually removed something. Without this an empty range — a plain
-                // insertion point, which is what a completion with no typed prefix passes — inserted
-                // wherever the caret happened to be instead of where the caller asked.
-                document.moveCursorTo(startLine, startColumn);
+                // A deletion moves the caret to the start of the range. An insertion
+                // into an empty range needs to place it explicitly.
+                if (document.getVersion() == versionBefore) {
+                    document.moveCursorTo(startLine, startColumn);
+                }
                 document.insertText(safe);
             }
         } finally {
             document.endCompoundEdit();
         }
+        if (document.getVersion() == versionBefore) {
+            return false;
+        }
+        clearSelection();
+        markPendingContentChange(CodeEditorContentChangeType.REPLACE_CURRENT);
         onDocumentMutated();
         return true;
     }
@@ -2476,8 +2555,8 @@ public class CodeEditor extends Widget {
      * document-first edit happened to end. A caret inside a replaced range lands at the end of that
      * range's replacement.
      *
-     * @return false when the editor is read-only or disabled, when {@code edits} is null or empty, or
-     *     when {@link #canApplyEdits(Array)} rejects it
+     * @return false when the editor is read-only or disabled, when {@code edits} is null or empty,
+     *     when {@link #canApplyEdits(Array)} rejects it, or when no edits remain after input filtering
      */
     public boolean applyEdits(Array<CodeEditorTextEdit> edits) {
         return applyEdits(edits, null);
@@ -2488,43 +2567,80 @@ public class CodeEditor extends Widget {
      * appear in a menu as what it was. See {@link #getUndoLabel()}.
      */
     public boolean applyEdits(Array<CodeEditorTextEdit> edits, String label) {
+        return applyEdits(edits, label, false);
+    }
+
+    /** {@link #applyEditsExact(Array, String)} without a history label. */
+    public boolean applyEditsExact(Array<CodeEditorTextEdit> edits) {
+        return applyEditsExact(edits, null);
+    }
+
+    /**
+     * Applies a batch only if input filtering and newline normalization leave every replacement
+     * unchanged. A rejected character rejects the whole batch before any edit, preserving the text,
+     * caret, selection and history. Replacements must already use LF newlines. Unchanged edits are
+     * skipped. Useful for structural edits which must never lose characters while moving old text.
+     */
+    public boolean applyEditsExact(Array<CodeEditorTextEdit> edits, String label) {
+        return applyEdits(edits, label, true);
+    }
+
+    private boolean applyEdits(Array<CodeEditorTextEdit> edits, String label, boolean exact) {
         if (disabled || readOnly || !canApplyEdits(edits)) {
             return false;
         }
-        Array<CodeEditorTextEdit> ordered = new Array<CodeEditorTextEdit>(edits);
+        int preflightVersion = document.getVersion();
+        // The caret must follow the text actually inserted, including normalized newlines. Filter
+        // once up front so a rejected insertion is a no-op and stateful filters are not run twice.
+        Array<CodeEditorTextEdit> ordered = new Array<CodeEditorTextEdit>(edits.size);
+        for (int i = 0; i < edits.size; i++) {
+            CodeEditorTextEdit edit = edits.get(i);
+            CodeEditorTextEdit sanitized = new CodeEditorTextEdit(edit.range,
+                sanitizeInputText(edit.replacement, true));
+            if (exact && !sanitized.replacement.equals(edit.replacement)) return false;
+            if (exact && sanitized.replacement.equals(getTextRange(edit.range))) continue;
+            if (!sanitized.isNoOp()) {
+                ordered.add(sanitized);
+            }
+        }
+        if (ordered.size == 0) {
+            return false;
+        }
+        if (exact && (disabled || readOnly || document.getVersion() != preflightVersion)) return false;
         // Stable, so two edits at the same position keep the caller's order; combined with the
         // descending walk below that inserts them left to right as listed.
         ordered.sort(EDIT_ORDER);
 
         editBatchCaretLine = document.getCursorLine();
         editBatchCaretColumn = document.getCursorColumn();
+        int versionBefore = document.getVersion();
         beginCompoundEdit(label);
         try {
             for (int i = ordered.size - 1; i >= 0; i--) {
                 CodeEditorTextEdit edit = ordered.get(i);
-                if (edit.isNoOp()) {
-                    continue;
-                }
                 // Before the edit is applied, while the caret and the edit are still in the same
                 // coordinate space. Walking backwards means every edit still to come starts before
                 // this one, so nothing later moves what this call produces.
                 trackBatchCaret(edit);
-                replaceRange(edit.range, edit.replacement);
+                replaceRangeSanitized(edit.range.startLine, edit.range.startColumn,
+                    edit.range.endLine, edit.range.endColumn, edit.replacement);
             }
             clearSelection();
             document.moveCursorTo(editBatchCaretLine, editBatchCaretColumn);
-            // Set last on purpose: each replaceRange above marks REPLACE_CURRENT, and the event is
-            // only built when the group closes, so marking earlier would be overwritten.
-            markPendingContentChange(CodeEditorContentChangeType.REPLACE_ALL);
         } finally {
+            // Inner replacements mark REPLACE_CURRENT; classify the completed batch only when the
+            // outer group closes, including any successful edits before an exception.
+            if (document.getVersion() != versionBefore) {
+                markPendingContentChange(CodeEditorContentChangeType.REPLACE_ALL);
+            }
             endCompoundEdit();
         }
-        return true;
+        return document.getVersion() != versionBefore;
     }
 
     /**
      * Whether {@link #applyEdits(Array)} would accept this batch: every range in document bounds,
-     * start not after end, and no two ranges overlapping.
+     * start not after end, no endpoint inside a surrogate pair, and no two ranges overlapping.
      *
      * <p>Worth calling separately when a caller wants to report "cannot do that" without attempting
      * the edit — a rename UI checking a provider's output, for instance. Says nothing about read-only
@@ -2556,7 +2672,9 @@ public class CodeEditor extends Widget {
         if (range == null) {
             return false;
         }
-        if (range.startLine < 0 || range.endLine >= document.getLineCount()) {
+        int lineCount = document.getLineCount();
+        if (range.startLine < 0 || range.startLine >= lineCount
+            || range.endLine < 0 || range.endLine >= lineCount) {
             return false;
         }
         if (range.startColumn < 0 || range.startColumn > document.getLineLength(range.startLine)) {
@@ -2565,7 +2683,9 @@ public class CodeEditor extends Widget {
         if (range.endColumn < 0 || range.endColumn > document.getLineLength(range.endLine)) {
             return false;
         }
-        return comparePositions(range.startLine, range.startColumn, range.endLine, range.endColumn) <= 0;
+        return comparePositions(range.startLine, range.startColumn, range.endLine, range.endColumn) <= 0
+            && document.snapColumn(range.startLine, range.startColumn) == range.startColumn
+            && document.snapColumn(range.endLine, range.endColumn) == range.endColumn;
     }
 
     private static int comparePositions(int leftLine, int leftColumn, int rightLine, int rightColumn) {
@@ -2617,9 +2737,22 @@ public class CodeEditor extends Widget {
         new java.util.Comparator<CodeEditorTextEdit>() {
             @Override
             public int compare(CodeEditorTextEdit left, CodeEditorTextEdit right) {
-                return comparePositions(
+                int result = comparePositions(
                     left.range.startLine, left.range.startColumn,
                     right.range.startLine, right.range.startColumn);
+                if (result != 0) {
+                    return result;
+                }
+                // A zero-length insertion at the start of a replacement is a valid half-open
+                // boundary. Put it first so the descending application applies the replacement
+                // before the insertion, regardless of the caller's order. Returning zero for two
+                // insertions keeps the sort stable and preserves their listed order.
+                boolean leftEmpty = left.range.isEmpty();
+                boolean rightEmpty = right.range.isEmpty();
+                if (leftEmpty != rightEmpty) {
+                    return leftEmpty ? -1 : 1;
+                }
+                return 0;
             }
         };
 
@@ -2710,9 +2843,13 @@ public class CodeEditor extends Widget {
         if (disabled || readOnly) {
             return false;
         }
+        int versionBefore = document.getVersion();
+        document.deleteRange(startLine, startColumn, endLine, endColumn);
+        if (document.getVersion() == versionBefore) {
+            return false;
+        }
         clearSelection();
         markPendingContentChange(CodeEditorContentChangeType.DELETE);
-        document.deleteRange(startLine, startColumn, endLine, endColumn);
         onDocumentMutated();
         return true;
     }
@@ -2725,19 +2862,55 @@ public class CodeEditor extends Widget {
      * Replaces the diagnostic marks. Ranges are drawn as squiggles with a tick in the gutter, and can
      * be queried by position for a hover tooltip.
      *
-     * <p>Diagnostics are not tied to the document version: after an edit their line and column
-     * numbers refer to the text as it was when they were produced. Whoever produces them should push a
-     * fresh set, typically from a {@link CodeEditorContentListener}.
+     * <p>This overload assumes the marks describe the current document. For background analysis use
+     * {@link #setDiagnostics(Array, int)} to reject results produced against an older version. Marks
+     * keep their original coordinates after edits; {@link #isDiagnosticsStale()} signals that a fresh
+     * set is needed, typically from a {@link CodeEditorContentListener}.
      */
     public void setDiagnostics(Array<CodeDiagnostic> newDiagnostics) {
-        diagnostics.clear();
-        if (newDiagnostics != null) {
-            diagnostics.addAll(newDiagnostics);
+        setDiagnostics(newDiagnostics, document.getVersion());
+    }
+
+    /**
+     * Replaces the marks only if {@code version} is still the current document version.
+     *
+     * <p>Capture {@link #getDocumentVersion()} before starting analysis, then deliver its results on
+     * the GDX thread. A rejected batch leaves the existing marks and their version untouched.
+     *
+     * @return whether the diagnostic batch was accepted
+     */
+    public boolean setDiagnostics(Array<CodeDiagnostic> newDiagnostics, int version) {
+        if (version != document.getVersion()) {
+            return false;
         }
+        if (newDiagnostics != diagnostics) {
+            diagnostics.clear();
+            if (newDiagnostics != null) {
+                for (int i = 0; i < newDiagnostics.size; i++) {
+                    CodeDiagnostic diagnostic = newDiagnostics.get(i);
+                    if (diagnostic != null) {
+                        diagnostics.add(diagnostic);
+                    }
+                }
+            }
+        }
+        diagnosticVersion = version;
+        return true;
     }
 
     public void clearDiagnostics() {
         diagnostics.clear();
+        diagnosticVersion = -1;
+    }
+
+    /** Version the last diagnostic batch describes, or -1 after clearing/before the first batch. */
+    public int getDiagnosticVersion() {
+        return diagnosticVersion;
+    }
+
+    /** Whether the last batch, including an empty analysis result, predates the current text. */
+    public boolean isDiagnosticsStale() {
+        return diagnosticVersion >= 0 && diagnosticVersion != document.getVersion();
     }
 
     /** Live view of the current diagnostics; do not mutate. */
@@ -2775,6 +2948,83 @@ public class CodeEditor extends Widget {
             }
         }
         return best;
+    }
+
+    /** Moves to the next diagnostic start, wrapping at the end. Returns the mark reached, or null. */
+    public CodeDiagnostic navigateToNextDiagnostic() {
+        return navigateToNextDiagnostic(null);
+    }
+
+    /**
+     * Moves to the next mark at least as severe as {@code maximumSeverity}; null includes every
+     * severity, {@link CodeDiagnosticSeverity#ERROR} includes only errors. Does nothing for stale
+     * batches or a disabled editor. Read-only editors can still navigate.
+     */
+    public CodeDiagnostic navigateToNextDiagnostic(CodeDiagnosticSeverity maximumSeverity) {
+        return navigateDiagnostic(true, maximumSeverity);
+    }
+
+    /** Moves to the preceding diagnostic start, wrapping at the beginning. */
+    public CodeDiagnostic navigateToPreviousDiagnostic() {
+        return navigateToPreviousDiagnostic(null);
+    }
+
+    /** Reverse counterpart of {@link #navigateToNextDiagnostic(CodeDiagnosticSeverity)}. */
+    public CodeDiagnostic navigateToPreviousDiagnostic(CodeDiagnosticSeverity maximumSeverity) {
+        return navigateDiagnostic(false, maximumSeverity);
+    }
+
+    private CodeDiagnostic navigateDiagnostic(boolean forward, CodeDiagnosticSeverity maximumSeverity) {
+        if (disabled || isDiagnosticsStale()) {
+            return null;
+        }
+        CodeDiagnostic nearest = null;
+        CodeDiagnostic wrapped = null;
+        int cursorLine = document.getCursorLine();
+        int cursorColumn = document.getCursorColumn();
+        for (int i = 0; i < diagnostics.size; i++) {
+            CodeDiagnostic diagnostic = diagnostics.get(i);
+            if (diagnostic == null
+                || (maximumSeverity != null && diagnostic.severity.ordinal() > maximumSeverity.ordinal())
+                || diagnostic.startLine < 0 || diagnostic.startLine >= document.getLineCount()
+                || diagnostic.endLine < 0 || diagnostic.endLine >= document.getLineCount()
+                || diagnostic.startColumn < 0
+                || diagnostic.startColumn > document.getLineLength(diagnostic.startLine)
+                || diagnostic.endColumn < 0
+                || diagnostic.endColumn > document.getLineLength(diagnostic.endLine)
+                || comparePositions(diagnostic.startLine, diagnostic.startColumn,
+                    diagnostic.endLine, diagnostic.endColumn) > 0) {
+                continue;
+            }
+            if (isPreferredDiagnostic(diagnostic, wrapped, forward)) {
+                wrapped = diagnostic;
+            }
+            // Compare the actual caret boundary, so a diagnostic pointing inside a surrogate pair
+            // does not trap Previous on that same character after moveCursorTo snaps to its end.
+            int column = document.snapColumn(diagnostic.startLine, diagnostic.startColumn);
+            int relative = comparePositions(diagnostic.startLine, column, cursorLine, cursorColumn);
+            if ((forward ? relative > 0 : relative < 0)
+                && isPreferredDiagnostic(diagnostic, nearest, forward)) {
+                nearest = diagnostic;
+            }
+        }
+        CodeDiagnostic target = nearest != null ? nearest : wrapped;
+        if (target != null) {
+            setCursorPosition(target.startLine, target.startColumn);
+        }
+        return target;
+    }
+
+    private boolean isPreferredDiagnostic(CodeDiagnostic candidate, CodeDiagnostic current, boolean forward) {
+        if (current == null) {
+            return true;
+        }
+        int relative = comparePositions(candidate.startLine,
+            document.snapColumn(candidate.startLine, candidate.startColumn), current.startLine,
+            document.snapColumn(current.startLine, current.startColumn));
+        // Multiple messages at one position represent one navigation stop; show the most severe.
+        return relative == 0 ? candidate.severity.ordinal() < current.severity.ordinal()
+            : forward ? relative < 0 : relative > 0;
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -3022,10 +3272,10 @@ public class CodeEditor extends Widget {
             return false;
         }
         SelectionRange selection = getSelectionRange();
-        markPendingContentChange(CodeEditorContentChangeType.INSERT);
         if (!document.shiftLinesIndent(fromLine, toLine, increase)) {
             return false;
         }
+        markPendingContentChange(CodeEditorContentChangeType.INSERT);
         if (selection != null) {
             // Re-select whole lines: the columns have moved, and selecting the range is what lets the
             // user press Tab repeatedly.
@@ -3473,6 +3723,12 @@ public class CodeEditor extends Widget {
             case TOGGLE_FOLD:
                 toggleFold(findRelevantRegion(document.getCursorLine()));
                 return true;
+            case DIAGNOSTIC_NEXT:
+                navigateToNextDiagnostic();
+                return true;
+            case DIAGNOSTIC_PREVIOUS:
+                navigateToPreviousDiagnostic();
+                return true;
             case UNDO:
                 if (!readOnly) {
                     undo();
@@ -3880,8 +4136,12 @@ public class CodeEditor extends Widget {
         // in step with the version, so this holds whenever the version has not moved — but a helper that
         // empties the array without repairing it breaks the mapping silently, and every line then draws
         // as the empty layout. Refusing to take the fast path here is what turns that into a rebuild.
-        if (document.getVersion() == analyzedVersion && !geometryChanged && !rowMappingDirty && !searchDirty
+        if (document.getVersion() == analyzedVersion && !geometryChanged && !rowMappingDirty
             && lineLayouts.size == document.getLineCount()) {
+            if (searchDirty) {
+                refreshSearchMatches();
+                searchDirty = false;
+            }
             return;
         }
         if (layoutSyncInProgress) {
@@ -3894,8 +4154,7 @@ public class CodeEditor extends Widget {
             // Folding only changes which lines are visible, so it asks for a row-mapping rebuild and
             // must not land in the discard-everything branch: that would reset the lexer state cache and
             // force a synchronous re-scan of the document.
-            boolean rebuildOnly = (rowMappingDirty || searchDirty)
-                && document.getVersion() == analyzedVersion && !geometryChanged;
+            boolean rebuildOnly = rowMappingDirty && document.getVersion() == analyzedVersion && !geometryChanged;
             if (!rebuildOnly) {
                 if (geometryChanged || analyzedVersion < 0) {
                     discardAllLineLayouts();
@@ -3907,6 +4166,7 @@ public class CodeEditor extends Widget {
                         markWholeDocumentChanged();
                         // No journal was replayed, so the structure cache never saw those edits.
                         invalidateStructureCache();
+                        invalidateSearch();
                     }
                 } else if (!syncLineArraysFromJournal(lineCount)) {
                     discardAllLineLayouts();
@@ -3917,6 +4177,7 @@ public class CodeEditor extends Widget {
                     // The replay can half-apply its splices before giving up, so nothing it touched is
                     // trustworthy.
                     invalidateStructureCache();
+                    invalidateSearch();
                 }
                 lineArraysSyncedVersion = document.getVersion();
             }
@@ -4009,7 +4270,10 @@ public class CodeEditor extends Widget {
                 for (int i = 0; i < insertedCount; i++) {
                     searchMatches.insert(startLine + i, null);
                 }
-                markSearchDirty(startLine, startLine + insertedCount - 1);
+                // Scoped matches are tied to coordinates. A shifted line can cross either edge of
+                // the scope even if its text did not change.
+                markSearchDirty(startLine,
+                    searchRange == null ? startLine + insertedCount - 1 : searchMatches.size - 1);
             }
         }
         invalidateBracketCheckpointsFrom(startLine);
@@ -6004,13 +6268,16 @@ public class CodeEditor extends Widget {
      * happens while no search is active.
      */
     private void refreshSearchMatches() {
-        if (searchText == null || searchText.isEmpty()) {
+        ensureSearchPattern();
+        if (searchText.isEmpty() || (searchRegexEnabled && searchPattern == null)) {
             if (searchMatchCount != 0 || searchMatches.size != 0) {
                 searchMatches.clear();
                 flatSearchMatches.clear();
                 searchMatchCount = 0;
                 clearCurrentSearchMatch();
             }
+            searchDirtyFrom = Integer.MAX_VALUE;
+            searchDirtyTo = -1;
             searchAnalyzedVersion = document.getVersion();
             return;
         }
@@ -6022,15 +6289,7 @@ public class CodeEditor extends Widget {
             return;
         }
 
-        int previousCurrentLine = currentSearchMatchLine;
-        int previousCurrentStart = currentSearchMatchStart;
-        int previousCurrentEnd = currentSearchMatchEnd;
-
-        // An invalid pattern yields no matches rather than an exception; findMatchesInLine checks this.
-        ensureSearchPattern();
-
-        // Splices keep searchMatches aligned and leave nulls for new lines; a size mismatch means
-        // the alignment was lost and everything has to be re-searched.
+        // Splices leave nulls for new lines. A size mismatch means the alignment was lost.
         if (searchMatches.size != lineCount) {
             searchMatches.clear();
             for (int i = 0; i < lineCount; i++) {
@@ -6042,29 +6301,25 @@ public class CodeEditor extends Widget {
 
         int from = Math.max(0, Math.min(searchDirtyFrom, lineCount - 1));
         int to = Math.min(lineCount - 1, searchDirtyTo);
-        for (int line = from; line <= to; line++) {
-            searchMatches.set(line, findMatchesInLine(line, document.getLineSequence(line)));
-        }
-        for (int line = 0; line < lineCount; line++) {
-            if (searchMatches.get(line) == null) {
-                searchMatches.set(line, findMatchesInLine(line, document.getLineSequence(line)));
-            }
-        }
-
         flatSearchMatches.clear();
-        searchMatchCount = 0;
         for (int line = 0; line < lineCount; line++) {
             Array<SearchMatch> lineMatches = searchMatches.get(line);
+            if (lineMatches == null || (line >= from && line <= to)) {
+                lineMatches = findMatchesInLine(line, document.getLineSequence(line));
+                searchMatches.set(line, lineMatches);
+            }
             for (int i = 0; i < lineMatches.size; i++) {
                 flatSearchMatches.add(new SearchMatchRef(line, lineMatches.get(i)));
-                searchMatchCount++;
             }
         }
+        searchMatchCount = flatSearchMatches.size;
 
         searchDirtyFrom = Integer.MAX_VALUE;
         searchDirtyTo = -1;
         searchAnalyzedVersion = document.getVersion();
-        restoreCurrentSearchMatch(previousCurrentLine, previousCurrentStart, previousCurrentEnd);
+        if (findCurrentSearchMatchIndex() < 0) {
+            clearCurrentSearchMatch();
+        }
     }
 
     /**
@@ -6072,16 +6327,15 @@ public class CodeEditor extends Widget {
      * copy; the regex path reuses one {@link Matcher} across all lines.
      */
     private Array<SearchMatch> findMatchesInLine(int line, CharSequence text) {
-        Array<SearchMatch> matches = new Array<>(0);
         int from = searchRangeStartColumn(line);
         int to = searchRangeEndColumn(line, text.length());
         if (from > to) {
-            return matches;
+            return EMPTY_SEARCH_MATCHES;
         }
         if (searchRegexEnabled) {
-            findRegexMatchesInLine(text, from, to, matches);
-            return matches;
+            return findRegexMatchesInLine(text, from, to);
         }
+        Array<SearchMatch> matches = EMPTY_SEARCH_MATCHES;
         int needleLength = searchText.length();
         if (needleLength == 0) {
             return matches;
@@ -6092,9 +6346,15 @@ public class CodeEditor extends Widget {
                 continue;
             }
             int end = start + needleLength;
+            if (CodeDocument.splitsSurrogatePair(text, start) || CodeDocument.splitsSurrogatePair(text, end)) {
+                continue;
+            }
             if (searchWholeWord && !isWholeWordMatch(text, start, end)) {
                 // A longer identifier can still start one character later, so do not skip ahead.
                 continue;
+            }
+            if (matches == EMPTY_SEARCH_MATCHES) {
+                matches = new Array<>(1);
             }
             matches.add(new SearchMatch(start, end));
             // Matches never overlap; the loop's own increment covers the last character.
@@ -6108,10 +6368,8 @@ public class CodeEditor extends Widget {
      * {@code [from, to)}. The pattern runs over the full line even when a range is set, so {@code ^}
      * and {@code $} keep meaning "line start" and "line end" instead of shifting with the selection.
      */
-    private void findRegexMatchesInLine(CharSequence text, int from, int to, Array<SearchMatch> matches) {
-        if (searchPattern == null) {
-            return;
-        }
+    private Array<SearchMatch> findRegexMatchesInLine(CharSequence text, int from, int to) {
+        Array<SearchMatch> matches = EMPTY_SEARCH_MATCHES;
         if (searchMatcher == null) {
             searchMatcher = searchPattern.matcher(text);
         } else {
@@ -6122,27 +6380,11 @@ public class CodeEditor extends Widget {
         while (search <= length && searchMatcher.find(search)) {
             int start = searchMatcher.start();
             int end = searchMatcher.end();
-            // java.util.regex sees chars, not codepoints: it will match either half of a supplementary
-            // pair on its own. Replacing that match takes one half and orphans the other into the line,
-            // where the font can only draw it as a notdef box. A match starting on the low surrogate is
-            // skipped entirely; one stopping between the halves is extended past the pair, so a replace
-            // takes the whole emoji. This mirrors how the editor's own boundaries never split a pair.
-            if (isTrailingSurrogate(text, start)) {
-                search = start + 1;
+            if (start == end || CodeDocument.splitsSurrogatePair(text, start)
+                || CodeDocument.splitsSurrogatePair(text, end)) {
+                // Nothing to highlight, or replacing the hit would break a supplementary character.
+                search = CodeDocument.snapColumn(text, start + 1);
                 continue;
-            }
-            if (end == start) {
-                // A pattern such as "a*" can match nothing; without this the scan would never advance.
-                search = start + 1;
-                // A zero-width hit one column into a pair would leave the scan between its halves.
-                if (isTrailingSurrogate(text, search)) {
-                    search++;
-                }
-                // Zero-length hits have nothing to highlight or replace.
-                continue;
-            }
-            if (isTrailingSurrogate(text, end)) {
-                end++;
             }
             search = end;
             if (start < from || end > to) {
@@ -6151,8 +6393,12 @@ public class CodeEditor extends Widget {
             if (searchWholeWord && !isWholeWordMatch(text, start, end)) {
                 continue;
             }
+            if (matches == EMPTY_SEARCH_MATCHES) {
+                matches = new Array<>(1);
+            }
             matches.add(new SearchMatch(start, end));
         }
+        return matches;
     }
 
     /** Whether {@code replacement} can contain group references worth resolving per match. */
@@ -6165,10 +6411,18 @@ public class CodeEditor extends Widget {
 
     /** Whether the characters flanking {@code [start, end)} are non-word, so the hit stands alone. */
     private boolean isWholeWordMatch(CharSequence text, int start, int end) {
-        if (start > 0 && isWordChar(text.charAt(start - 1))) {
+        if (start > 0 && isWordCodePoint(Character.codePointBefore(text, start))) {
             return false;
         }
-        return end >= text.length() || !isWordChar(text.charAt(end));
+        return end >= text.length() || !isWordCodePoint(Character.codePointAt(text, end));
+    }
+
+    private boolean isWordCodePoint(int codePoint) {
+        return Character.isLetterOrDigit(codePoint) || codePoint == '_';
+    }
+
+    private boolean isIdentifierCodePoint(int codePoint) {
+        return isWordCodePoint(codePoint) || codePoint == '$';
     }
 
     /** First column of {@code line} that {@link #searchRange} allows a match to start at. */
@@ -6438,9 +6692,7 @@ public class CodeEditor extends Widget {
         }
 
         // Deleting from between the halves of a pair orphans one surrogate half into the surrounding text.
-        document.deleteRange(
-            selection.startLine, snapBoundaryOffSurrogate(selection.startLine, selection.startColumn),
-            selection.endLine, snapBoundaryOffSurrogate(selection.endLine, selection.endColumn));
+        document.deleteRange(selection.startLine, selection.startColumn, selection.endLine, selection.endColumn);
         clearSelection();
     }
 
@@ -6462,23 +6714,33 @@ public class CodeEditor extends Widget {
             return;
         }
 
-        int pivot = Math.min(column, Math.max(0, text.length() - 1));
-        if (pivot > 0 && pivot == text.length()) {
-            pivot--;
+        int pivot = Math.min(column, text.length());
+        if (pivot == text.length()) {
+            pivot = Character.offsetByCodePoints(text, pivot, -1);
+        } else {
+            pivot = codePointStartAt(text, pivot);
         }
-        if (!isWordChar(text.charAt(pivot))) {
+        if (!isWordCodePoint(Character.codePointAt(text, pivot))) {
             clearSelection();
             refreshBlink();
             return;
         }
 
         int start = pivot;
-        int end = pivot + 1;
-        while (start > 0 && isWordChar(text.charAt(start - 1))) {
-            start--;
+        int end = pivot + Character.charCount(Character.codePointAt(text, pivot));
+        while (start > 0) {
+            int codePoint = Character.codePointBefore(text, start);
+            if (!isWordCodePoint(codePoint)) {
+                break;
+            }
+            start -= Character.charCount(codePoint);
         }
-        while (end < text.length() && isWordChar(text.charAt(end))) {
-            end++;
+        while (end < text.length()) {
+            int codePoint = Character.codePointAt(text, end);
+            if (!isWordCodePoint(codePoint)) {
+                break;
+            }
+            end += Character.charCount(codePoint);
         }
 
         selectionAnchorLine = line;
@@ -6519,53 +6781,49 @@ public class CodeEditor extends Widget {
     }
 
     private int findCurrentSearchMatchIndex() {
-        for (int i = 0; i < flatSearchMatches.size; i++) {
-            SearchMatchRef ref = flatSearchMatches.get(i);
-            if (ref.line == currentSearchMatchLine
-                && ref.match.start == currentSearchMatchStart
-                && ref.match.end == currentSearchMatchEnd) {
-                return i;
+        if (!isCaretAtCurrentSearchMatch()) {
+            return -1;
+        }
+        int index = firstSearchMatchAtOrAfter(currentSearchMatchLine, currentSearchMatchStart);
+        if (index < flatSearchMatches.size) {
+            SearchMatchRef ref = flatSearchMatches.get(index);
+            if (isCurrentSearchMatch(ref.line, ref.match)) {
+                return index;
             }
         }
         return -1;
     }
 
-    private void restoreCurrentSearchMatch(int line, int start, int end) {
-        if (line < 0 || start < 0 || end < 0) {
-            clearCurrentSearchMatch();
-            return;
-        }
-        for (SearchMatchRef ref : flatSearchMatches) {
-            if (ref.line == line && ref.match.start == start && ref.match.end == end) {
-                currentSearchMatchLine = line;
-                currentSearchMatchStart = start;
-                currentSearchMatchEnd = end;
-                return;
+    private int firstSearchMatchAtOrAfter(int line, int column) {
+        int low = 0;
+        int high = flatSearchMatches.size;
+        while (low < high) {
+            int mid = (low + high) >>> 1;
+            SearchMatchRef ref = flatSearchMatches.get(mid);
+            if (comparePositions(ref.line, ref.match.start, line, column) < 0) {
+                low = mid + 1;
+            } else {
+                high = mid;
             }
         }
-        clearCurrentSearchMatch();
+        return low;
     }
 
     private int findSearchMatchIndexFromCursor(boolean forward) {
         int cursorLine = document.getCursorLine();
         int cursorColumn = document.getCursorColumn();
+        int next = firstSearchMatchAtOrAfter(cursorLine, cursorColumn);
         if (forward) {
-            for (int i = 0; i < flatSearchMatches.size; i++) {
-                SearchMatchRef ref = flatSearchMatches.get(i);
-                if (ref.line > cursorLine || (ref.line == cursorLine && ref.match.start >= cursorColumn)) {
-                    return i;
-                }
-            }
-            return 0;
+            return next < flatSearchMatches.size ? next : 0;
         }
-
-        for (int i = flatSearchMatches.size - 1; i >= 0; i--) {
-            SearchMatchRef ref = flatSearchMatches.get(i);
-            if (ref.line < cursorLine || (ref.line == cursorLine && ref.match.end <= cursorColumn)) {
-                return i;
+        int previous = next - 1;
+        if (previous >= 0) {
+            SearchMatchRef ref = flatSearchMatches.get(previous);
+            if (ref.line == cursorLine && ref.match.end > cursorColumn) {
+                previous--;
             }
         }
-        return flatSearchMatches.size - 1;
+        return previous >= 0 ? previous : flatSearchMatches.size - 1;
     }
 
     private void activateSearchMatch(int index) {
@@ -6625,20 +6883,19 @@ public class CodeEditor extends Widget {
         document.insertText(replacement);
     }
 
-    private void expandCollapsedRegionsForSearchMatches(Iterable<SearchMatchRef> matches) {
-        if (matches == null) {
+    private void expandCollapsedRegionsForSearchMatches() {
+        if (collapsedLines.size == 0) {
             return;
         }
 
         scratchExpandLines.clear();
-        for (SearchMatchRef match : matches) {
-            if (match == null) {
+        for (FoldRegion region : foldRegions) {
+            if (!region.collapsed) {
                 continue;
             }
-            for (FoldRegion region : foldRegions) {
-                if (region.collapsed && region.startLine < match.line && match.line <= region.endLine) {
-                    scratchExpandLines.add(region.startLine);
-                }
+            int index = firstSearchMatchAtOrAfter(region.startLine + 1, 0);
+            if (index < flatSearchMatches.size && flatSearchMatches.get(index).line <= region.endLine) {
+                scratchExpandLines.add(region.startLine);
             }
         }
 
@@ -6735,11 +6992,8 @@ public class CodeEditor extends Widget {
         if (selection == null) {
             return "";
         }
-        // A boundary between the halves of a pair hands the clipboard a lone surrogate, which pastes back
-        // as a box rather than the emoji the user selected.
-        return document.getTextRange(
-            selection.startLine, snapBoundaryOffSurrogate(selection.startLine, selection.startColumn),
-            selection.endLine, snapBoundaryOffSurrogate(selection.endLine, selection.endColumn));
+        return document.getTextRange(selection.startLine, selection.startColumn,
+            selection.endLine, selection.endColumn);
     }
 
     private void selectWordAt(float x, float y) {
@@ -6756,12 +7010,14 @@ public class CodeEditor extends Widget {
             return;
         }
 
-        int pivot = Math.min(point.column, Math.max(0, line.length() - 1));
-        if (pivot > 0 && pivot == line.length()) {
-            pivot--;
+        int pivot = Math.min(point.column, line.length());
+        if (pivot == line.length()) {
+            pivot = Character.offsetByCodePoints(line, pivot, -1);
+        } else {
+            pivot = codePointStartAt(line, pivot);
         }
 
-        if (!isWordChar(line.charAt(pivot))) {
+        if (!isWordCodePoint(Character.codePointAt(line, pivot))) {
             // A double-click on an inline image still selects the word around it. Any other non-word
             // character keeps its existing behaviour of parking the caret, but an image replaced the
             // glyph the user clicked through, so the word beside it is what the double-click was about.
@@ -6781,12 +7037,20 @@ public class CodeEditor extends Widget {
         }
 
         int start = pivot;
-        int end = pivot + 1;
-        while (start > 0 && isWordChar(line.charAt(start - 1))) {
-            start--;
+        int end = pivot + Character.charCount(Character.codePointAt(line, pivot));
+        while (start > 0) {
+            int codePoint = Character.codePointBefore(line, start);
+            if (!isWordCodePoint(codePoint)) {
+                break;
+            }
+            start -= Character.charCount(codePoint);
         }
-        while (end < line.length() && isWordChar(line.charAt(end))) {
-            end++;
+        while (end < line.length()) {
+            int codePoint = Character.codePointAt(line, end);
+            if (!isWordCodePoint(codePoint)) {
+                break;
+            }
+            end += Character.charCount(codePoint);
         }
 
         selectionAnchorLine = point.line;
@@ -7100,8 +7364,8 @@ public class CodeEditor extends Widget {
     private boolean performDeleteAction(CodeEditorAction action) {
         if (action == CodeEditorAction.BACKSPACE) {
             expandCollapsedRegionsForEdit(EditIntent.BACKSPACE);
-            markPendingContentChange(CodeEditorContentChangeType.DELETE);
             if (getSelectionRange() != null) {
+                markPendingContentChange(CodeEditorContentChangeType.DELETE);
                 deleteSelectionIfPresent();
                 onDocumentMutated();
                 return true;
@@ -7117,14 +7381,15 @@ public class CodeEditor extends Widget {
             if (lineBefore == document.getCursorLine() && columnBefore == document.getCursorColumn()) {
                 return false;
             }
+            markPendingContentChange(CodeEditorContentChangeType.DELETE);
             onDocumentMutated();
             return true;
         }
 
         if (action == CodeEditorAction.DELETE) {
             expandCollapsedRegionsForEdit(EditIntent.DELETE);
-            markPendingContentChange(CodeEditorContentChangeType.DELETE);
             if (getSelectionRange() != null) {
+                markPendingContentChange(CodeEditorContentChangeType.DELETE);
                 deleteSelectionIfPresent();
                 onDocumentMutated();
                 return true;
@@ -7135,6 +7400,7 @@ public class CodeEditor extends Widget {
             if (versionBefore == document.getVersion()) {
                 return false;
             }
+            markPendingContentChange(CodeEditorContentChangeType.DELETE);
             onDocumentMutated();
             return true;
         }
@@ -7211,14 +7477,9 @@ public class CodeEditor extends Widget {
         document.beginCompoundEdit();
         try {
             document.deleteRange(selection.startLine, selection.startColumn, selection.endLine, selection.endColumn);
-            // The drop column is arithmetic over the text before the deletion, so it is re-snapped against
-            // the text after it: a shift by a plain char count can land on a pair's low surrogate, and the
-            // dragged text would then be inserted between the two halves.
-            adjustedDropPoint = new CodePoint(adjustedDropPoint.line,
-                snapBoundaryOffSurrogate(adjustedDropPoint.line, adjustedDropPoint.column));
             document.moveCursorTo(adjustedDropPoint.line, adjustedDropPoint.column);
-            selectionAnchorLine = adjustedDropPoint.line;
-            selectionAnchorColumn = adjustedDropPoint.column;
+            selectionAnchorLine = document.getCursorLine();
+            selectionAnchorColumn = document.getCursorColumn();
             markPendingContentChange(CodeEditorContentChangeType.UNKNOWN);
             document.insertText(draggedSelectionText);
         } finally {
@@ -8465,9 +8726,14 @@ public class CodeEditor extends Widget {
     }
 
     private boolean isCurrentSearchMatch(int line, SearchMatch match) {
-        return line == currentSearchMatchLine
+        return isCaretAtCurrentSearchMatch() && line == currentSearchMatchLine
             && match.start == currentSearchMatchStart
             && match.end == currentSearchMatchEnd;
+    }
+
+    private boolean isCaretAtCurrentSearchMatch() {
+        return document.getCursorLine() == currentSearchMatchLine
+            && document.getCursorColumn() == currentSearchMatchStart;
     }
 
     private void drawBracketHighlight(
@@ -9118,7 +9384,7 @@ public class CodeEditor extends Widget {
                     int suffixColumn = findColumnForX(layoutFor(region.endLine), display.suffixStart, display.suffixEnd, suffixLocalX);
                     // Same rounding as the main branch, so the same correction — but only for a caret.
                     return new CodePoint(region.endLine, imageHit ? suffixColumn
-                        : snapBoundaryOffSurrogate(region.endLine, layoutFor(region.endLine).text, suffixColumn));
+                        : document.snapColumn(region.endLine, suffixColumn));
                 }
             }
         }
@@ -9131,10 +9397,7 @@ public class CodeEditor extends Widget {
             ? containingColumnForX(layout, start, end, segmentLocalX)
             : findColumnForX(layout, start, end, segmentLocalX);
         if (!imageHit) {
-            // A caret or a selection edge never belongs inside a supplementary pair: its low surrogate's
-            // column is zero-wide, so the position past the pair is the same x and is the one that keeps
-            // the emoji whole.
-            column = snapBoundaryOffSurrogate(line, layout.text, column);
+            column = document.snapColumn(line, column);
         }
         return new CodePoint(line, column);
     }
@@ -10170,9 +10433,7 @@ public class CodeEditor extends Widget {
         // targetX is a distance from the text origin, so the indent comes off before the lookup — same
         // adjustment getCodePointAtRowX makes, and the reason Up/Down keeps its column across a wrap.
         int column = findColumnForX(layout, start, end, targetX - segmentIndentOffset(layout, segment));
-        // Up/Down inherits the same rounding as a click, so it needs the same correction: a caret on the
-        // low surrogate is where a paste or a keystroke would later split the pair.
-        document.moveCursorTo(line, snapBoundaryOffSurrogate(line, column));
+        document.moveCursorTo(line, column);
     }
 
     /**
@@ -10452,49 +10713,17 @@ public class CodeEditor extends Widget {
      * <p>Asks the provider about the high surrogate rather than assuming any surrogate pair is an image:
      * a non-BMP character the provider does not answer for is still two glyphs, and must keep its width.
      *
-     * <p>The trailing column still exists as an index — a {@code CodeDocument} column counts {@code char}s,
-     * so a supplementary character is two of them — but nothing places a boundary there now: see
-     * {@link #snapBoundaryOffSurrogate}, which moves any caret, selection edge, copy, cut or drop past the
-     * pair, since that is the same x and the one that keeps the pair whole.
+     * <p>The document still counts both UTF-16 units, and places caret and selection boundaries
+     * outside the pair regardless of how it is drawn.
      */
     private boolean isTrailingImageSurrogate(int line, CharSequence text, int index) {
         if (inlineImageProvider == null || passwordMode) {
             return false;
         }
-        if (!isTrailingSurrogate(text, index)) {
+        if (!CodeDocument.splitsSurrogatePair(text, index)) {
             return false;
         }
         return inlineImageProvider.imageAt(line, index - 1, text) != null;
-    }
-
-    /** Whether {@code index} is the low surrogate of a supplementary pair, however that pair is drawn. */
-    private static boolean isTrailingSurrogate(CharSequence text, int index) {
-        return index > 0 && index < text.length()
-            && Character.isLowSurrogate(text.charAt(index))
-            && Character.isHighSurrogate(text.charAt(index - 1));
-    }
-
-    /**
-     * The column a boundary at {@code column} should occupy, moved off the zero-width low surrogate of a
-     * supplementary pair if it landed on it.
-     *
-     * <p>The pair's image is drawn at its high surrogate and the low one takes no advance, so the boundary
-     * before the low surrogate and the one after it are the same x. A boundary kept between them splits
-     * the pair in everything that works in columns — a copy, a cut, a delete range — and the text that
-     * comes out carries a lone surrogate, which the editor can only draw as a notdef box. That is how an
-     * emoji selected and copied comes back as two boxes. Moving the boundary past the pair is visually the
-     * same position and keeps the emoji whole.
-     */
-    private int snapBoundaryOffSurrogate(int line, CharSequence text, int column) {
-        if (column <= 0 || column >= text.length()) {
-            return column;
-        }
-        return isTrailingImageSurrogate(line, text, column) ? column + 1 : column;
-    }
-
-    /** {@link #snapBoundaryOffSurrogate(int, CharSequence, int)} for a column on a document line. */
-    private int snapBoundaryOffSurrogate(int line, int column) {
-        return snapBoundaryOffSurrogate(line, document.getLine(line), column);
     }
 
     /**
@@ -10514,17 +10743,26 @@ public class CodeEditor extends Widget {
 
     /** Index of the word character nearest to {@code from}, preferring the one to its left, or -1. */
     private int nearestWordChar(String line, int from) {
-        for (int i = from - 1; i >= 0; i--) {
-            if (isWordChar(line.charAt(i))) {
-                return i;
+        for (int end = Math.min(from, line.length()); end > 0;) {
+            int codePoint = Character.codePointBefore(line, end);
+            end -= Character.charCount(codePoint);
+            if (isWordCodePoint(codePoint)) {
+                return end;
             }
         }
-        for (int i = from + 1; i < line.length(); i++) {
-            if (isWordChar(line.charAt(i))) {
+        int start = CodeDocument.snapColumn(line, Math.min(line.length(), from + 1));
+        for (int i = start; i < line.length();) {
+            int codePoint = Character.codePointAt(line, i);
+            if (isWordCodePoint(codePoint)) {
                 return i;
             }
+            i += Character.charCount(codePoint);
         }
         return -1;
+    }
+
+    private static int codePointStartAt(CharSequence text, int index) {
+        return CodeDocument.splitsSurrogatePair(text, index) ? index - 1 : index;
     }
 
     /** Advance for a character pair, cached. A {@code next} of 0 means no following character. */
@@ -12631,6 +12869,7 @@ public class CodeEditor extends Widget {
         public boolean keyUp(InputEvent event, int keycode) {
             // Keyed by keycode, not action, so whichever key armed the repeat is the one that cancels it.
             stopDeleteKeyRepeat(keycode);
+            dispatchInterceptorKeyUp(keycode);
             return false;
         }
 

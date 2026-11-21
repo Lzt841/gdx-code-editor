@@ -121,7 +121,7 @@ public class WordCodeNavigationProvider implements CodeNavigationProvider, CodeR
                     found.add(new CodeEditorTextRange(line, column, line, column + length));
                     column += length;
                 } else {
-                    column++;
+                    column += Character.charCount(codePointAt(editor, line, column, lineLength));
                 }
             }
         }
@@ -129,12 +129,16 @@ public class WordCodeNavigationProvider implements CodeNavigationProvider, CodeR
     }
 
     private static boolean matchesAt(CodeEditor editor, int line, int column, String word, int lineLength) {
-        if (column > 0 && isWordChar(editor.getCharAt(line, column - 1))) {
+        if (column > 0 && isWordChar(codePointBefore(editor, line, column))) {
             return false;
         }
         int end = column + word.length();
-        if (end < lineLength && isWordChar(editor.getCharAt(line, end))) {
-            return false;
+        if (end < lineLength) {
+            if (isWordChar(codePointAt(editor, line, end, lineLength))
+                || (Character.isHighSurrogate(editor.getCharAt(line, end - 1))
+                    && Character.isLowSurrogate(editor.getCharAt(line, end)))) {
+                return false;
+            }
         }
         for (int i = 0; i < word.length(); i++) {
             if (editor.getCharAt(line, column + i) != word.charAt(i)) {
@@ -164,18 +168,42 @@ public class WordCodeNavigationProvider implements CodeNavigationProvider, CodeR
         if (text == null || text.isEmpty()) {
             return false;
         }
-        if (Character.isDigit(text.charAt(0))) {
+        if (Character.isDigit(Character.codePointAt(text, 0))) {
             return false;
         }
-        for (int i = 0; i < text.length(); i++) {
-            if (!isWordChar(text.charAt(i))) {
+        for (int i = 0; i < text.length();) {
+            int codePoint = Character.codePointAt(text, i);
+            if (!isWordChar(codePoint)) {
                 return false;
             }
+            i += Character.charCount(codePoint);
         }
         return true;
     }
 
-    private static boolean isWordChar(char c) {
-        return Character.isLetterOrDigit(c) || c == '_';
+    private static boolean isWordChar(int codePoint) {
+        return Character.isLetterOrDigit(codePoint) || codePoint == '_' || codePoint == '$';
+    }
+
+    private static int codePointAt(CodeEditor editor, int line, int column, int lineLength) {
+        char first = editor.getCharAt(line, column);
+        if (Character.isHighSurrogate(first) && column + 1 < lineLength) {
+            char second = editor.getCharAt(line, column + 1);
+            if (Character.isLowSurrogate(second)) {
+                return Character.toCodePoint(first, second);
+            }
+        }
+        return first;
+    }
+
+    private static int codePointBefore(CodeEditor editor, int line, int column) {
+        char last = editor.getCharAt(line, column - 1);
+        if (Character.isLowSurrogate(last) && column >= 2) {
+            char first = editor.getCharAt(line, column - 2);
+            if (Character.isHighSurrogate(first)) {
+                return Character.toCodePoint(first, last);
+            }
+        }
+        return last;
     }
 }
