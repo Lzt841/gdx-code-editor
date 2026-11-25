@@ -32,6 +32,7 @@ import com.badlogic.gdx.utils.ObjectMap;
 import com.badlogic.gdx.utils.IntArray;
 import com.badlogic.gdx.utils.ScreenUtils;
 import com.badlogic.gdx.utils.TimeUtils;
+import com.badlogic.gdx.utils.SnapshotArray;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
@@ -56,6 +57,9 @@ import com.lzt841.editor.structure.CodeStructureProvider;
 import com.lzt841.editor.structure.CodeStructureScanner;
 import com.lzt841.editor.structure.CodeSymbol;
 import com.lzt841.editor.structure.IncrementalCodeStructureProvider;
+import com.lzt841.editor.render.CodeWhitespaceMode;
+import com.lzt841.editor.render.CodeEditorRowRenderer;
+import com.lzt841.editor.render.CodeEditorRowRenderContext;
 
 
 /**
@@ -432,6 +436,8 @@ public class CodeEditor extends Widget {
     private final float[] touchPointerX = new float[MAX_TOUCH_POINTERS];
     private final float[] touchPointerY = new float[MAX_TOUCH_POINTERS];
     private final SelectionHandleOverlay selectionHandleOverlay = new SelectionHandleOverlay();
+    private final SnapshotArray<CodeEditorRowRenderer> rowRenderers = new SnapshotArray<>(CodeEditorRowRenderer.class);
+    private final RowRenderContext rowRenderContext = new RowRenderContext();
 
     private CodeEditorStyle style;
     private CodeEditorSettings settings;
@@ -569,6 +575,10 @@ public class CodeEditor extends Widget {
     private boolean wrapEnabled;
     private boolean rainbowBracketsEnabled;
     private boolean rainbowGuidesEnabled;
+    private CodeWhitespaceMode whitespaceMode = CodeWhitespaceMode.NONE;
+    private boolean lineEndingsVisible;
+    private boolean trailingWhitespaceHighlighted;
+    private int[] columnRulers = new int[0];
     private boolean searchCaseSensitive;
     private boolean searchWholeWord;
     private boolean searchRegexEnabled;
@@ -1970,6 +1980,10 @@ public class CodeEditor extends Widget {
         applyPasswordMode(settings.isPasswordMode());
         applyRainbowBracketsEnabled(settings.isRainbowBracketsEnabled());
         applyRainbowGuidesEnabled(settings.isRainbowGuidesEnabled());
+        whitespaceMode = settings.getWhitespaceMode();
+        lineEndingsVisible = settings.isLineEndingsVisible();
+        trailingWhitespaceHighlighted = settings.isTrailingWhitespaceHighlighted();
+        columnRulers = settings.getColumnRulers();
         applyInteractionMode(settings.getInteractionMode());
     }
 
@@ -2011,6 +2025,54 @@ public class CodeEditor extends Widget {
 
     private void applyRainbowGuidesEnabled(boolean rainbowGuidesEnabled) {
         this.rainbowGuidesEnabled = rainbowGuidesEnabled;
+    }
+
+    public CodeWhitespaceMode getWhitespaceMode() {
+        return whitespaceMode;
+    }
+
+    public void setWhitespaceMode(CodeWhitespaceMode mode) {
+        settings.setWhitespaceMode(mode);
+    }
+
+    public boolean isLineEndingsVisible() {
+        return lineEndingsVisible;
+    }
+
+    /** Shows actual line breaks, excluding soft wraps and EOF. Hidden in password mode. */
+    public void setLineEndingsVisible(boolean visible) {
+        settings.setLineEndingsVisible(visible);
+    }
+
+    public boolean isTrailingWhitespaceHighlighted() {
+        return trailingWhitespaceHighlighted;
+    }
+
+    public void setTrailingWhitespaceHighlighted(boolean highlighted) {
+        settings.setTrailingWhitespaceHighlighted(highlighted);
+    }
+
+    public int[] getColumnRulers() {
+        return columnRulers.clone();
+    }
+
+    /** See {@link CodeEditorSettings#setColumnRulers(int...)} for space-based margin semantics. */
+    public void setColumnRulers(int... columns) {
+        settings.setColumnRulers(columns);
+    }
+
+    /** Adds one decoration layer, ignoring null and duplicate identities. */
+    public void addRowRenderer(CodeEditorRowRenderer renderer) {
+        if (renderer != null && !rowRenderers.contains(renderer, true)) rowRenderers.add(renderer);
+    }
+
+    public boolean removeRowRenderer(CodeEditorRowRenderer renderer) {
+        return rowRenderers.removeValue(renderer, true);
+    }
+
+    /** Returns a copy; changing it does not change the editor's registered layers. */
+    public Array<CodeEditorRowRenderer> getRowRenderers() {
+        return new Array<>(rowRenderers);
     }
 
     public void setText(String text) {
@@ -7863,6 +7925,7 @@ public class CodeEditor extends Widget {
         }
 
         drawVisibleRowBackgrounds(batch, startRow, endRow, activeBlock);
+        drawColumnRulers(batch);
         drawVisibleIndentGuides(batch, startRow, endRow, activeBlock);
 
         for (int row = startRow; row <= endRow; row++) {
@@ -7883,16 +7946,22 @@ public class CodeEditor extends Widget {
             // Computed once and handed to every drawer on this row, so the text and its decorations
             // cannot end up at different offsets on a wrapped continuation row.
             float rowX = getX() + getTextRenderX() + segmentIndentOffset(layout, segment);
+            FoldRegion region = foldRegionsByStart.get(line);
+            boolean collapsed = segment == 0 && region != null && region.collapsed;
 
+            drawCustomRow(batch, layout, row, segment, start, end, rowX, rowBottom, false);
+            drawTrailingWhitespace(batch, layout, start, end, rowX, rowBottom);
             drawSearchHighlights(batch, layout, line, start, end, rowBottom, rowX);
             drawSelection(batch, selection, layout, line, start, end, rowBottom, rowX);
             drawBracketHighlight(batch, bracketMatch, layout, line, segment, start, end, rowBottom, rowX);
 
             drawStyledRange(batch, layout, start, end, rowX, baseline, rowBottom);
+            drawWhitespaceMarkers(batch, selection, layout, start, end, rowX, rowBottom,
+                !collapsed && segment == layout.segmentEnds.size - 1);
             drawDiagnosticsForRow(batch, layout, line, start, end, rowBottom, rowX);
+            drawCustomRow(batch, layout, row, segment, start, end, rowX, rowBottom, true);
 
-            FoldRegion region = foldRegionsByStart.get(line);
-            if (segment == 0 && region != null && region.collapsed) {
+            if (collapsed) {
                 CollapsedFoldDisplay collapsedDisplay = getCollapsedFoldDisplay(region);
                 String collapsedText = collapsedDisplay.placeholderText;
                 float badgeX = getX() + getCollapsedFoldDisplayX(layout, start, end);
@@ -7914,14 +7983,172 @@ public class CodeEditor extends Widget {
                 }
                 if (collapsedDisplay.hasSuffix()) {
                     float suffixX = badgeX + measureText(collapsedText);
+                    LineLayout suffixLayout = layoutFor(collapsedDisplay.suffixLine);
+                    drawCustomRow(batch, suffixLayout, row, -1, collapsedDisplay.suffixStart,
+                        collapsedDisplay.suffixEnd, suffixX, rowBottom, false);
+                    drawTrailingWhitespace(batch, suffixLayout, collapsedDisplay.suffixStart,
+                        collapsedDisplay.suffixEnd, suffixX, rowBottom);
                     drawCollapsedFoldSuffixDecorations(batch, selection, bracketMatch, collapsedDisplay, suffixX, rowBottom);
                     drawCollapsedFoldSuffix(batch, collapsedDisplay, suffixX, baseline, rowBottom);
+                    drawWhitespaceMarkers(batch, selection, suffixLayout, collapsedDisplay.suffixStart,
+                        collapsedDisplay.suffixEnd, suffixX, rowBottom, true);
+                    drawDiagnosticsForRow(batch, suffixLayout, collapsedDisplay.suffixLine, collapsedDisplay.suffixStart,
+                        collapsedDisplay.suffixEnd, rowBottom, suffixX);
+                    drawCustomRow(batch, suffixLayout, row, -1, collapsedDisplay.suffixStart,
+                        collapsedDisplay.suffixEnd, suffixX, rowBottom, true);
                 }
             }
         }
 
         drawGutterOverlay(batch, startRow, endRow);
         drawScrollbar(batch);
+    }
+
+    private void drawColumnRulers(Batch batch) {
+        if (columnRulers.length == 0 || style.columnRulerWidth <= 0f) return;
+        float left = getX() + (lineNumbersFixed ? getGutterWidth() : 0f);
+        float right = getX() + getWidth();
+        float origin = getX() + getTextRenderX();
+        float advance = glyphAdvance(' ', (char) 0);
+        float width = style.columnRulerWidth * zoomScale;
+        for (int column : columnRulers) {
+            float x = origin + column * advance;
+            if (x >= right) break;
+            if (x + width <= left) continue;
+            float clippedX = Math.max(left, x);
+            drawColoredBar(batch, clippedX, getY() + style.statusBarHeight,
+                Math.min(right, x + width) - clippedX, getContentHeight(), style.columnRulerColor);
+        }
+    }
+
+    private void drawTrailingWhitespace(Batch batch, LineLayout layout, int start, int end, float x, float bottom) {
+        if (passwordMode || !trailingWhitespaceHighlighted || layout.trailingWhitespaceStart >= end) return;
+        int from = Math.max(start, layout.trailingWhitespaceStart);
+        float left = Math.max(getX() + (lineNumbersFixed ? getGutterWidth() : 0f), x + layout.measureRange(start, from));
+        float right = Math.min(getX() + getWidth(), x + layout.measureRange(start, end));
+        if (right > left) {
+            drawColoredBar(batch, left, bottom + 2f, right - left, Math.max(1f, lineHeight - 4f),
+                style.trailingWhitespaceColor);
+        }
+    }
+
+    private void drawWhitespaceMarkers(Batch batch, SelectionRange selection, LineLayout layout,
+        int start, int end, float x, float bottom, boolean showLineEnding) {
+        if (whitespaceMode == CodeWhitespaceMode.NONE && !lineEndingsVisible) return;
+        if (passwordMode || style.whitePixelTexture == null || style.whitespaceColor == null) return;
+        float thickness = style.whitespaceMarkerThickness * zoomScale;
+        if (thickness <= 0f) return;
+        float left = getX() + (lineNumbersFixed ? getGutterWidth() : 0f);
+        float right = getX() + getWidth();
+        float centerY = bottom + lineHeight * 0.5f;
+        int from = start;
+        int to = end;
+        if (whitespaceMode == CodeWhitespaceMode.NONE) {
+            to = from;
+        } else if (whitespaceMode == CodeWhitespaceMode.TRAILING) {
+            from = Math.max(from, layout.trailingWhitespaceStart);
+        } else if (whitespaceMode == CodeWhitespaceMode.SELECTION) {
+            if (selection == null || layout.line < selection.startLine || layout.line > selection.endLine) {
+                to = from;
+            } else {
+                if (layout.line == selection.startLine) from = Math.max(from, selection.startColumn);
+                if (layout.line == selection.endLine) to = Math.min(to, selection.endColumn);
+            }
+        }
+        // Binary-search the first horizontally visible cell. A long, unwrapped line must not submit
+        // thousands of invisible dots, or scan its whole prefix, on every frame.
+        if (from < to) {
+            int low = from;
+            int high = to;
+            float target = layout.prefixWidths[start] + left - x;
+            while (low < high) {
+                int mid = (low + high) >>> 1;
+                if (layout.prefixWidths[mid + 1] < target) low = mid + 1;
+                else high = mid;
+            }
+            for (int column = low; column < to; column++) {
+                float cellX = x + layout.measureRange(start, column);
+                if (cellX > right) break;
+                char ch = layout.text.charAt(column);
+                if (ch != ' ' && ch != '\t') continue;
+                if (ch == ' ' && inlineImageProvider != null
+                    && inlineImageProvider.imageAt(layout.line, column, layout.text) != null) continue;
+                float cellWidth = layout.measureRange(column, column + 1);
+                if (ch == ' ') {
+                    float size = Math.min(cellWidth * 0.5f, style.whitespaceDotSize * zoomScale);
+                    if (size > 0f) drawColoredBar(batch, cellX + (cellWidth - size) * 0.5f,
+                        centerY - size * 0.5f, size, size, style.whitespaceColor);
+                } else {
+                    float inset = Math.min(cellWidth * 0.2f, 3f * zoomScale);
+                    float arrowLeft = cellX + inset;
+                    float arrowRight = cellX + cellWidth - inset;
+                    float head = Math.min(3f * zoomScale, (arrowRight - arrowLeft) * 0.4f);
+                    drawMarkerStroke(batch, arrowLeft, centerY, arrowRight, centerY, thickness);
+                    drawMarkerStroke(batch, arrowRight - head, centerY + head, arrowRight, centerY, thickness);
+                    drawMarkerStroke(batch, arrowRight - head, centerY - head, arrowRight, centerY, thickness);
+                }
+            }
+        }
+        if (lineEndingsVisible && showLineEnding && end >= layout.trailingWhitespaceStart && layout.line < document.getLineCount() - 1) {
+            float markerX = x + layout.measureRange(start, end) + glyphAdvance(' ', (char) 0) * 0.25f;
+            float size = Math.min(lineHeight * 0.3f, glyphAdvance(' ', (char) 0) * 0.8f);
+            if (markerX + size < left || markerX > right) return;
+            float head = size * 0.35f;
+            drawMarkerStroke(batch, markerX + size, centerY + head, markerX + size, centerY, thickness);
+            drawMarkerStroke(batch, markerX, centerY, markerX + size, centerY, thickness);
+            drawMarkerStroke(batch, markerX + head, centerY + head, markerX, centerY, thickness);
+            drawMarkerStroke(batch, markerX + head, centerY - head, markerX, centerY, thickness);
+        }
+    }
+
+    /** A glyph-independent marker stroke, so fonts without arrows can still show spaces/tabs/EOL. */
+    private void drawMarkerStroke(Batch batch, float x1, float y1, float x2, float y2, float thickness) {
+        float dx = x2 - x1;
+        float dy = y2 - y1;
+        float length = (float) Math.sqrt(dx * dx + dy * dy);
+        if (length <= 0f) return;
+        float packed = batch.getPackedColor();
+        try {
+            batch.setColor(style.whitespaceColor);
+            batch.draw(whitePixelRegion(), x1, y1 - thickness * 0.5f, 0f, thickness * 0.5f,
+                length, thickness, 1f, 1f, MathUtils.radiansToDegrees * (float) Math.atan2(dy, dx));
+        } finally {
+            batch.setPackedColor(packed);
+        }
+    }
+
+    private void drawCustomRow(Batch batch, LineLayout layout, int row, int segment, int start, int end,
+        float x, float bottom, boolean foreground) {
+        if (passwordMode || rowRenderers.size == 0) return;
+        rowRenderContext.layout = layout;
+        rowRenderContext.row = row;
+        rowRenderContext.segment = segment;
+        rowRenderContext.start = start;
+        rowRenderContext.end = end;
+        rowRenderContext.x = x;
+        rowRenderContext.bottom = bottom;
+        CodeEditorRowRenderer[] renderers = rowRenderers.begin();
+        int count = rowRenderers.size;
+        try {
+            for (int i = 0; i < count; i++) {
+                float packed = batch.getPackedColor();
+                Color fontColor = style.font.getColor();
+                float r = fontColor.r, g = fontColor.g, b = fontColor.b, a = fontColor.a;
+                float scaleX = style.font.getData().scaleX, scaleY = style.font.getData().scaleY;
+                try {
+                    if (foreground) renderers[i].drawForeground(batch, rowRenderContext);
+                    else renderers[i].drawBackground(batch, rowRenderContext);
+                } finally {
+                    batch.setPackedColor(packed);
+                    style.font.setColor(r, g, b, a);
+                    if (style.font.getData().scaleX != scaleX || style.font.getData().scaleY != scaleY) {
+                        style.font.getData().setScale(scaleX, scaleY);
+                    }
+                }
+            }
+        } finally {
+            rowRenderers.end();
+        }
     }
 
     /**
@@ -8567,7 +8794,7 @@ public class CodeEditor extends Widget {
         if (image == null || image.region == null) {
             return;
         }
-        Color previous = batch.getColor();
+        float previous = batch.getPackedColor();
         // Text drawing leaves the batch colour alone, but a decoration just before this may have set one;
         // an image has its own colours and must not inherit the last underline's.
         batch.setColor(Color.WHITE);
@@ -8593,7 +8820,7 @@ public class CodeEditor extends Widget {
             drawY = rowTop - drawHeight;
         }
         batch.draw(image.region, x, drawY, drawWidth, drawHeight);
-        batch.setColor(previous);
+        batch.setPackedColor(previous);
     }
 
     /**
@@ -8751,10 +8978,10 @@ public class CodeEditor extends Widget {
         if (width <= 0f || height <= 0f || color == null || style.whitePixelTexture == null) {
             return;
         }
-        Color previous = batch.getColor();
+        float previous = batch.getPackedColor();
         batch.setColor(color);
         batch.draw(style.whitePixelTexture, x, y, width, height);
-        batch.setColor(previous);
+        batch.setPackedColor(previous);
     }
 
     /**
@@ -8787,7 +9014,7 @@ public class CodeEditor extends Widget {
         float period = Math.max(4f, step);
         float safeAmplitude = Math.max(0f, amplitude);
         float safeThickness = Math.max(1f, thickness);
-        Color previous = batch.getColor();
+        float previous = batch.getPackedColor();
         batch.setColor(color);
         // The wave is a cosine sampled often enough that a chord is under two pixels. The peaks of a
         // two-chord zig-zag are what makes a wavy underline read as jagged — the eye sees the corner
@@ -8815,7 +9042,7 @@ public class CodeEditor extends Widget {
             previousX = sampleX;
             previousY = sampleY;
         }
-        batch.setColor(previous);
+        batch.setPackedColor(previous);
     }
 
     /**
@@ -8846,7 +9073,7 @@ public class CodeEditor extends Widget {
         // A mark and a gap is one cycle of the pattern; the last mark is clipped where the run ends, so
         // a short run shows a partial mark rather than overrunning the next column.
         float cycle = safeMark + safeGap;
-        Color previous = batch.getColor();
+        float previous = batch.getPackedColor();
         batch.setColor(color);
         int marks = (int) Math.ceil(width / cycle);
         for (int i = 0; i < marks; i++) {
@@ -8857,7 +9084,7 @@ public class CodeEditor extends Widget {
             }
             batch.draw(style.whitePixelTexture, markX, y, markWidth, safeThickness);
         }
-        batch.setColor(previous);
+        batch.setPackedColor(previous);
     }
 
 
@@ -11694,10 +11921,39 @@ public class CodeEditor extends Widget {
         }
     }
 
+    private final class RowRenderContext implements CodeEditorRowRenderContext {
+        LineLayout layout;
+        int row, segment, start, end;
+        float x, bottom;
+
+        @Override public CodeEditor getEditor() { return CodeEditor.this; }
+        @Override public int getLine() { return layout.line; }
+        @Override public int getVisualRow() { return row; }
+        @Override public int getSegmentIndex() { return segment; }
+        @Override public int getStartColumn() { return start; }
+        @Override public int getEndColumn() { return end; }
+        @Override public String getLineText() { return layout.text; }
+        @Override public boolean isFoldSuffix() { return segment < 0; }
+        @Override public float getTextX() { return x; }
+        @Override public float getTextEndX() { return getColumnX(end); }
+        @Override public float getRowBottom() { return bottom; }
+        @Override public float getLineHeight() { return lineHeight; }
+        @Override public float getBaseline() { return getTextBaseline(bottom); }
+        @Override public float getContentLeft() { return getX() + (lineNumbersFixed ? getGutterWidth() : 0f); }
+        @Override public float getContentRight() { return getX() + getWidth(); }
+        @Override public float getColumnX(int column) {
+            int safe = Math.max(start, Math.min(end, column));
+            safe = Math.min(end, CodeDocument.snapColumn(layout.text, safe));
+            return x + layout.measureRange(start, safe);
+        }
+    }
+
     private static final class LineLayout {
         final int line;
         final String text;
         final int indentLevel;
+        /** Computed once per layout, not once per visible wrapped row and frame. */
+        final int trailingWhitespaceStart;
         /** Assigned after construction by {@code buildLineContent}, which fills the ignore ranges too. */
         Array<HighlightToken> tokens;
         final IntArray segmentStarts = new IntArray();
@@ -11717,6 +11973,9 @@ public class CodeEditor extends Widget {
             this.text = text;
             this.indentLevel = indentLevel;
             this.tokens = tokens;
+            int trailing = text.length();
+            while (trailing > 0 && (text.charAt(trailing - 1) == ' ' || text.charAt(trailing - 1) == '\t')) trailing--;
+            this.trailingWhitespaceStart = trailing;
         }
 
         /** Placeholder returned for out-of-range lines so callers never see null. */
@@ -11988,6 +12247,15 @@ public class CodeEditor extends Widget {
         public Color diagnosticWarningColor = new Color(0.96f, 0.76f, 0.26f, 1f);
         public Color diagnosticInformationColor = new Color(0.37f, 0.71f, 0.99f, 1f);
         public Color diagnosticHintColor = new Color(0.55f, 0.63f, 0.71f, 1f);
+        /** Space dots, tab arrows and line-break symbols; null hides the markers. */
+        public Color whitespaceColor = new Color(0.55f, 0.63f, 0.71f, 0.55f);
+        /** Trailing whitespace tint; null hides it. */
+        public Color trailingWhitespaceColor = new Color(0.94f, 0.33f, 0.31f, 0.22f);
+        public Color columnRulerColor = new Color(0.55f, 0.63f, 0.71f, 0.25f);
+        /** Marker geometry in UI units at zoom 1; nonpositive sizes hide the respective shape. */
+        public float whitespaceDotSize = 2f;
+        public float whitespaceMarkerThickness = 1f;
+        public float columnRulerWidth = 1f;
         public Color[] rainbowBracketColors = copyPalette(null, DEFAULT_RAINBOW_BRACKET_PALETTE);
         public Color[] rainbowGuideColors = copyPalette(null, DEFAULT_RAINBOW_GUIDE_PALETTE);
         /**
@@ -12162,6 +12430,12 @@ public class CodeEditor extends Widget {
             this.diagnosticWarningColor = new Color(style.diagnosticWarningColor);
             this.diagnosticInformationColor = new Color(style.diagnosticInformationColor);
             this.diagnosticHintColor = new Color(style.diagnosticHintColor);
+            this.whitespaceColor = style.whitespaceColor == null ? null : new Color(style.whitespaceColor);
+            this.trailingWhitespaceColor = style.trailingWhitespaceColor == null ? null : new Color(style.trailingWhitespaceColor);
+            this.columnRulerColor = style.columnRulerColor == null ? null : new Color(style.columnRulerColor);
+            this.whitespaceDotSize = style.whitespaceDotSize;
+            this.whitespaceMarkerThickness = style.whitespaceMarkerThickness;
+            this.columnRulerWidth = style.columnRulerWidth;
             this.rainbowBracketColors = copyPalette(style.rainbowBracketColors, DEFAULT_RAINBOW_BRACKET_PALETTE);
             this.rainbowGuideColors = copyPalette(style.rainbowGuideColors, DEFAULT_RAINBOW_GUIDE_PALETTE);
             // Copied by value: a theme derived from another must be recolourable without reaching back
@@ -12576,6 +12850,12 @@ public class CodeEditor extends Widget {
                 style.numberColor = new Color(0.914f, 0.761f, 0.384f, 1f);
                 style.annotationColor = mix(accentColor, new Color(0.965f, 0.522f, 0.722f, 1f), 0.32f, 1f);
                 style.literalColor = mix(accentColor, new Color(0.875f, 0.506f, 0.506f, 1f), 0.26f, 1f);
+                style.whitespaceColor = mix(textColor, backgroundColor, 0.38f, 0.55f);
+                style.trailingWhitespaceColor = new Color(style.diagnosticErrorColor.r,
+                    style.diagnosticErrorColor.g, style.diagnosticErrorColor.b, 0.22f);
+                style.columnRulerColor = mix(accentColor, textColor, 0.35f, 0.22f);
+                style.whitespaceDotSize = Math.max(1f, Math.round(fontLineHeight * 0.1f));
+                style.whitespaceMarkerThickness = Math.max(1f, Math.round(fontLineHeight * 0.06f));
 
                 style.scrollbarWidth = derivedScrollbarWidth;
                 style.scrollbarHitWidth = Math.max(style.scrollbarWidth * 2.5f, DEFAULT_SCROLLBAR_HIT_WIDTH);

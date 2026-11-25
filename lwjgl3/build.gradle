@@ -51,6 +51,15 @@ run {
   if (os.contains('mac')) jvmArgs += "-XstartOnFirstThread"
 }
 
+// Opt-in visual smoke check. Requires an OpenGL-capable desktop (or Xvfb on Linux).
+tasks.register('renderingSnapshot', JavaExec) {
+  dependsOn testClasses
+  classpath = sourceSets.test.runtimeClasspath
+  mainClass = 'com.lzt841.editor.lwjgl3.RenderingSnapshot'
+  args rootProject.layout.buildDirectory.dir('rendering-snapshots').get().asFile.absolutePath
+  if (os.contains('mac')) jvmArgs += '-XstartOnFirstThread'
+}
+
 jar {
 // sets the name of the .jar file this produces to the name of the game or app, with the version after.
   archiveFileName.set("${appName}-${projectVersion}.jar")

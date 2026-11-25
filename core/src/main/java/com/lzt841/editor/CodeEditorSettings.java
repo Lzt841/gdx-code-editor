@@ -2,6 +2,8 @@ package com.lzt841.editor;
 
 import com.badlogic.gdx.utils.Array;
 import com.lzt841.editor.input.CodeEditorInteractionMode;
+import com.lzt841.editor.render.CodeWhitespaceMode;
+import java.util.Arrays;
 
 /** Shared editor behavior settings that can be reused across multiple editors. */
 public class CodeEditorSettings {
@@ -16,6 +18,10 @@ public class CodeEditorSettings {
     private boolean passwordMode;
     private boolean rainbowBracketsEnabled;
     private boolean rainbowGuidesEnabled;
+    private CodeWhitespaceMode whitespaceMode = CodeWhitespaceMode.NONE;
+    private boolean lineEndingsVisible;
+    private boolean trailingWhitespaceHighlighted;
+    private int[] columnRulers = new int[0];
     private boolean scrollbarsVisible = true;
     private boolean overscrollEnabled = true;
     private boolean zoomEnabled = true;
@@ -189,6 +195,66 @@ public class CodeEditorSettings {
 
     public CodeEditorInteractionMode getInteractionMode() {
         return interactionMode;
+    }
+
+    public CodeWhitespaceMode getWhitespaceMode() {
+        return whitespaceMode;
+    }
+
+    /** Null means {@link CodeWhitespaceMode#NONE}. Markers are suppressed in password mode. */
+    public void setWhitespaceMode(CodeWhitespaceMode mode) {
+        CodeWhitespaceMode normalized = mode == null ? CodeWhitespaceMode.NONE : mode;
+        if (whitespaceMode == normalized) return;
+        whitespaceMode = normalized;
+        notifyChanged();
+    }
+
+    public boolean isLineEndingsVisible() {
+        return lineEndingsVisible;
+    }
+
+    /** Shows a return arrow at actual line breaks, not soft wraps or the end of the document. */
+    public void setLineEndingsVisible(boolean visible) {
+        if (lineEndingsVisible == visible) return;
+        lineEndingsVisible = visible;
+        notifyChanged();
+    }
+
+    public boolean isTrailingWhitespaceHighlighted() {
+        return trailingWhitespaceHighlighted;
+    }
+
+    /** Tints trailing ASCII spaces/tabs, independently of the marker mode. */
+    public void setTrailingWhitespaceHighlighted(boolean highlighted) {
+        if (trailingWhitespaceHighlighted == highlighted) return;
+        trailingWhitespaceHighlighted = highlighted;
+        notifyChanged();
+    }
+
+    /** A defensive copy of the sorted, distinct, positive ruler columns. Empty means disabled. */
+    public int[] getColumnRulers() {
+        return columnRulers.clone();
+    }
+
+    /**
+     * Draws rulers after the given number of space advances from the unindented text origin.
+     * Typical values are 80 and 120. Nonpositive values and duplicates are ignored; null clears.
+     * Continuation indentation does not shift them. This is a visual margin, not a UTF-16 column
+     * in proportionally spaced text.
+     */
+    public void setColumnRulers(int... columns) {
+        int[] normalized = columns == null ? new int[0] : columns.clone();
+        Arrays.sort(normalized);
+        int size = 0;
+        for (int column : normalized) {
+            if (column > 0 && (size == 0 || normalized[size - 1] != column)) {
+                normalized[size++] = column;
+            }
+        }
+        normalized = Arrays.copyOf(normalized, size);
+        if (Arrays.equals(columnRulers, normalized)) return;
+        columnRulers = normalized;
+        notifyChanged();
     }
 
     public void setInteractionMode(CodeEditorInteractionMode interactionMode) {

@@ -20,4 +20,4 @@ jobs:
           java-version: '17'
           cache: gradle
       - name: Verify library and demos
-        run: ./gradlew :core:test :core:jar :core:sourcesJar :lwjgl3:compileJava :android:compileDebugJavaWithJavac
+        run: ./gradlew :core:test :core:jar :core:sourcesJar :lwjgl3:compileJava :lwjgl3:compileTestJava :android:compileDebugJavaWithJavac

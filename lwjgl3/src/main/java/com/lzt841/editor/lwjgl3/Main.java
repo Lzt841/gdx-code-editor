@@ -89,6 +89,9 @@ import com.lzt841.editor.structure.CodeSymbol;
 import com.lzt841.editor.structure.CodeSymbolKind;
 import com.lzt841.editor.structure.JavaCodeSymbolProvider;
 import com.lzt841.editor.structure.PythonIndentCodeStructureProvider;
+import com.lzt841.editor.render.CodeWhitespaceMode;
+import com.lzt841.editor.render.CodeEditorRowRenderer;
+import com.lzt841.editor.render.CodeEditorRowRenderContext;
 
 /** Desktop entry point with an interactive debug panel for the code editor. */
 public class Main extends ApplicationAdapter {
@@ -133,6 +136,32 @@ public class Main extends ApplicationAdapter {
     private TextButton overscrollButton;
     private TextButton rainbowBracketButton;
     private TextButton rainbowGuideButton;
+    private TextButton whitespaceButton;
+    private TextButton lineEndingsButton;
+    private TextButton trailingWhitespaceButton;
+    private TextButton rulersButton;
+    private TextButton rowRendererButton;
+    private boolean rowRendererEnabled;
+    private final CodeEditorRowRenderer reviewRenderer = new CodeEditorRowRenderer() {
+        @Override public void drawBackground(Batch batch, CodeEditorRowRenderContext row) {
+            if (!row.isFoldSuffix() && (row.getLine() & 1) == 1) {
+                batch.setColor(0.35f, 0.65f, 1f, 0.045f);
+                batch.draw(whitePixel, row.getContentLeft(), row.getRowBottom(),
+                    row.getContentRight() - row.getContentLeft(), row.getLineHeight());
+            }
+        }
+
+        @Override public void drawForeground(Batch batch, CodeEditorRowRenderContext row) {
+            for (int at = row.getLineText().indexOf("TODO"); at >= 0; at = row.getLineText().indexOf("TODO", at + 4)) {
+                int from = Math.max(at, row.getStartColumn());
+                int to = Math.min(at + 4, row.getEndColumn());
+                if (from >= to) continue;
+                float x = row.getColumnX(from), endX = row.getColumnX(to);
+                batch.setColor(1f, 0.72f, 0.28f, 0.95f);
+                batch.draw(whitePixel, x, row.getRowBottom() + 2f, endX - x, 2f);
+            }
+        }
+    };
     private TextButton undoButton;
     private TextButton redoButton;
     private TextButton selectAllButton;
@@ -518,6 +547,18 @@ public class Main extends ApplicationAdapter {
             public void run() {
                 editor.setRainbowGuidesEnabled(!editor.isRainbowGuidesEnabled());
             }
+        });
+        whitespaceButton = createActionButton("", () -> {
+            CodeWhitespaceMode[] modes = CodeWhitespaceMode.values();
+            editor.setWhitespaceMode(modes[(editor.getWhitespaceMode().ordinal() + 1) % modes.length]);
+        });
+        lineEndingsButton = createActionButton("", () -> editor.setLineEndingsVisible(!editor.isLineEndingsVisible()));
+        trailingWhitespaceButton = createActionButton("", () -> editor.setTrailingWhitespaceHighlighted(!editor.isTrailingWhitespaceHighlighted()));
+        rulersButton = createActionButton("", () -> editor.setColumnRulers(editor.getColumnRulers().length == 0 ? new int[]{80, 120} : new int[0]));
+        rowRendererButton = createActionButton("", () -> {
+            rowRendererEnabled = !rowRendererEnabled;
+            if (rowRendererEnabled) editor.addRowRenderer(reviewRenderer);
+            else editor.removeRowRenderer(reviewRenderer);
         });
         undoButton = createActionButton("", new Runnable() {
             @Override
@@ -918,6 +959,16 @@ public class Main extends ApplicationAdapter {
         sidebar.row();
         sidebar.add(rainbowGuideButton);
         sidebar.row();
+        sidebar.add(whitespaceButton);
+        sidebar.row();
+        sidebar.add(lineEndingsButton);
+        sidebar.row();
+        sidebar.add(trailingWhitespaceButton);
+        sidebar.row();
+        sidebar.add(rulersButton);
+        sidebar.row();
+        sidebar.add(rowRendererButton);
+        sidebar.row();
         sidebar.add(new Label("Edit Actions", debugTitleStyle)).padBottom(2f);
         sidebar.row();
         sidebar.add(undoButton);
@@ -1237,6 +1288,11 @@ public class Main extends ApplicationAdapter {
         overscrollButton.setText("Overscroll: " + onOff(editor.isOverscrollEnabled()));
         rainbowBracketButton.setText("Rainbow Brackets: " + onOff(editor.isRainbowBracketsEnabled()));
         rainbowGuideButton.setText("Rainbow Guides: " + onOff(editor.isRainbowGuidesEnabled()));
+        whitespaceButton.setText("Whitespace: " + editor.getWhitespaceMode().name());
+        lineEndingsButton.setText("Line Break Symbols: " + onOff(editor.isLineEndingsVisible()));
+        trailingWhitespaceButton.setText("Trailing Space Tint: " + onOff(editor.isTrailingWhitespaceHighlighted()));
+        rulersButton.setText("Column Rulers 80/120: " + onOff(editor.getColumnRulers().length > 0));
+        rowRendererButton.setText("Review Overlay: " + onOff(rowRendererEnabled));
         clipAreaButton.setText("Custom Clip Inset: " + onOff(customClipInsetEnabled));
         undoButton.setText("Undo: " + onOff(editor.canUndo()));
         redoButton.setText("Redo: " + onOff(editor.canRedo()));
@@ -2213,7 +2269,9 @@ public class Main extends ApplicationAdapter {
             new DemoProfile("JSON", "Brace structure + JSON highlight", BuiltinCodeHighlighters.json(), new BraceCodeStructureProvider(), createJsonDemo()),
             new DemoProfile("XML", "Brace structure + XML highlight", BuiltinCodeHighlighters.xml(), new BraceCodeStructureProvider(), createXmlDemo()),
             new DemoProfile("Plain Text", "Brace structure disabled-like plain text", BuiltinCodeHighlighters.plainText(), new BraceCodeStructureProvider(), createPlainTextDemo()),
-            new DemoProfile("Rich Text", "Markers, gradients and inline images", richTextHighlighter, new BraceCodeStructureProvider(), createRichTextDemo(), true)
+            new DemoProfile("Rich Text", "Markers, gradients and inline images", richTextHighlighter, new BraceCodeStructureProvider(), createRichTextDemo(), true),
+            new DemoProfile("Rendering", "Whitespace, rulers and custom row overlays", BuiltinCodeHighlighters.java(),
+                new BraceCodeStructureProvider(), createRenderingDemo())
         };
     }
 
@@ -2233,11 +2291,20 @@ public class Main extends ApplicationAdapter {
         profileIndex = index;
         DemoProfile profile = profiles[profileIndex];
         commentEditingExtension.setLineCommentPrefix("Python".equals(profile.name) ? "#"
-            : "Java".equals(profile.name) || "Kotlin".equals(profile.name) || "JavaScript".equals(profile.name) ? "//" : null);
+            : "Java".equals(profile.name) || "Kotlin".equals(profile.name) || "JavaScript".equals(profile.name)
+                || "Rendering".equals(profile.name) ? "//" : null);
         editor.setHighlighter(profile.highlighter);
         editor.setStructureProvider(profile.structureProvider);
         editor.clearSearchRange();
         editor.setText(profile.text);
+        if ("Rendering".equals(profile.name)) {
+            editor.setWhitespaceMode(CodeWhitespaceMode.ALL);
+            editor.setLineEndingsVisible(true);
+            editor.setTrailingWhitespaceHighlighted(true);
+            editor.setColumnRulers(80, 120);
+            rowRendererEnabled = true;
+            editor.addRowRenderer(reviewRenderer);
+        }
         // The image atlas belongs to the one profile that uses it: swapped out here rather than left
         // loaded for the other languages, whose text contains no image columns anyway. The listener goes
         // with it, so clicking a diagnostic icon in another sample does nothing instead of reporting an
@@ -2637,6 +2704,20 @@ public class Main extends ApplicationAdapter {
                 lastEventText = "Image hover ended at " + (hit.line + 1) + ":" + (hit.column + 1);
             }
         };
+    }
+
+    private String createRenderingDemo() {
+        return "// Rendering controls are in Display. All effects can be toggled independently.\n"
+            + "// TODO: Try SELECTION whitespace mode, then select text across several lines.\n"
+            + "public class RenderingDemo {\n"
+            + "\t// Tabs show arrows; spaces show dots. These lines also contain trailing spaces.  \n"
+            + "\tString message = \"Whitespace, rulers and custom overlays\";   \n"
+            + "\tvoid render() {\n"
+            + "\t\t// TODO: Toggle wrapping, continuation indentation and zoom.\n"
+            + "\t\tSystem.out.println(message + \" -- a long line to scroll beyond the 80 column ruler and inspect the fixed margin\");\n"
+            + "\t} // TODO: Collapse render() and inspect this visible fold suffix.  \n"
+            + "\t  \n"
+            + "}\n";
     }
 
     private String createRichTextDemo() {

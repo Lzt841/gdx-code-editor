@@ -52,6 +52,9 @@ import com.lzt841.editor.extensions.CodeTextEditingExtension;
 import com.lzt841.editor.structure.BraceCodeStructureProvider;
 import com.lzt841.editor.structure.CodeStructureProvider;
 import com.lzt841.editor.structure.PythonIndentCodeStructureProvider;
+import com.lzt841.editor.render.CodeWhitespaceMode;
+import com.lzt841.editor.render.CodeEditorRowRenderer;
+import com.lzt841.editor.render.CodeEditorRowRenderContext;
 
 /** Touch-first portrait debug app for Android. */
 public class AndroidDebugApp extends ApplicationAdapter {
@@ -84,6 +87,21 @@ public class AndroidDebugApp extends ApplicationAdapter {
     private TextButton zoomButton;
     private TextButton zoomEnabledButton;
     private TextButton overscrollButton;
+    private TextButton whitespaceButton;
+    private TextButton lineEndingsButton;
+    private TextButton trailingWhitespaceButton;
+    private TextButton rulersButton;
+    private TextButton rowRendererButton;
+    private boolean rowRendererEnabled;
+    private final CodeEditorRowRenderer stripeRenderer = new CodeEditorRowRenderer() {
+        @Override public void drawBackground(Batch batch, CodeEditorRowRenderContext row) {
+            if (!row.isFoldSuffix() && (row.getLine() & 1) == 1) {
+                batch.setColor(0.35f, 0.65f, 1f, 0.06f);
+                batch.draw(whitePixel, row.getContentLeft(), row.getRowBottom(),
+                    row.getContentRight() - row.getContentLeft(), row.getLineHeight());
+            }
+        }
+    };
     private final Vector2 popupStageTmp = new Vector2();
     private Table popupMenu;
     private Label popupTitleLabel;
@@ -303,6 +321,19 @@ public class AndroidDebugApp extends ApplicationAdapter {
             }
         });
 
+        whitespaceButton = button("", buttonStyle, () -> {
+            CodeWhitespaceMode[] modes = CodeWhitespaceMode.values();
+            editor.setWhitespaceMode(modes[(editor.getWhitespaceMode().ordinal() + 1) % modes.length]);
+        });
+        lineEndingsButton = button("", buttonStyle, () -> editor.setLineEndingsVisible(!editor.isLineEndingsVisible()));
+        trailingWhitespaceButton = button("", buttonStyle, () -> editor.setTrailingWhitespaceHighlighted(!editor.isTrailingWhitespaceHighlighted()));
+        rulersButton = button("", buttonStyle, () -> editor.setColumnRulers(editor.getColumnRulers().length == 0 ? new int[]{40, 80} : new int[0]));
+        rowRendererButton = button("", buttonStyle, () -> {
+            rowRendererEnabled = !rowRendererEnabled;
+            if (rowRendererEnabled) editor.addRowRenderer(stripeRenderer);
+            else editor.removeRowRenderer(stripeRenderer);
+        });
+
         stateLabel = new Label("", labelStyle);
         stateLabel.setWrap(true);
         eventLabel = new Label("", labelStyle);
@@ -361,6 +392,14 @@ public class AndroidDebugApp extends ApplicationAdapter {
         controlsTable.row();
         controlsTable.add(zoomEnabledButton);
         controlsTable.add(overscrollButton);
+        controlsTable.row();
+        controlsTable.add(whitespaceButton).colspan(2);
+        controlsTable.row();
+        controlsTable.add(lineEndingsButton);
+        controlsTable.add(trailingWhitespaceButton);
+        controlsTable.row();
+        controlsTable.add(rulersButton);
+        controlsTable.add(rowRendererButton);
         controlsTable.row();
         controlsTable.add(zoomButton).colspan(2);
         controlsTable.row();
@@ -608,6 +647,11 @@ public class AndroidDebugApp extends ApplicationAdapter {
         zoomButton.setText("Zoom: " + String.format(java.util.Locale.ROOT, "%.2fx", editor.getZoomScale()));
         zoomEnabledButton.setText("Pinch Zoom: " + onOff(editor.isZoomEnabled()));
         overscrollButton.setText("Overscroll: " + onOff(editor.isOverscrollEnabled()));
+        whitespaceButton.setText("Whitespace: " + editor.getWhitespaceMode().name());
+        lineEndingsButton.setText("Line Breaks: " + onOff(editor.isLineEndingsVisible()));
+        trailingWhitespaceButton.setText("Trailing Tint: " + onOff(editor.isTrailingWhitespaceHighlighted()));
+        rulersButton.setText("Rulers 40/80: " + onOff(editor.getColumnRulers().length > 0));
+        rowRendererButton.setText("Row Overlay: " + onOff(rowRendererEnabled));
         stateLabel.setText(
             "Highlighter: " + profile.description + "\n"
                 + "Cursor: " + (editor.getCursorLine() + 1) + ":" + (editor.getCursorColumn() + 1) + "\n"
@@ -629,11 +673,19 @@ public class AndroidDebugApp extends ApplicationAdapter {
         profileIndex = index;
         DemoProfile profile = profiles[index];
         commentEditingExtension.setLineCommentPrefix("Python".equals(profile.name) ? "#"
-            : "Java".equals(profile.name) ? "//" : null);
+            : "Java".equals(profile.name) || "Rendering".equals(profile.name) ? "//" : null);
         editor.setHighlighter(profile.highlighter);
         editor.setStructureProvider(profile.structureProvider);
         editor.clearSearchRange();
         editor.setText(profile.text);
+        if ("Rendering".equals(profile.name)) {
+            editor.setWhitespaceMode(CodeWhitespaceMode.ALL);
+            editor.setLineEndingsVisible(true);
+            editor.setTrailingWhitespaceHighlighted(true);
+            editor.setColumnRulers(40, 80);
+            rowRendererEnabled = true;
+            editor.addRowRenderer(stripeRenderer);
+        }
         lastEvent = "Loaded sample: " + profile.name;
     }
 
@@ -641,7 +693,17 @@ public class AndroidDebugApp extends ApplicationAdapter {
         return new DemoProfile[] {
             new DemoProfile("Java", "Brace structure + Java highlight", BuiltinCodeHighlighters.java(), new BraceCodeStructureProvider(), createJavaSample()),
             new DemoProfile("Python", "Indent structure + Python highlight", BuiltinCodeHighlighters.python(), new PythonIndentCodeStructureProvider(), createPythonSample()),
-            new DemoProfile("JSON", "Brace structure + JSON highlight", BuiltinCodeHighlighters.json(), new BraceCodeStructureProvider(), createJsonSample())
+            new DemoProfile("JSON", "Brace structure + JSON highlight", BuiltinCodeHighlighters.json(), new BraceCodeStructureProvider(), createJsonSample()),
+            new DemoProfile("Rendering", "Whitespace, rulers and row overlays", BuiltinCodeHighlighters.java(), new BraceCodeStructureProvider(),
+                "// Use Quick Toggles to compare rendering modes.\n"
+                    + "public class RenderSample {\n"
+                    + "\tString text = \"Spaces and tabs\";   \n"
+                    + "\tvoid render() {\n"
+                    + "\t\t// Try wrapping and pinch zoom on this longer line of code.\n"
+                    + "\t\tSystem.out.println(text);\n"
+                    + "\t} // Collapse to inspect the visible suffix.\n"
+                    + "\t  \n"
+                    + "}\n")
         };
     }
 

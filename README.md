@@ -23,6 +23,8 @@ See [the implementation review](docs/EDITOR_REVIEW.md) for current limitations a
 - Replace current / replace all
 - Undo / redo with named compound edits and a configurable history budget
 - Rainbow brackets and rainbow guides
+- Optional space/tab markers, trailing-whitespace tint, real line-break symbols and column rulers
+- Custom background/foreground row layers with measured columns, wrapping and collapsed-suffix geometry
 - Touch and mouse interaction modes
 - Touch handles, long press, inertial scrolling, pinch zoom
 - Scroll state queries and a listener, covering touch pan, fling and every other scroll source
@@ -68,6 +70,9 @@ See [the implementation review](docs/EDITOR_REVIEW.md) for current limitations a
 
 ## Screenshots
 
+### Rendering aids and custom row layers
+![Whitespace, rulers, light/dark themes, wrapped rows and fold suffix decorations](images/rendering-effects.png)
+
 ### Java editing and context menu
 ![Java editor with search](images/img.png)
 
@@ -95,7 +100,7 @@ Add the dependency:
 
 ```gradle
 dependencies {
-    implementation 'com.github.Lzt841:gdx-code-editor:v1.4.2'
+    implementation 'com.github.Lzt841:gdx-code-editor:v1.5.0'
 }
 ```
 
@@ -108,7 +113,7 @@ repositories {
 }
 
 dependencies {
-    implementation("com.github.Lzt841:gdx-code-editor:v1.4.2")
+    implementation("com.github.Lzt841:gdx-code-editor:v1.5.0")
 }
 ```
 
@@ -883,6 +888,97 @@ editor.getRowSegmentClampCount();     // must be 0; see "Large Documents"
 The one to watch is `getHighlightResyncLine()`. While you type it should stay at or near the line count.
 If it sits far below, the highlighter's state is not converging and every edit is re-scanning the tail of
 the document — usually a sign that its `highlightLine` returns a state that varies when it should not.
+
+## Rendering Aids and Custom Layers
+
+These effects are opt-in and do not modify text, history, caret placement or wrapping. They are also
+available through shared `CodeEditorSettings`.
+
+```java
+import com.lzt841.editor.render.CodeWhitespaceMode;
+
+editor.setWhitespaceMode(CodeWhitespaceMode.ALL); // NONE (default), ALL, TRAILING, SELECTION
+editor.setTrailingWhitespaceHighlighted(true);   // independent tint for trailing ASCII spaces/tabs
+editor.setLineEndingsVisible(true);              // real newlines, excluding soft wraps and EOF
+editor.setColumnRulers(80, 120);                 // empty/null clears; sorted and deduplicated
+
+style.whitespaceColor = new Color(0.55f, 0.65f, 0.75f, 0.55f);
+style.trailingWhitespaceColor = new Color(0.95f, 0.3f, 0.3f, 0.2f);
+style.columnRulerColor = new Color(0.55f, 0.65f, 0.75f, 0.22f);
+style.whitespaceDotSize = 2f;
+style.whitespaceMarkerThickness = 1f;
+style.columnRulerWidth = 1f;
+```
+
+Spaces use dots, tabs use arrows spanning their measured tab-stop width, and real line breaks use
+return arrows. The symbols are drawn from `style.whitePixelTexture`, so the font does not need arrow
+glyphs. The theme builder supplies this texture and derives marker colors for the chosen theme.
+Manually assembled styles need to supply the texture for built-in effects; missing textures or null
+colors skip the corresponding effect. Marker and ruler sizes follow zoom. Rulers are placed after N
+space advances from the unindented text origin and follow horizontal scrolling; continuation indent
+does not shift them. With a proportional font, they represent a visual margin, not a UTF-16 index.
+
+`TRAILING` refers to the end of a logical line, and `SELECTION` follows the normalized selection across
+lines. Spaces/tabs omitted by the existing soft-wrap indentation trimming are not marked. Hidden fold
+contents and synthetic placeholders are not marked; visible closing suffixes retain markers and
+diagnostics. Password mode suppresses whitespace effects and all custom row callbacks.
+
+Hosts can add diff backgrounds, review annotations, current-execution overlays or custom range
+decorations without replacing text rendering:
+
+```java
+import com.badlogic.gdx.graphics.g2d.Batch;
+import com.lzt841.editor.render.CodeEditorRowRenderContext;
+import com.lzt841.editor.render.CodeEditorRowRenderer;
+
+CodeEditorRowRenderer executionLine = new CodeEditorRowRenderer() {
+    @Override public void drawBackground(Batch batch, CodeEditorRowRenderContext row) {
+        if (row.getLine() != 10 || row.isFoldSuffix()) return;
+        batch.setColor(0.2f, 0.75f, 0.4f, 0.15f);
+        batch.draw(style.whitePixelTexture, row.getContentLeft(), row.getRowBottom(),
+            row.getContentRight() - row.getContentLeft(), row.getLineHeight());
+    }
+
+    @Override public void drawForeground(Batch batch, CodeEditorRowRenderContext row) {
+        if (row.getLine() != 10) return;
+        int from = Math.max(4, row.getStartColumn());
+        int to = Math.min(12, row.getEndColumn());
+        if (from >= to) return;
+        batch.setColor(0.2f, 0.9f, 0.5f, 0.9f);
+        batch.draw(style.whitePixelTexture, row.getColumnX(from), row.getRowBottom() + 2f,
+            row.getColumnX(to) - row.getColumnX(from), 2f);
+    }
+};
+editor.addRowRenderer(executionLine);
+// Later, before disposing the host's resources:
+editor.removeRowRenderer(executionLine);
+```
+
+Each layer is called in registration order for viewport rows (including boundary rows), empty lines,
+wrapped segments and visible fold suffixes. Column geometry accounts for tabs, inline images,
+surrogate boundaries, scrolling and continuation indent. A suffix reports its original logical line
+and columns, the enclosing visual row, and segment index `-1`. The context is reused and is valid only
+during its callback. Its coordinates include the actor position in the current batch draw space.
+Clamp decorations to the reported segment and use the existing clip; content bounds exclude a fixed
+gutter, but do not include custom scissor insets.
+
+The background callback precedes selection/text; foreground follows text, markers and diagnostics,
+before the caret and gutter. Batch tint and font color/scale are restored after each callback,
+including exceptions. Callbacks must not edit the document or change batch transform, projection,
+shader, blending or begin/end state. Defer edits to the next `act`. Registration changes are safe
+during callbacks and take effect on the next callback pass; renderer resources belong to the host.
+
+The desktop **Rendering** sample demonstrates these effects with alternating row backgrounds and
+TODO underlines. Android has touch controls for the same built-in effects and a row-layer example.
+An optional desktop OpenGL smoke check generates a reference sheet in
+`build/rendering-snapshots/rendering-effects.png`:
+
+```shell
+./gradlew :lwjgl3:renderingSnapshot
+```
+
+It uses a hidden window and requires an OpenGL-capable desktop (or Xvfb on Linux); regular unit tests
+record draw commands and do not require a display.
 
 ## Caret and Coordinate Queries
 

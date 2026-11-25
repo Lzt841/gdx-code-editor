@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+## v1.5.0 — 2026-11-26
+
+### Added
+
+- Opt-in whitespace markers with ALL, TRAILING and SELECTION modes, plus independent trailing-space
+  tint and actual line-break symbols. Spaces use dots and tabs use measured arrows; no special font
+  glyphs are required. Password mode suppresses these text decorations.
+- Multiple configurable column rulers, using space advances from the unindented text origin. Rulers
+  follow horizontal scroll and zoom. All display options work with shared editor settings.
+- Composable background/foreground row renderer callbacks for host-defined diff, execution or review
+  overlays. Contexts expose measured UTF-16 column geometry, wrapped segments, empty lines and visible
+  collapsed-fold suffixes. Callback tint and font state are restored even after exceptions.
+- Desktop and Android Rendering samples with effect controls, and an optional hidden-window OpenGL
+  reference-sheet task: `:lwjgl3:renderingSnapshot`.
+
+### Improved
+
+- Visible fold suffixes now retain diagnostic squiggles as well as their existing search/selection and
+  rich-text decorations. Synthetic fold placeholders do not acquire source-text whitespace markers.
+- Whitespace rendering uses binary search to skip the horizontally hidden prefix of long lines, and
+  submits markers only for cells near the viewport. Display toggles reuse layout/highlight caches.
+- Theme-derived marker colors, copy-safe style fields and README integration examples for custom layers.
+
+### Fixed
+
+- Rich-text backgrounds and underlines, diagnostic squiggles and inline images now restore the batch's
+  original packed tint. Keeping a reference to the mutable batch color previously let decoration
+  colors leak into subsequent custom layers or sibling actors.
+
+### Validation and distribution
+
+- All 561 core tests passed across 46 classes, including 31 rendering regression tests covering actual
+  draw-call geometry, modes, wraps, folds, scroll/zoom, Unicode/images, state restoration and culling.
+- Core build and local Maven publication, desktop Java compilation and Android debug Java compilation
+  passed. Generated and visually inspected a real OpenGL reference sheet for dark/light themes,
+  continuation indentation, zoom and visible fold suffixes; included it in the README.
+- Physical Android rendering/touch behavior and IME composition still require device validation.
+- Git tag and JitPack version: `v1.5.0`; Gradle publication version: `1.5.0`.
+
 ## v1.4.2 — 2026-11-25
 
 - Restore the Gradle wrapper's executable bit so GitHub Actions can run verification on Linux.
