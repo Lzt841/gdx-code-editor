@@ -3,6 +3,9 @@ package com.lzt841.editor;
 import com.badlogic.gdx.utils.Array;
 import org.junit.Test;
 
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
 import static com.lzt841.editor.EditorTestSupport.createEditor;
 import static org.junit.Assert.*;
 
@@ -70,6 +73,50 @@ public class CodeEditorReplacementTest {
         editor.setSearchText("id=([0-9]+)");
         assertEquals(1, editor.replaceAllSearchMatches("$2"));
         assertEquals("$2", editor.getText());
+    }
+
+    @Test public void replacementTemplatesAgreeWithJavaMatcherIncludingInvalidLiteralFallback() {
+        String text = "acdefghijkl";
+        String regex = "(?<value>a)(b)?(c)(d)(e)(f)(g)(h)(i)(j)(k)(l)";
+        Pattern pattern = Pattern.compile(regex);
+        String[] templates = {"$0", "$00", "$01", "$001", "$02", "$12", "$123", "$13", "$99",
+            "$2", "${value}", "${missing}", "${}", "${9}", "${value", "${value}x", "\\$1", "\\\\$1",
+            "$", "\\", "$-", "$1$", "ok\\n", "[${value}][$2][$12]"};
+        for (String template : templates) {
+            Matcher matcher = pattern.matcher(text);
+            assertTrue(matcher.find());
+            String expected;
+            try {
+                StringBuffer buffer = new StringBuffer();
+                matcher.appendReplacement(buffer, template);
+                expected = buffer.toString();
+            } catch (IllegalArgumentException | IndexOutOfBoundsException invalid) {
+                expected = template;
+            }
+            CodeEditor editor = createEditor(text);
+            editor.setSearchRegexEnabled(true);
+            editor.setSearchText(regex);
+            int version = editor.getDocumentVersion();
+            assertEquals(template, expected.equals(text) ? 0 : 1, editor.replaceAllSearchMatches(template));
+            assertEquals(template, expected, editor.getText());
+            if (expected.equals(text)) {
+                assertEquals(version, editor.getDocumentVersion());
+                assertEquals(0, editor.getUndoEntryCount());
+            } else {
+                assertTrue(template, editor.undo());
+                assertEquals(template, text, editor.getText());
+            }
+        }
+    }
+
+    @Test public void replacementExpansionRecoversLookaroundGroupsAtEachOriginalOffset() {
+        CodeEditor editor = createEditor("pre42 pre7\npre9");
+        editor.setSearchRegexEnabled(true);
+        editor.setSearchText("(?<=(pre))([0-9]+)");
+        assertEquals(3, editor.replaceAllSearchMatches("$1=$2"));
+        assertEquals("prepre=42 prepre=7\nprepre=9", editor.getText());
+        assertTrue(editor.undo());
+        assertEquals("pre42 pre7\npre9", editor.getText());
     }
 
     @Test public void literalReplaceAllFiltersEveryInsertionOnce() {

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## v1.4.2 — 2026-11-25
+
+- Restore the Gradle wrapper's executable bit so GitHub Actions can run verification on Linux.
+- Extend regex replacement validation against Java's own template expansion, including multi-digit
+  groups, escaping, malformed templates, no-op history preservation and lookaround captures.
+- All 530 core tests passed; core packaging and local Maven publication, desktop Java compilation and
+  Android debug Java compilation passed.
+- Includes the `v1.4.1` replacement performance improvements below. Git/Gradle/JitPack versions are
+  `v1.4.2` / `1.4.2` / `v1.4.2` respectively.
+
 ## v1.4.1 — 2026-11-25
 
 ### Improved
