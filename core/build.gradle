@@ -32,6 +32,12 @@ tasks.register('positionMappingBenchmark', JavaExec) {
   mainClass = 'com.lzt841.editor.CodeDocumentPositionBenchmark'
 }
 
+tasks.register('searchReplacementBenchmark', JavaExec) {
+  dependsOn testClasses
+  classpath = sourceSets.test.runtimeClasspath
+  mainClass = 'com.lzt841.editor.CodeEditorSearchReplacementBenchmark'
+}
+
 publishing {
   publications {
     release(MavenPublication) {

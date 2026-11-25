@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+## v1.4.1 — 2026-11-25
+
+### Improved
+
+- Regex replacement expands captured and named groups directly into a replacement-sized buffer and
+  reuses one matcher across Replace All. Dense matches on long lines no longer allocate a full-line
+  buffer and copy every prefix once per match.
+- Added a warmed median benchmark task for dense regex replacements, alongside the position-mapping
+  benchmark.
+
+### Validation
+
+- Added replacement regressions for named groups, unmatched optional groups, escaped dollar signs and
+  invalid group references.
+- All 528 core tests passed. Verified the core JAR and sources JAR, desktop Java compilation and Android
+  debug Java compilation.
+- GUI rendering, IME composition and physical Android touch behavior remain unverified on devices.
+
+### Distribution
+
+- Git tag and JitPack dependency version: `v1.4.1`.
+- Gradle publication version: `1.4.1`.
+- Existing public APIs and default shortcuts are unchanged.
+
 ## v1.4.0 — 2026-11-22
 
 ### Added

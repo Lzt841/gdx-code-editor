@@ -1563,8 +1563,11 @@ public class CodeEditor extends Widget {
         // up front rather than inside the edit loop, which rewrites the text as it walks backwards.
         String[] expanded = new String[matchesToReplace.size];
         boolean expand = needsReplacementExpansion(template);
+        Matcher replacementMatcher = expand ? searchPattern.matcher("") : null;
         for (int i = 0; i < matchesToReplace.size; i++) {
-            expanded[i] = expand ? expandReplacement(template, matchesToReplace.get(i)) : template;
+            expanded[i] = expand
+                ? expandReplacement(template, matchesToReplace.get(i), replacementMatcher)
+                : template;
         }
         Array<SearchMatchRef> changedMatches = new Array<>(matchesToReplace.size);
         Array<String> replacements = new Array<>(matchesToReplace.size);
@@ -6582,10 +6585,15 @@ public class CodeEditor extends Widget {
      *
      * <p>Only meaningful in regex mode. The pattern is re-run on the match's own line to recover the
      * groups, which costs one line scan per replacement but keeps the search itself from having to
-     * retain a group array for every hit in the document. Falls back to the literal replacement if
-     * the pattern no longer matches at that exact offset, or if the reference is malformed.
+     * retain a group array for every hit in the document. Replace All reuses its matcher, and the
+     * replacement parser avoids copying the text before each hit. Falls back to the literal
+     * replacement if the pattern no longer matches at that exact offset, or if the reference is malformed.
      */
     private String expandReplacement(String replacement, SearchMatchRef target) {
+        return expandReplacement(replacement, target, null);
+    }
+
+    private String expandReplacement(String replacement, SearchMatchRef target, Matcher matcher) {
         if (target == null || !needsReplacementExpansion(replacement)) {
             return replacement;
         }
@@ -6600,21 +6608,85 @@ public class CodeEditor extends Widget {
         if (target.match.start < 0 || target.match.end > text.length()) {
             return replacement;
         }
-        Matcher matcher = searchPattern.matcher(text);
+        if (matcher == null) {
+            matcher = searchPattern.matcher(text);
+        } else {
+            matcher.reset(text);
+        }
         if (!matcher.find(target.match.start)
             || matcher.start() != target.match.start
             || matcher.end() != target.match.end) {
             return replacement;
         }
-        StringBuffer buffer = new StringBuffer(text.length() + replacement.length());
         try {
-            matcher.appendReplacement(buffer, replacement);
+            return expandMatcherReplacement(matcher, replacement);
         } catch (RuntimeException error) {
             // A dangling "$" or a reference to a group the pattern does not have; take it literally.
             return replacement;
         }
-        // appendReplacement copied text before the match first, so the expansion is what follows it.
-        return buffer.substring(target.match.start);
+    }
+
+    /** Expands Matcher replacement syntax without copying the text before this match. */
+    private String expandMatcherReplacement(Matcher matcher, String replacement) {
+        StringBuilder expanded = new StringBuilder(replacement.length());
+        int cursor = 0;
+        int groupCount = matcher.groupCount();
+        while (cursor < replacement.length()) {
+            char current = replacement.charAt(cursor++);
+            if (current == '\\') {
+                if (cursor >= replacement.length()) {
+                    throw new IllegalArgumentException("dangling escape");
+                }
+                expanded.append(replacement.charAt(cursor++));
+                continue;
+            }
+            if (current != '$') {
+                expanded.append(current);
+                continue;
+            }
+            if (cursor >= replacement.length()) {
+                throw new IllegalArgumentException("dangling group reference");
+            }
+            char next = replacement.charAt(cursor);
+            if (next == '{') {
+                int nameStart = cursor + 1;
+                int nameEnd = replacement.indexOf('}', nameStart);
+                if (nameEnd < 0) {
+                    throw new IllegalArgumentException("unterminated named group");
+                }
+                String group = matcher.group(replacement.substring(nameStart, nameEnd));
+                if (group != null) {
+                    expanded.append(group);
+                }
+                cursor = nameEnd + 1;
+                continue;
+            }
+            if (next < '0' || next > '9') {
+                throw new IllegalArgumentException("invalid group reference");
+            }
+            int groupIndex = next - '0';
+            if (groupIndex > groupCount) {
+                throw new IllegalArgumentException("unknown group");
+            }
+            cursor++;
+            while (cursor < replacement.length()) {
+                char digit = replacement.charAt(cursor);
+                if (digit < '0' || digit > '9') {
+                    break;
+                }
+                int candidate = groupIndex * 10 + digit - '0';
+                if (candidate > groupCount) {
+                    break;
+                }
+                groupIndex = candidate;
+                cursor++;
+            }
+            String group = matcher.group(groupIndex);
+            if (group != null) {
+                expanded.append(group);
+            }
+        }
+        return expanded.toString();
     }
 
     private boolean regionMatchesSearch(CharSequence line, int offset) {

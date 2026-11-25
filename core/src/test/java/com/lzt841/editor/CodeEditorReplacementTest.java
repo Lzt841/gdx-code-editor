@@ -56,6 +56,22 @@ public class CodeEditorReplacementTest {
         assertEquals("42", editor.getText());
     }
 
+    @Test public void replacementExpansionKeepsNamedGroupsEscapesAndUnmatchedGroups() {
+        CodeEditor editor = createEditor("foo foobar");
+        editor.setSearchRegexEnabled(true);
+        editor.setSearchText("foo(?<suffix>bar)?");
+        assertEquals(2, editor.replaceAllSearchMatches("$0-${suffix}-\\$"));
+        assertEquals("foo--$ foobar-bar-$", editor.getText());
+    }
+
+    @Test public void invalidReplacementGroupFallsBackToLiteralText() {
+        CodeEditor editor = createEditor("id=42");
+        editor.setSearchRegexEnabled(true);
+        editor.setSearchText("id=([0-9]+)");
+        assertEquals(1, editor.replaceAllSearchMatches("$2"));
+        assertEquals("$2", editor.getText());
+    }
+
     @Test public void literalReplaceAllFiltersEveryInsertionOnce() {
         CodeEditor editor = createEditor("a a");
         editor.setSearchText("a");
