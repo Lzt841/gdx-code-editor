@@ -18,6 +18,10 @@ import com.badlogic.gdx.graphics.g2d.TextureRegion;
  * image whose width does not match its pixels will still be hit-tested correctly, because every consumer
  * reads the same number.
  *
+ * <p><b>Zoom.</b> Width, height and baseline offset are declared at 100% zoom. The editor multiplies them
+ * by its zoom scale exactly as it does glyph advances, so an icon keeps its size relative to the text and
+ * its column, hit area and drawn picture stay identical at every zoom level.
+ *
  * <p><b>One column.</b> The editor collapses a supplementary-plane character — two {@code char}s in a
  * Java string — onto a single column: answer from the high surrogate and return null from the low one.
  * The low surrogate is then neither measured nor drawn, so a U+1F600 emoji occupies exactly the width of

@@ -100,7 +100,7 @@ Add the dependency:
 
 ```gradle
 dependencies {
-    implementation 'com.github.Lzt841:gdx-code-editor:v1.5.0'
+    implementation 'com.github.Lzt841:gdx-code-editor:v1.5.1'
 }
 ```
 
@@ -113,7 +113,7 @@ repositories {
 }
 
 dependencies {
-    implementation("com.github.Lzt841:gdx-code-editor:v1.5.0")
+    implementation("com.github.Lzt841:gdx-code-editor:v1.5.1")
 }
 ```
 
@@ -331,7 +331,9 @@ row before the first one could be drawn.
 
 `GRADIENT` is a horizontal interpolation drawn as solid-colour bands of `CodeEditorStyle.gradientBandWidth`,
 which is what a single-colour `BitmapFont` can produce: a band is one `font.draw` call in one colour, so
-a narrower band is a smoother gradient at a linear cost and no allocation.
+a narrower band is a smoother gradient at a linear cost and no allocation. The ramp spans the whole token,
+so it continues across tabs, inline images, unsupported characters and soft-wrapped rows instead of
+restarting after each break; fake-bold passes repeat the same colours.
 
 The geometry knobs for every decoration are in `CodeEditorStyle` — `underlineOffset` and
 `underlineThickness`, `doubleUnderlineGap`, `wavyUnderlineStep` / `wavyUnderlineAmplitude`,
@@ -368,7 +370,9 @@ answer for stays two glyphs. `column` and `lineText` are the high surrogate's, s
 via `Character.toCodePoint(char, char)` is the right shape.
 
 An `InlineImage` is a `TextureRegion` plus a width, a height and a baseline offset, so an icon can sit on
-the baseline like a glyph or hang from it like a reaction emoji.
+the baseline like a glyph or hang from it like a reaction emoji. All three values are declared at 100%
+zoom and scale with the text: at 2x zoom a 20px icon occupies and draws 40px, and hit testing and
+wrapping follow. An image taller than the row is shrunk to fit and stays centred in its measured column.
 
 ### Clickable and hoverable images
 

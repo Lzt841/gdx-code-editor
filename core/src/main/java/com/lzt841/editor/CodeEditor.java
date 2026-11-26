@@ -680,7 +680,10 @@ public class CodeEditor extends Widget {
         this.style = style;
         this.baseFontScaleX = style.font.getData().scaleX;
         this.baseFontScaleY = style.font.getData().scaleY;
-        this.baseFontLineHeight = style.font.getLineHeight() / Math.max(0.0001f, baseFontScaleY);
+        // The font's own scale is part of its size at 100% zoom. Glyphs are drawn at baseScale * zoom, so a
+        // skin that ships a pre-scaled font needs rows as tall as that font actually is; dividing the scale
+        // back out left 2x glyphs overlapping in 1x rows.
+        this.baseFontLineHeight = style.font.getLineHeight();
         updateFontMetrics();
         glyphWidthCache.clear();
         glyphAdvanceCache.clear();
@@ -8527,6 +8530,11 @@ public class CodeEditor extends Widget {
 
             int tokenStart = Math.max(token.start, start);
             int tokenEnd = Math.min(token.end, end);
+            // The ramp spans the whole token on this line, not just the part on this visual row, so a
+            // gradient keeps going across a soft wrap instead of restarting at every row.
+            int lineLength = layout.text.length();
+            int rampStart = Math.max(0, Math.min(token.start, lineLength));
+            int rampEnd = Math.max(rampStart, Math.min(token.end, lineLength));
             drawText(
                 batch,
                 layout,
@@ -8536,7 +8544,9 @@ public class CodeEditor extends Widget {
                 baseline,
                 rowBottom,
                 disabled ? baseColor : token.color,
-                disabled ? null : token.style
+                disabled ? null : token.style,
+                rampStart,
+                rampEnd
             );
             x += layout.measureRange(tokenStart, tokenEnd);
             cursor = tokenEnd;
@@ -8558,6 +8568,27 @@ public class CodeEditor extends Widget {
         Color color,
         CodeTextStyle textStyle
     ) {
+        drawText(batch, layout, start, end, x, y, rowBottom, color, textStyle, start, end);
+    }
+
+    /**
+     * Draws one styled range. {@code rampStart}/{@code rampEnd} are the columns of the whole token the
+     * range belongs to: a gradient is sampled against that full extent, so a token split by tabs, inline
+     * images, unsupported glyphs or soft wraps still reads as one continuous ramp.
+     */
+    private void drawText(
+        Batch batch,
+        LineLayout layout,
+        int start,
+        int end,
+        float x,
+        float y,
+        float rowBottom,
+        Color color,
+        CodeTextStyle textStyle,
+        int rampStart,
+        int rampEnd
+    ) {
         if (start >= end) {
             return;
         }
@@ -8572,7 +8603,11 @@ public class CodeEditor extends Widget {
             int runStart = start;
             float runX = x;
             for (int i = start; i < end; i++) {
-                if (text.charAt(i) != '\t') {
+                char current = text.charAt(i);
+                // A tab is drawn as empty space, and so is a character the font would silently skip: a
+                // BitmapFont with no glyph and no missingGlyph gives it no advance, which would pull every
+                // following glyph left of the column the caret and hit tests measured for it.
+                if (current != '\t' && !isSkippedByFont(current)) {
                     continue;
                 }
                 if (runStart < i) {
@@ -8620,7 +8655,7 @@ public class CodeEditor extends Widget {
                 char current = text.charAt(i);
                 if (current == '\t') {
                     if (runStart < i) {
-                        drawTextGlyphs(batch, layout, runStart, i, runX, y, color, runStyle);
+                        drawTextGlyphs(batch, layout, runStart, i, runX, y, color, runStyle, rampStart, rampEnd);
                         runX += layout.measureRange(runStart, i);
                     }
                     runX += layout.measureRange(i, i + 1);
@@ -8630,7 +8665,7 @@ public class CodeEditor extends Widget {
                 InlineImage image = drawingImages ? inlineImageProvider.imageAt(layout.line, i, text) : null;
                 if (image == null && drawingImages && isTrailingImageSurrogate(layout.line, text, i)) {
                     if (runStart < i) {
-                        drawTextGlyphs(batch, layout, runStart, i, runX, y, color, runStyle);
+                        drawTextGlyphs(batch, layout, runStart, i, runX, y, color, runStyle, rampStart, rampEnd);
                         runX += layout.measureRange(runStart, i);
                     }
                     // The pair's image was drawn one column back and this column has no advance, so there is
@@ -8642,7 +8677,7 @@ public class CodeEditor extends Widget {
                 }
                 if (image != null) {
                     if (runStart < i) {
-                        drawTextGlyphs(batch, layout, runStart, i, runX, y, color, runStyle);
+                        drawTextGlyphs(batch, layout, runStart, i, runX, y, color, runStyle, rampStart, rampEnd);
                         runX += layout.measureRange(runStart, i);
                     }
                     if (italic) {
@@ -8655,17 +8690,24 @@ public class CodeEditor extends Widget {
                         batch.flush();
                         batch.setProjectionMatrix(scratchOriginalProjection);
                     }
-                    drawInlineImage(batch, image, runX, y, rowBottom);
+                    drawInlineImage(batch, image, runX, layout.measureRange(i, i + 1), y, rowBottom);
                     if (italic) {
                         batch.flush();
                         batch.setProjectionMatrix(scratchShearedProjection);
                     }
                     runX += layout.measureRange(i, i + 1);
                     runStart = i + 1;
+                } else if (isSkippedByFont(current)) {
+                    if (runStart < i) {
+                        drawTextGlyphs(batch, layout, runStart, i, runX, y, color, runStyle, rampStart, rampEnd);
+                        runX += layout.measureRange(runStart, i);
+                    }
+                    runX += layout.measureRange(i, i + 1);
+                    runStart = i + 1;
                 }
             }
             if (runStart < end) {
-                drawTextGlyphs(batch, layout, runStart, end, runX, y, color, runStyle);
+                drawTextGlyphs(batch, layout, runStart, end, runX, y, color, runStyle, rampStart, rampEnd);
             }
         } finally {
             if (italic) {
@@ -8696,7 +8738,9 @@ public class CodeEditor extends Widget {
         float runX,
         float baseline,
         Color color,
-        CodeTextStyle runStyle
+        CodeTextStyle runStyle,
+        int rampStart,
+        int rampEnd
     ) {
         // The theme derives the offset from the font's unscaled line height, so it is scaled here to the
         // size the glyphs are actually drawn at: without that, zooming in thins the bold and zooming out
@@ -8704,7 +8748,7 @@ public class CodeEditor extends Widget {
         float boldOffset = style.fakeBoldOffset * zoomScale;
         boolean bold = runStyle.hasFlags(CodeTextStyle.BOLD) && boldOffset != 0f;
         if (runStyle.hasFlags(CodeTextStyle.GRADIENT) && runStyle.gradientEndColor != null) {
-            drawGradientTextRun(batch, layout, runStart, runEnd, runX, baseline, color, runStyle);
+            drawGradientTextRun(batch, layout, runStart, runEnd, runX, baseline, color, runStyle, rampStart, rampEnd);
             if (bold) {
                 // The extra passes must repeat the gradient rather than draw the run in one flat colour:
                 // a solid overlay a couple of pixels off covers the bands at every glyph's left edge, which
@@ -8713,7 +8757,7 @@ public class CodeEditor extends Widget {
                 for (int i = 1; i <= passes; i++) {
                     drawGradientTextRun(
                         batch, layout, runStart, runEnd, runX + passOffset(boldOffset, passes, i), baseline,
-                        color, runStyle
+                        color, runStyle, rampStart, rampEnd
                     );
                 }
             }
@@ -8790,7 +8834,14 @@ public class CodeEditor extends Widget {
      * <p>An image taller than the row is scaled to fit with its aspect ratio held, and the centred position
      * is clamped to the row, so no image can paint the row above or below.
      */
-    private void drawInlineImage(Batch batch, InlineImage image, float x, float capTop, float rowBottom) {
+    private void drawInlineImage(
+        Batch batch,
+        InlineImage image,
+        float x,
+        float columnWidth,
+        float capTop,
+        float rowBottom
+    ) {
         if (image == null || image.region == null) {
             return;
         }
@@ -8805,21 +8856,26 @@ public class CodeEditor extends Widget {
         // band wider than the ink, so it is clamped rather than trusted.
         float descent = Math.min(0f, style.font.getDescent());
         float inkCentre = fontBaseline + (capHeight + descent) / 2f;
-        float drawWidth = image.width;
-        float drawHeight = image.height;
+        // Image sizes are declared at 100% zoom and scale with the text, the same way the column advance
+        // does, so an icon keeps its size relative to the letters beside it at every zoom level.
+        float drawWidth = Math.max(0f, image.width * zoomScale);
+        float drawHeight = Math.max(0f, image.height * zoomScale);
         float rowTop = rowBottom + lineHeight;
         if (drawHeight > lineHeight && drawHeight > 0f) {
             float scale = lineHeight / drawHeight;
             drawHeight = lineHeight;
-            drawWidth = image.width * scale;
+            drawWidth *= scale;
         }
-        float drawY = inkCentre - drawHeight / 2f - image.baselineOffset;
+        // A shrunken image stays centred in the column the layout measured for it, so the caret and the
+        // hit area still bracket the picture.
+        float drawX = x + (columnWidth - drawWidth) / 2f;
+        float drawY = inkCentre - drawHeight / 2f - image.baselineOffset * zoomScale;
         if (drawY < rowBottom) {
             drawY = rowBottom;
         } else if (drawY + drawHeight > rowTop) {
             drawY = rowTop - drawHeight;
         }
-        batch.draw(image.region, x, drawY, drawWidth, drawHeight);
+        batch.draw(image.region, drawX, drawY, drawWidth, drawHeight);
         batch.setPackedColor(previous);
     }
 
@@ -8831,12 +8887,12 @@ public class CodeEditor extends Widget {
      * each with the font set to one colour. Band columns are found by walking the prefix widths forward,
      * which is linear across the whole run rather than a binary search per band.
      *
-     * <p><b>Known limitation: the ramp restarts at a tab or image column.</b> {@link #drawText} splits a
-     * token at those columns and calls this per stretch, and each stretch derives its own band count and
-     * samples colour from its own left edge, so a gradient heading with an emoji in it runs back toward
-     * the start colour on the far side of the icon. A continuous ramp needs the token's total width and
-     * this stretch's offset in it — two values the split loop has, but does not yet hand down. The
-     * decorations are drawn across the whole token, so only the colour ramp is affected.
+     * <p>The ramp is laid over the whole token, {@code rampStart..rampEnd}, rather than over the stretch
+     * being drawn. {@link #drawText} splits a token at tabs, images and unsupported glyphs, and a soft wrap
+     * splits it across rows; every stretch places its glyphs in the same token-wide bands, so a gradient
+     * heading with an emoji in it, or one that wraps, keeps running toward its end colour instead of
+     * restarting on the far side of each break. A glyph takes the colour of the band its centre falls
+     * in, and consecutive glyphs of one band are drawn in a single call.
      */
     private void drawGradientTextRun(
         Batch batch,
@@ -8846,47 +8902,48 @@ public class CodeEditor extends Widget {
         float runX,
         float baseline,
         Color startColor,
-        CodeTextStyle runStyle
+        CodeTextStyle runStyle,
+        int rampStart,
+        int rampEnd
     ) {
         float[] widths = layout.prefixWidths;
         String text = layout.text;
         float runStartWidth = widths[runStart];
-        float runWidth = widths[runEnd] - runStartWidth;
-        if (runWidth <= 0f) {
+        if (widths[runEnd] - runStartWidth <= 0f) {
             return;
         }
-        int bandCount = Math.max(1, (int) Math.ceil(runWidth / Math.max(1f, style.gradientBandWidth)));
+        int safeRampStart = Math.max(0, Math.min(rampStart, runStart));
+        int safeRampEnd = Math.min(text.length(), Math.max(rampEnd, runEnd));
+        float rampStartWidth = widths[safeRampStart];
+        float rampWidth = widths[safeRampEnd] - rampStartWidth;
+        if (rampWidth <= 0f) {
+            return;
+        }
+        int bandCount = Math.max(1, (int) Math.ceil(rampWidth / Math.max(1f, style.gradientBandWidth)));
+        float bandWidth = rampWidth / bandCount;
         Color endColor = runStyle.gradientEndColor;
-        int bandStart = runStart;
-        int column = runStart;
-        for (int band = 0; band < bandCount; band++) {
-            float targetWidth = runWidth * (band + 1) / bandCount;
-            while (column < runEnd && widths[column + 1] - runStartWidth < targetWidth) {
-                column++;
+        int groupStart = runStart;
+        int groupBand = -1;
+        for (int column = runStart; column <= runEnd; column++) {
+            int band = groupBand;
+            if (column < runEnd && !(column > groupStart && Character.isLowSurrogate(text.charAt(column)))) {
+                // A low surrogate stays with its high half, so a pair is never split across two colours.
+                float centre = (widths[column] + widths[column + 1]) * 0.5f - rampStartWidth;
+                band = Math.max(0, Math.min(bandCount - 1, (int) (centre / bandWidth)));
             }
-            if (band == bandCount - 1) {
-                // The width walk stops one column short of the end because the last prefix width equals
-                // the target rather than exceeding it; clamping here is what makes the bands tile the run.
-                column = runEnd;
-            } else if (column < runEnd && Character.isLowSurrogate(text.charAt(column))) {
-                // A boundary between the two chars of a surrogate pair would split one glyph across two
-                // colours. Backing it up leaves the pair whole in the next band; a pair that starts at
-                // bandStart is then absorbed there, which is the same absorption as an over-wide glyph.
-                column = Math.max(bandStart, column - 1);
+            if (column == runEnd || (band != groupBand && groupBand >= 0)) {
+                if (column > groupStart && groupBand >= 0) {
+                    // Sample at the band's middle, so each glyph is the colour its band's centre should be.
+                    float sample = (groupBand + 0.5f) / bandCount;
+                    style.font.setColor(scratchGradientColor.set(startColor).lerp(endColor, sample));
+                    // Prefix widths are the only source of truth for where a column is, so each group is
+                    // placed from them instead of from where the previous draw call stopped.
+                    float groupX = runX + widths[groupStart] - runStartWidth;
+                    style.font.draw(batch, text, groupX, baseline, groupStart, column, 0f, Align.left, false);
+                }
+                groupStart = column;
             }
-            if (column <= bandStart) {
-                // A glyph wider than a band absorbs several bands; nothing to draw for the empty ones.
-                continue;
-            }
-            // Sample at the band's middle so each drawn segment is the colour its centre should have.
-            float sample = (band + 0.5f) / bandCount;
-            style.font.setColor(scratchGradientColor.set(startColor).lerp(endColor, sample));
-            // Each band starts where the previous one ended in x, not at the run's left edge — the
-            // prefix widths are the only source of truth for where a column is, so a band that skipped
-            // an over-wide glyph must skip its width too, and the draw call has no other way to know.
-            float bandX = runX + widths[bandStart] - runStartWidth;
-            style.font.draw(batch, text, bandX, baseline, bandStart, column, 0f, Align.left, false);
-            bandStart = column;
+            groupBand = band;
         }
     }
 
@@ -11113,12 +11170,12 @@ public class CodeEditor extends Widget {
             return getTabWidth();
         }
         if (glyphWidthCache.containsKey(character)) {
-            return glyphWidthCache.get(character, style.font.getSpaceXadvance());
+            return glyphWidthCache.get(character, 0f);
         }
-        BitmapFont.Glyph glyph = style.font.getData().getGlyph(character);
+        BitmapFont.Glyph glyph = fontGlyph(character);
         float width;
         if (glyph == null) {
-            width = Math.max(6f, style.font.getSpaceXadvance() * zoomScale);
+            width = unsupportedGlyphAdvance();
         } else {
             width = Math.max(1f, glyph.xadvance * getEffectiveFontScaleX());
         }
@@ -11158,7 +11215,9 @@ public class CodeEditor extends Widget {
         if (inlineImageProvider != null && !passwordMode) {
             InlineImage image = inlineImageProvider.imageAt(line, index, text);
             if (image != null) {
-                return Math.max(0f, image.width);
+                // Declared at 100% zoom, like a glyph's advance, so the column grows and shrinks with the
+                // text; hit testing, wrapping and the drawn picture all read this same scaled number.
+                return Math.max(0f, image.width * zoomScale);
             }
             if (isTrailingImageSurrogate(line, text, index)) {
                 // The image drawn at the high surrogate of this pair already covers both columns, so the
@@ -11241,10 +11300,10 @@ public class CodeEditor extends Widget {
             return glyphAdvanceCache.get(cacheKey, 0f);
         }
 
-        BitmapFont.Glyph glyph = style.font.getData().getGlyph(current);
+        BitmapFont.Glyph glyph = fontGlyph(current);
         float advance;
         if (glyph == null) {
-            advance = Math.max(6f, style.font.getSpaceXadvance() * getEffectiveFontScaleX());
+            advance = unsupportedGlyphAdvance();
         } else {
             advance = glyph.xadvance * getEffectiveFontScaleX();
             if (next != 0) {
@@ -11254,6 +11313,36 @@ public class CodeEditor extends Widget {
         }
         glyphAdvanceCache.put(cacheKey, advance);
         return advance;
+    }
+
+    /**
+     * The glyph a {@link BitmapFont} actually lays out for {@code character}: its own glyph, or the font's
+     * {@code missingGlyph} replacement when it has one. Measuring the replacement keeps the caret, hit
+     * tests and wrap in step with what the font draws for an unsupported character.
+     */
+    private BitmapFont.Glyph fontGlyph(char character) {
+        BitmapFont.BitmapFontData data = style.font.getData();
+        BitmapFont.Glyph glyph = data.getGlyph(character);
+        return glyph != null ? glyph : data.missingGlyph;
+    }
+
+    /** True when the font has neither a glyph nor a replacement, so it would silently skip the char. */
+    private boolean isSkippedByFont(char character) {
+        BitmapFont.BitmapFontData data = style.font.getData();
+        return data.missingGlyph == null && data.getGlyph(character) == null;
+    }
+
+    /**
+     * Space reserved for a character the font cannot draw at all: one space advance at the current zoom.
+     * {@code spaceXadvance} is stored already multiplied by whatever scale the font holds at the moment
+     * (its base scale outside a draw, the zoomed one inside), so that scale is divided back out before
+     * the editor's own effective scale is applied; multiplying the stored value directly counted the
+     * font's base scale twice.
+     */
+    private float unsupportedGlyphAdvance() {
+        BitmapFont.BitmapFontData data = style.font.getData();
+        float unscaledSpace = data.spaceXadvance / Math.max(0.0001f, Math.abs(data.scaleX));
+        return Math.max(1f, unscaledSpace * getEffectiveFontScaleX());
     }
 
     private float getTabWidth() {

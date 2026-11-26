@@ -86,6 +86,8 @@ public class CodeEditorRenderingTest {
 
     private void draw() {
         recording.rects.clear();
+        recording.images.clear();
+        recording.glyphs.clear();
         recording.events.clear();
         rows.clear();
         editor.draw(recording.batch, 1f);
@@ -583,6 +585,184 @@ public class CodeEditorRenderingTest {
         assertEquals(original, recording.batch.getPackedColor(), 0f);
     }
 
+    @Test public void inlineImageDimensionsAndSurrogateHitAreaFollowZoom() {
+        InlineImage image = new InlineImage(new TextureRegion(pixel), 20f, 12f, 1f);
+        editor.setInlineImageProvider((line, column, text) -> text.charAt(column) == '\uD83D' ? image : null);
+        captureRows();
+        for (float zoom : new float[]{1f, 2f, 0.5f}) {
+            editor.setZoomScale(zoom);
+            draw("a\uD83D\uDE00b");
+            Row row = rows.first();
+            Rect actual = recording.images.first();
+            assertEquals(20f * zoom, row.xs[3] - row.xs[1], 0.001f);
+            assertEquals(20f * zoom, actual.width, 0.001f);
+            assertEquals(12f * zoom, actual.height, 0.001f);
+            float localY = row.bottom - editor.getY() + row.height / 2f;
+            InlineImageHit hit = editor.getInlineImageAt(actual.x - editor.getX() + actual.width * 0.9f, localY);
+            assertNotNull(hit);
+            assertEquals(1, hit.column);
+            assertNull(editor.getInlineImageAt(row.xs[3] - editor.getX() + 1f, localY));
+            assertEquals(3, editor.getPositionAtLocal(actual.x - editor.getX() + actual.width * 0.9f, localY, false).column);
+        }
+    }
+
+    @Test public void oversizedInlineImageStaysCenteredInItsMeasuredZoomedColumn() {
+        InlineImage image = new InlineImage(new TextureRegion(pixel), 40f, 80f, 100f);
+        editor.setInlineImageProvider((line, column, text) -> text.charAt(column) == '*' ? image : null);
+        editor.setZoomScale(2f);
+        captureRows();
+        draw("a*b");
+        Row row = rows.first();
+        Rect actual = recording.images.first();
+        assertEquals(80f, row.xs[2] - row.xs[1], 0.001f);
+        assertEquals(row.height, actual.height, 0.001f);
+        assertEquals(actual.height / 2f, actual.width, 0.001f);
+        assertEquals((row.xs[1] + row.xs[2] - actual.width) / 2f, actual.x, 0.001f);
+        assertEquals(row.bottom, actual.y, 0.001f);
+    }
+
+    @Test public void imageZoomChangesWrappingAndKeepsFollowingTextAligned() {
+        InlineImage image = new InlineImage(new TextureRegion(pixel), 40f, 12f, 0f);
+        editor.setInlineImageProvider((line, column, text) -> text.charAt(column) == '*' ? image : null);
+        editor.setWrapEnabled(true);
+        editor.setSize(180f, 480f);
+        captureRows();
+        draw("*ab*ab*ab*ab");
+        int before = rows.size;
+        editor.setZoomScale(2f);
+        draw();
+        assertTrue(rows.size > before);
+        for (Row row : rows) {
+            for (int column = row.start; column < row.end; column++) {
+                if (row.text.charAt(column) == '*') {
+                    assertEquals(80f, row.xs[column - row.start + 1] - row.xs[column - row.start], 0.001f);
+                }
+            }
+        }
+    }
+
+    @Test public void preScaledFontUsesItsActualHeightAndRestoresBothScales() {
+        BitmapFont font = editor.getStyle().font;
+        font.getData().setScale(1.5f, 2f);
+        editor.setStyle(editor.getStyle());
+        assertEquals(32f + editor.getStyle().rowPadding, editor.getLineHeight(), 0.001f);
+        editor.setZoomScale(0.5f);
+        assertEquals(16f + editor.getStyle().rowPadding, editor.getLineHeight(), 0.001f);
+        draw("one\ntwo");
+        assertEquals(1.5f, font.getData().scaleX, 0f);
+        assertEquals(2f, font.getData().scaleY, 0f);
+    }
+
+    @Test public void missingGlyphUsesTheFontsReplacementAdvanceAndKerning() {
+        BitmapFont font = editor.getStyle().font;
+        BitmapFont.Glyph replacement = new BitmapFont.Glyph();
+        replacement.xadvance = 13;
+        replacement.width = 13;
+        replacement.height = 12;
+        replacement.setKerning('b', -2);
+        font.getData().missingGlyph = replacement;
+        font.getData().setScale(1.5f, 2f);
+        editor.setStyle(editor.getStyle());
+        editor.setZoomScale(2f);
+        captureRows();
+        draw("a\u2603b");
+        Row row = rows.first();
+        assertEquals(33f, row.xs[2] - row.xs[1], 0.001f);
+        GlyphDraw following = glyphAt(row.xs[2], row.bottom, row.height);
+        assertNotNull("the glyph after the replacement matches the measured caret column", following);
+    }
+
+    @Test public void unsupportedCharactersReserveStableSpaceWhenTheFontHasNoReplacement() {
+        BitmapFont font = editor.getStyle().font;
+        font.getData().setScale(1.5f, 2f);
+        editor.setStyle(editor.getStyle());
+        editor.setZoomScale(2f);
+        captureRows();
+        draw("a\u2603b");
+        Row row = rows.first();
+        assertEquals(24f, row.xs[2] - row.xs[1], 0.001f);
+        assertNotNull("skipped font glyph must not pull the next character left", glyphAt(row.xs[2], row.bottom, row.height));
+        float advance = row.xs[2] - row.xs[1];
+        font.getData().setScale(3f, 4f);
+        editor.setHighlighter(BuiltinCodeHighlighters.plainText());
+        draw();
+        assertEquals(advance, rows.first().xs[2] - rows.first().xs[1], 0.001f);
+    }
+
+    @Test public void unsupportedSpacesKeepTabsAndRulersAtTheSameZoomedStops() {
+        BitmapFont.BitmapFontData data = editor.getStyle().font.getData();
+        data.setGlyph(' ', null);
+        data.setScale(1.5f);
+        editor.setStyle(editor.getStyle());
+        editor.setZoomScale(2f);
+        editor.setColumnRulers(4);
+        captureRows();
+        draw(" \ta");
+        Row row = rows.first();
+        assertEquals(24f, row.xs[1] - row.xs[0], 0.001f);
+        assertEquals(row.xs[2], marks(editor.getStyle().columnRulerColor, false).first().x, 0.001f);
+    }
+
+    @Test public void gradientContinuesAcrossTabAndImageGaps() {
+        gradientStyle(CodeTextStyle.GRADIENT);
+        InlineImage image = new InlineImage(new TextureRegion(pixel), 24f, 12f, 0f);
+        editor.setInlineImageProvider((line, column, text) -> text.charAt(column) == '*' ? image : null);
+        captureRows();
+        draw("ab\tcd*ef");
+        Row row = rows.first();
+        assertTrue(glyphAt(row.xs[0], row.bottom, row.height).color.b < 0.2f);
+        assertTrue(glyphAt(row.xs[6], row.bottom, row.height).color.b > 0.8f);
+        assertGradientSamples(row);
+    }
+
+    @Test public void gradientContinuesAcrossWrappedRowsAndBoldPassesKeepTheirColors() {
+        gradientStyle(CodeTextStyle.GRADIENT | CodeTextStyle.BOLD | CodeTextStyle.ITALIC);
+        editor.getStyle().fakeBoldOffset = 2f;
+        editor.setWrapEnabled(true);
+        editor.setSize(180f, 480f);
+        captureRows();
+        draw("abcdefghijklmnopqrstuvwxyz");
+        assertTrue(rows.size > 1);
+        for (Row row : rows) assertGradientSamples(row);
+        assertTrue(recording.glyphs.size >= 26 * 3);
+    }
+
+    private void gradientStyle(int flags) {
+        editor.getStyle().gradientBandWidth = 1f;
+        editor.setHighlighter((lines, style) -> {
+            Array<Array<CodeHighlightSpan>> result = new Array<>();
+            for (String line : lines) result.add(Array.with(new CodeHighlightSpan(0, line.length(), Color.RED,
+                new CodeTextStyle(flags, null, null, Color.BLUE))));
+            return result;
+        });
+    }
+
+    private void assertGradientSamples(Row row) {
+        float total = 0f;
+        for (Row visible : rows) total += visible.xs[visible.xs.length - 1] - visible.xs[0];
+        float before = 0f;
+        for (Row visible : rows) {
+            if (visible == row) break;
+            before += visible.xs[visible.xs.length - 1] - visible.xs[0];
+        }
+        for (int column = row.start; column < row.end; column++) {
+            char ch = row.text.charAt(column);
+            if (ch == '\t' || ch == '*') continue;
+            int offset = column - row.start;
+            GlyphDraw glyph = glyphAt(row.xs[offset], row.bottom, row.height);
+            assertNotNull(glyph);
+            float sample = (before + (row.xs[offset] + row.xs[offset + 1]) / 2f - row.x) / total;
+            assertEquals("gradient uses the full token width at column " + column, sample, glyph.color.b, 0.008f);
+        }
+    }
+
+    private GlyphDraw glyphAt(float x, float bottom, float height) {
+        for (GlyphDraw glyph : recording.glyphs) {
+            if (Math.abs(glyph.x - x) < 0.01f && glyph.y >= bottom && glyph.y < bottom + height) return glyph;
+        }
+        return null;
+    }
+
     private CodeEditorRowRenderer eventRenderer(final String name) {
         return new CodeEditorRowRenderer() {
             @Override public void drawBackground(Batch batch, CodeEditorRowRenderContext row) { recording.events.add(name + "-bg"); }
@@ -623,6 +803,8 @@ public class CodeEditorRenderingTest {
     private static final class RecordingBatch {
         final Color color = new Color(Color.WHITE);
         final Array<Rect> rects = new Array<>();
+        final Array<Rect> images = new Array<>();
+        final Array<GlyphDraw> glyphs = new Array<>();
         final Array<String> events = new Array<>();
         final Matrix4 matrix = new Matrix4();
         float imageTint;
@@ -638,8 +820,15 @@ public class CodeEditorRenderingTest {
             }
             if (name.equals("getTransformMatrix") || name.equals("getProjectionMatrix")) return matrix;
             if (name.equals("draw")) {
-                if (args[1] instanceof float[]) events.add("text");
-                else if (args.length == 5 && args[0] instanceof TextureRegion) imageTint = color.toFloatBits();
+                if (args[1] instanceof float[]) {
+                    events.add("text");
+                    float[] vertices = (float[]) args[1];
+                    int end = (Integer) args[2] + (Integer) args[3];
+                    for (int at = (Integer) args[2]; at < end; at += 20) glyphs.add(new GlyphDraw(vertices, at));
+                } else if (args.length == 5 && args[0] instanceof TextureRegion) {
+                    imageTint = color.toFloatBits();
+                    images.add(new Rect(color, (Float) args[1], (Float) args[2], (Float) args[3], (Float) args[4], false));
+                }
                 else if (args.length == 5 && args[0] instanceof Texture) {
                     rects.add(new Rect(color, (Float) args[1], (Float) args[2], (Float) args[3], (Float) args[4], false));
                 } else if (args.length == 10 && args[0] instanceof TextureRegion) {
@@ -648,6 +837,15 @@ public class CodeEditorRenderingTest {
             }
             return defaultValue(method.getReturnType());
         });
+    }
+
+    private static final class GlyphDraw {
+        final float x, y;
+        final Color color = new Color();
+        GlyphDraw(float[] vertices, int at) {
+            x = vertices[at]; y = vertices[at + 1];
+            Color.abgr8888ToColor(color, vertices[at + 2]);
+        }
     }
 
     private static Object defaultValue(Class<?> type) {

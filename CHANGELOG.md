@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+## v1.5.1 — 2026-11-26
+
+### Fixed
+
+- Inline images now scale with zoom. Their width was used as a fixed advance while the surrounding text
+  grew or shrank, so at 2x zoom icons were half-size, wrapping was computed from the wrong widths, and
+  hit areas no longer matched the text. Width, height and baseline offset are now declared at 100% zoom
+  and multiplied by the zoom scale for measurement, hit testing, wrapping and drawing alike. Images
+  shrunk to fit the row stay centred in their measured column.
+- Fonts that already carry a scale (for example a skin font set to 1.5x/2x) got rows sized for the
+  unscaled font, so taller glyphs overlapped neighbouring rows. Row height now uses the font's actual
+  line height at 100% zoom.
+- Characters the font cannot draw are measured consistently: the font's `missingGlyph` replacement is
+  used for advance and kerning when present, and the fallback space reservation no longer applies the
+  font's base scale twice. When the font has no replacement, the character is skipped during drawing at
+  its measured width, so following glyphs no longer drift left of the caret and hit-test columns.
+- `GRADIENT` text keeps one continuous ramp across the whole token. Previously it restarted after every
+  tab, inline image or soft wrap, and wrapped headings reset to the start colour on each row. Fake-bold
+  passes repeat the same per-glyph colours.
+
+### Validation and distribution
+
+- All 570 core tests passed across 46 classes, including 9 new rendering regressions that record actual
+  image rectangles and glyph vertex positions/colours under zoom, pre-scaled fonts, missing glyphs,
+  unsupported spaces with tabs/rulers, and gradients across tabs, images, wraps and bold passes.
+- Core build and local Maven publication, desktop and Android Java compilation, and the hidden-window
+  OpenGL reference sheet passed; the snapshot was visually inspected.
+- Physical Android rendering/touch behavior and IME composition still require device validation.
+- Git tag and JitPack version: `v1.5.1`; Gradle publication version: `1.5.1`.
+
 ## v1.5.0 — 2026-11-26
 
 ### Added
