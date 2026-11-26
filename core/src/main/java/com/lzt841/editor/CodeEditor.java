@@ -373,6 +373,15 @@ public class CodeEditor extends Widget {
     /** Sampled colour of the current gradient band; reused because a gradient run draws one per band. */
     private final Color scratchGradientColor = new Color();
     /**
+     * The actor colour times the parent alpha for the draw in progress. Every colour the editor sets is
+     * multiplied by it, so fading or tinting a parent fades or tints the editor like any Scene2D widget.
+     */
+    private final Color drawTint = new Color(Color.WHITE);
+    /** Whether {@link #drawTint} is opaque white, the common case that needs no per-colour multiply. */
+    private boolean drawTintIdentity = true;
+    /** Result of {@link #tinted(Color)}; reused because every decoration asks for one. */
+    private final Color scratchDrawColor = new Color();
+    /**
      * The three matrices a fake italic needs: the projection as it was, the same projection sheared, and
      * the shear itself. All three are reused rather than allocated per italic run.
      */
@@ -4175,6 +4184,21 @@ public class CodeEditor extends Widget {
 
     @Override
     public void draw(Batch batch, float parentAlpha) {
+        Color actorColor = getColor();
+        drawTint.set(actorColor.r, actorColor.g, actorColor.b, actorColor.a * parentAlpha);
+        drawTintIdentity = drawTint.r == 1f && drawTint.g == 1f && drawTint.b == 1f && drawTint.a == 1f;
+        // Scene2D leaves the previous sibling's batch colour in place, so the editor sets its own tint for
+        // drawables and images and gives the caller its colour back afterwards.
+        float callerColor = batch.getPackedColor();
+        batch.setColor(drawTint);
+        try {
+            drawTintedContent(batch);
+        } finally {
+            batch.setPackedColor(callerColor);
+        }
+    }
+
+    private void drawTintedContent(Batch batch) {
         flushPendingContentChanges();
         ensureLayout();
         float originalScaleX = style.font.getData().scaleX;
@@ -7923,7 +7947,7 @@ public class CodeEditor extends Widget {
         BracketMatch bracketMatch = getBracketMatch();
 
         if (document.getLineCount() == 1 && document.getLineLength(0) == 0 && !isFocused() && !messageText.isEmpty()) {
-            style.font.setColor(style.messageFontColor);
+            setFontColor(style.messageFontColor);
             style.font.draw(batch, messageText, getX() + getTextRenderX(), getTextBaseline(getY() + rowBottom(0)));
         }
 
@@ -7981,7 +8005,7 @@ public class CodeEditor extends Widget {
                 }
                 drawCollapsedFoldPlaceholderSelection(batch, selection, region, collapsedDisplay, badgeX, rowBottom);
                 if (!collapsedText.isEmpty()) {
-                    style.font.setColor(style.gutterFontColor);
+                    setFontColor(style.gutterFontColor);
                     style.font.draw(batch, collapsedText, badgeX, baseline);
                 }
                 if (collapsedDisplay.hasSuffix()) {
@@ -8112,7 +8136,7 @@ public class CodeEditor extends Widget {
         if (length <= 0f) return;
         float packed = batch.getPackedColor();
         try {
-            batch.setColor(style.whitespaceColor);
+            batch.setColor(tinted(style.whitespaceColor));
             batch.draw(whitePixelRegion(), x1, y1 - thickness * 0.5f, 0f, thickness * 0.5f,
                 length, thickness, 1f, 1f, MathUtils.radiansToDegrees * (float) Math.atan2(dy, dx));
         } finally {
@@ -8296,7 +8320,7 @@ public class CodeEditor extends Widget {
             int segment = row - visualRowStartOf(line);
             float rowBottom = getY() + rowBottom(row);
             float baseline = getTextBaseline(rowBottom);
-            style.font.setColor(style.gutterFontColor);
+            setFontColor(style.gutterFontColor);
             if (segment == 0) {
                 drawGutterMarks(batch, line, rowBottom);
                 drawFoldIndicator(batch, line, rowBottom, baseline);
@@ -8431,7 +8455,7 @@ public class CodeEditor extends Widget {
             return;
         }
         if (display.suffixLine < 0 || display.suffixLine >= document.getLineCount()) {
-            style.font.setColor(style.fontColor);
+            setFontColor(style.fontColor);
             style.font.draw(batch, display.suffixText, x, baseline);
             return;
         }
@@ -8497,6 +8521,21 @@ public class CodeEditor extends Widget {
                     tintColor(mark.color, style.lineMarkHighlightAlpha));
             }
         }
+    }
+
+    /** {@code color} multiplied by the actor colour and parent alpha of the draw in progress. */
+    private Color tinted(Color color) {
+        if (drawTintIdentity || color == null) {
+            return color;
+        }
+        return scratchDrawColor.set(
+            color.r * drawTint.r, color.g * drawTint.g, color.b * drawTint.b, color.a * drawTint.a
+        );
+    }
+
+    /** Sets the font colour through {@link #tinted(Color)}, so text fades with the rest of the editor. */
+    private void setFontColor(Color color) {
+        style.font.setColor(tinted(color));
     }
 
     /** A copy of {@code color} at {@code alpha}, for tints that must not obscure the text. */
@@ -8598,7 +8637,7 @@ public class CodeEditor extends Widget {
         CodeTextStyle runStyle = textStyle != null ? textStyle : CodeTextStyle.PLAIN;
         boolean drawingImages = inlineImageProvider != null && !passwordMode;
         if (runStyle.flags == CodeTextStyle.NONE && !drawingImages) {
-            style.font.setColor(color);
+            setFontColor(color);
             String text = layout.text;
             int runStart = start;
             float runX = x;
@@ -8762,7 +8801,7 @@ public class CodeEditor extends Widget {
                 }
             }
         } else {
-            style.font.setColor(color);
+            setFontColor(color);
             style.font.draw(batch, layout.text, runX, baseline, runStart, runEnd, 0f, Align.left, false);
             if (bold) {
                 // A real bold face is not a regular glyph with a second one laid beside it: it is one
@@ -8848,7 +8887,7 @@ public class CodeEditor extends Widget {
         float previous = batch.getPackedColor();
         // Text drawing leaves the batch colour alone, but a decoration just before this may have set one;
         // an image has its own colours and must not inherit the last underline's.
-        batch.setColor(Color.WHITE);
+        batch.setColor(drawTint);
         // The font's scale is set for the whole draw call, so its metrics are already in editor pixels.
         float capHeight = style.font.getCapHeight();
         float fontBaseline = capTop - capHeight;
@@ -8935,7 +8974,7 @@ public class CodeEditor extends Widget {
                 if (column > groupStart && groupBand >= 0) {
                     // Sample at the band's middle, so each glyph is the colour its band's centre should be.
                     float sample = (groupBand + 0.5f) / bandCount;
-                    style.font.setColor(scratchGradientColor.set(startColor).lerp(endColor, sample));
+                    setFontColor(scratchGradientColor.set(startColor).lerp(endColor, sample));
                     // Prefix widths are the only source of truth for where a column is, so each group is
                     // placed from them instead of from where the previous draw call stopped.
                     float groupX = runX + widths[groupStart] - runStartWidth;
@@ -9036,7 +9075,7 @@ public class CodeEditor extends Widget {
             return;
         }
         float previous = batch.getPackedColor();
-        batch.setColor(color);
+        batch.setColor(tinted(color));
         batch.draw(style.whitePixelTexture, x, y, width, height);
         batch.setPackedColor(previous);
     }
@@ -9072,7 +9111,7 @@ public class CodeEditor extends Widget {
         float safeAmplitude = Math.max(0f, amplitude);
         float safeThickness = Math.max(1f, thickness);
         float previous = batch.getPackedColor();
-        batch.setColor(color);
+        batch.setColor(tinted(color));
         // The wave is a cosine sampled often enough that a chord is under two pixels. The peaks of a
         // two-chord zig-zag are what makes a wavy underline read as jagged — the eye sees the corner
         // where the zig meets the zag — and short chords round the peaks off without the wave having
@@ -9131,7 +9170,7 @@ public class CodeEditor extends Widget {
         // a short run shows a partial mark rather than overrunning the next column.
         float cycle = safeMark + safeGap;
         float previous = batch.getPackedColor();
-        batch.setColor(color);
+        batch.setColor(tinted(color));
         int marks = (int) Math.ceil(width / cycle);
         for (int i = 0; i < marks; i++) {
             float markX = x + i * cycle;
@@ -9407,7 +9446,7 @@ public class CodeEditor extends Widget {
         float previousG = previous.g;
         float previousB = previous.b;
         float previousA = previous.a;
-        batch.setColor(color);
+        batch.setColor(tinted(color));
         batch.draw(style.whitePixelTexture, x, y, width, height);
         batch.setColor(previousR, previousG, previousB, previousA);
         return true;
@@ -10445,7 +10484,7 @@ public class CodeEditor extends Widget {
         float previousG = previous.g;
         float previousB = previous.b;
         float previousA = previous.a;
-        batch.setColor(color);
+        batch.setColor(tinted(color));
         batch.draw(style.whitePixelTexture, x, y, width, height);
         batch.setColor(previousR, previousG, previousB, previousA);
     }
@@ -12310,7 +12349,16 @@ public class CodeEditor extends Widget {
                 return;
             }
             Vector2 stageOrigin = getStageOrigin();
-            drawSelectionHandles(batch, stageOrigin.x, stageOrigin.y);
+            // The overlay sits on the stage root, outside the editor's parents, so it borrows the tint the
+            // editor was last drawn with and fades together with it.
+            Color own = getColor();
+            float callerColor = batch.getPackedColor();
+            batch.setColor(drawTint.r * own.r, drawTint.g * own.g, drawTint.b * own.b, drawTint.a * own.a * parentAlpha);
+            try {
+                drawSelectionHandles(batch, stageOrigin.x, stageOrigin.y);
+            } finally {
+                batch.setPackedColor(callerColor);
+            }
         }
 
         private boolean shouldHandleOverlayTouch(int button) {
@@ -13051,7 +13099,7 @@ public class CodeEditor extends Widget {
                         float previousG = previous.g;
                         float previousB = previous.b;
                         float previousA = previous.a;
-                        batch.setColor(tint);
+                        batch.setColor(tint.r * previousR, tint.g * previousG, tint.b * previousB, tint.a * previousA);
                         batch.draw(pixel, x, y, width, height);
                         batch.setColor(previousR, previousG, previousB, previousA);
                     }
@@ -13088,10 +13136,10 @@ public class CodeEditor extends Widget {
                         float previousG = previous.g;
                         float previousB = previous.b;
                         float previousA = previous.a;
-                        batch.setColor(fill);
+                        batch.setColor(fill.r * previousR, fill.g * previousG, fill.b * previousB, fill.a * previousA);
                         batch.draw(pixel, x, y, width, height);
                         float actualBorder = Math.max(1f, Math.min(borderWidth, width));
-                        batch.setColor(border);
+                        batch.setColor(border.r * previousR, border.g * previousG, border.b * previousB, border.a * previousA);
                         batch.draw(pixel, x + width - actualBorder, y, actualBorder, height);
                         batch.setColor(previousR, previousG, previousB, previousA);
                     }
@@ -13183,7 +13231,7 @@ public class CodeEditor extends Widget {
                 float previousG = previous.g;
                 float previousB = previous.b;
                 float previousA = previous.a;
-                batch.setColor(color);
+                batch.setColor(color.r * previousR, color.g * previousG, color.b * previousB, color.a * previousA);
                 batch.draw(pixel, x, y, width, height);
                 batch.setColor(previousR, previousG, previousB, previousA);
             }
@@ -13195,10 +13243,10 @@ public class CodeEditor extends Widget {
                 float previousG = previous.g;
                 float previousB = previous.b;
                 float previousA = previous.a;
-                float colorFloatBits = color.toFloatBits();
+                float colorFloatBits = Color.toFloatBits(color.r * previousR, color.g * previousG, color.b * previousB, color.a * previousA);
                 float x4=(x2+x3)/2;
                 float y4=(y2+y3)/2;
-                batch.setColor(color);
+                batch.setColor(color.r * previousR, color.g * previousG, color.b * previousB, color.a * previousA);
                 triangle[0] = x1;
                 triangle[1] = y1;
                 triangle[2] = colorFloatBits;
@@ -13232,7 +13280,7 @@ public class CodeEditor extends Widget {
                 float previousG = previous.g;
                 float previousB = previous.b;
                 float previousA = previous.a;
-                batch.setColor(color);
+                batch.setColor(color.r * previousR, color.g * previousG, color.b * previousB, color.a * previousA);
                 int steps = Math.max(8, Math.round(radius * 2.4f));
                 float diameter = radius * 2f;
                 float stripHeight = diameter / steps;
@@ -13261,7 +13309,7 @@ public class CodeEditor extends Widget {
                 float dy = y2 - y1;
                 float length = (float) Math.sqrt(dx * dx + dy * dy);
                 float angle = (float) Math.toDegrees(Math.atan2(dy, dx));
-                batch.setColor(color);
+                batch.setColor(color.r * previousR, color.g * previousG, color.b * previousB, color.a * previousA);
                 batch.draw(
                     pixel,
                     x1,

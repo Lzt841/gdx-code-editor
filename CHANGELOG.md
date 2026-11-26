@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+## v1.5.2 — 2026-11-26
+
+### Fixed
+
+- The editor now honours Scene2D `parentAlpha` and its actor colour, like other widgets. Fading a
+  parent `Table`/`Window`, or calling `editor.setColor(...)` / `addAction(Actions.fadeOut(...))`,
+  previously left the text, gutter numbers, whitespace markers, rulers, selection, squiggles and inline
+  images fully opaque while only sibling widgets faded. Every colour the editor sets is now multiplied by
+  the actor colour times `parentAlpha`; an opaque white editor keeps its exact style colours.
+- Touch selection handles live on a stage-level overlay and now fade together with the editor that owns
+  them, including the magnifier frame.
+- `CodeCompletionPopup` and `CodeHintPanel` (completion list, documentation, hover and signature hints)
+  apply their own actor colour and `parentAlpha` to backgrounds and text.
+- The built-in default-style drawables multiply their fill by the current batch colour instead of
+  replacing it, so custom skins and the defaults behave the same under fades.
+- The caller's batch colour is restored after drawing, so a tinted sibling drawn earlier no longer leaks
+  into the editor and the editor's tint no longer leaks into the next actor.
+
+### Compatibility
+
+- Row renderer callbacks now see the editor's tint as the batch colour (opaque white unless the editor or
+  a parent is faded or tinted) rather than whatever colour the previous actor left. Renderers that set
+  their own colours are unaffected; to fade with the editor, multiply by `batch.getColor()`.
+- `CodeCompletionPopup` subclasses overriding `drawItem` can call the new protected `setFontColor(Color)`
+  to get the same fade for their text.
+
+### Validation and distribution
+
+- All 573 core tests passed across 46 classes, including 3 new rendering regressions that record glyph
+  vertex colours, image tint, whitespace markers, gutter numbers and the restored caller colour under
+  `parentAlpha` and actor tint, plus hint panel and completion popup fades.
+- Core build and local Maven publication, and desktop and Android Java compilation passed.
+- Git tag and JitPack version: `v1.5.2`; Gradle publication version: `1.5.2`.
+
 ## v1.5.1 — 2026-11-26
 
 ### Fixed

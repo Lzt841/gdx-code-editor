@@ -52,6 +52,7 @@ public class CodeCompletionPopup extends Actor {
 
     private final Array<CodeCompletionItem> items = new Array<>();
     private final GlyphLayout glyphLayout = new GlyphLayout();
+    private final Color drawTint = new Color(Color.WHITE);
     private CodeCompletionPopupStyle style;
     private String prefix = "";
     private int selectedIndex;
@@ -88,6 +89,18 @@ public class CodeCompletionPopup extends Actor {
                 return true;
             }
         });
+    }
+
+    /** Sets the batch to this actor's colour times {@code parentAlpha}; text colours are multiplied by it too. */
+    private void applyTint(Batch batch, float parentAlpha) {
+        Color color = getColor();
+        drawTint.set(color.r, color.g, color.b, color.a * parentAlpha);
+        batch.setColor(drawTint);
+    }
+
+    /** Sets the font colour multiplied by this actor's colour and parent alpha, for use while drawing. */
+    protected void setFontColor(Color color) {
+        style.font.setColor(color.r * drawTint.r, color.g * drawTint.g, color.b * drawTint.b, color.a * drawTint.a);
     }
 
     public void setStyle(CodeCompletionPopupStyle style) {
@@ -249,6 +262,7 @@ public class CodeCompletionPopup extends Actor {
         if (items.size == 0) {
             return;
         }
+        applyTint(batch, parentAlpha);
         if (style.background != null) {
             style.background.draw(batch, getX(), getY(), getWidth(), getHeight());
         }
@@ -296,13 +310,13 @@ public class CodeCompletionPopup extends Actor {
         int matchLength = matchedPrefixLength(item);
         if (matchLength > 0) {
             String head = item.label.substring(0, matchLength);
-            style.font.setColor(style.matchColor);
+            setFontColor(style.matchColor);
             style.font.draw(batch, head, textX, baseline);
             float headWidth = measure(head);
-            style.font.setColor(labelColor);
+            setFontColor(labelColor);
             style.font.draw(batch, item.label.substring(matchLength), textX + headWidth, baseline);
         } else {
-            style.font.setColor(labelColor);
+            setFontColor(labelColor);
             style.font.draw(batch, item.label, textX, baseline);
         }
 
@@ -310,7 +324,7 @@ public class CodeCompletionPopup extends Actor {
             float detailWidth = measure(item.detail);
             float detailX = x + width - style.horizontalPadding - detailWidth;
             if (detailX > textX + measure(item.label) + style.detailGap * 0.5f) {
-                style.font.setColor(style.detailColor);
+                setFontColor(style.detailColor);
                 style.font.draw(batch, item.detail, detailX, baseline);
             }
         }

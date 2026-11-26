@@ -12,7 +12,9 @@ import com.badlogic.gdx.graphics.g2d.Batch;
  *
  * <p>Draw using the current batch and clip. Do not begin/end the batch, change its transform,
  * projection, shader or blending, or modify the document, layout or settings while drawing; defer
- * edits to the next act. Layer registration changes take effect on the next callback pass. Batch
+ * edits to the next act. Layer registration changes take effect on the next callback pass. The batch
+ * colour during a callback is the editor's tint (actor colour times parent alpha); multiply by it to fade
+ * with the editor. Batch
  * tint and the editor font's color/scale are restored even if a callback throws.
  * Renderer and texture lifetimes belong to the host; remove renderers before disposing resources.
  */

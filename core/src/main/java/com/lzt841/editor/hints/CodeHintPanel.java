@@ -40,6 +40,7 @@ public class CodeHintPanel extends Actor {
 
     private final Array<String> wrappedLines = new Array<>();
     private final GlyphLayout glyphLayout = new GlyphLayout();
+    private final Color drawTint = new Color(Color.WHITE);
     private CodeHintPanelStyle style;
     private String text = "";
     private int highlightStart = -1;
@@ -70,6 +71,18 @@ public class CodeHintPanel extends Actor {
         setStyle(style);
         setVisible(false);
         setTouchable(com.badlogic.gdx.scenes.scene2d.Touchable.disabled);
+    }
+
+    /** Sets the batch to this actor's colour times {@code parentAlpha}; text colours are multiplied by it too. */
+    private void applyTint(Batch batch, float parentAlpha) {
+        Color color = getColor();
+        drawTint.set(color.r, color.g, color.b, color.a * parentAlpha);
+        batch.setColor(drawTint);
+    }
+
+    /** Sets the font colour multiplied by this actor's colour and parent alpha, for use while drawing. */
+    private void setFontColor(Color color) {
+        style.font.setColor(color.r * drawTint.r, color.g * drawTint.g, color.b * drawTint.b, color.a * drawTint.a);
     }
 
     public void setStyle(CodeHintPanelStyle style) {
@@ -206,6 +219,7 @@ public class CodeHintPanel extends Actor {
         if (wrappedLines.size == 0) {
             return;
         }
+        applyTint(batch, parentAlpha);
         if (style.background != null) {
             style.background.draw(batch, getX(), getY(), getWidth(), getHeight());
         }
@@ -233,7 +247,7 @@ public class CodeHintPanel extends Actor {
             && localStart < line.length();
 
         if (!hasHighlight) {
-            style.font.setColor(style.textColor);
+            setFontColor(style.textColor);
             style.font.draw(batch, line, x, baseline);
             return;
         }
@@ -246,17 +260,17 @@ public class CodeHintPanel extends Actor {
 
         float cursorX = x;
         if (!head.isEmpty()) {
-            style.font.setColor(style.textColor);
+            setFontColor(style.textColor);
             style.font.draw(batch, head, cursorX, baseline);
             cursorX += measure(head);
         }
         if (!middle.isEmpty()) {
-            style.font.setColor(style.highlightColor);
+            setFontColor(style.highlightColor);
             style.font.draw(batch, middle, cursorX, baseline);
             cursorX += measure(middle);
         }
         if (!tail.isEmpty()) {
-            style.font.setColor(style.textColor);
+            setFontColor(style.textColor);
             style.font.draw(batch, tail, cursorX, baseline);
         }
     }

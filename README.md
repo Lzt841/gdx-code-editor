@@ -100,7 +100,7 @@ Add the dependency:
 
 ```gradle
 dependencies {
-    implementation 'com.github.Lzt841:gdx-code-editor:v1.5.1'
+    implementation 'com.github.Lzt841:gdx-code-editor:v1.5.2'
 }
 ```
 
@@ -113,7 +113,7 @@ repositories {
 }
 
 dependencies {
-    implementation("com.github.Lzt841:gdx-code-editor:v1.5.1")
+    implementation("com.github.Lzt841:gdx-code-editor:v1.5.2")
 }
 ```
 
@@ -967,7 +967,9 @@ Clamp decorations to the reported segment and use the existing clip; content bou
 gutter, but do not include custom scissor insets.
 
 The background callback precedes selection/text; foreground follows text, markers and diagnostics,
-before the caret and gutter. Batch tint and font color/scale are restored after each callback,
+before the caret and gutter. During callbacks the batch colour is the editor's own tint (actor colour
+times parent alpha); multiply your colours by `batch.getColor()` to fade with the editor. Batch tint
+and font color/scale are restored after each callback,
 including exceptions. Callbacks must not edit the document or change batch transform, projection,
 shader, blending or begin/end state. Defer edits to the next `act`. Registration changes are safe
 during callbacks and take effect on the next callback pass; renderer resources belong to the host.

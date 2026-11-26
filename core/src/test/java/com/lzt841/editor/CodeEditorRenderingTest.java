@@ -85,12 +85,16 @@ public class CodeEditorRenderingTest {
     }
 
     private void draw() {
+        drawWithAlpha(1f);
+    }
+
+    private void drawWithAlpha(float parentAlpha) {
         recording.rects.clear();
         recording.images.clear();
         recording.glyphs.clear();
         recording.events.clear();
         rows.clear();
-        editor.draw(recording.batch, 1f);
+        editor.draw(recording.batch, parentAlpha);
     }
 
     private void captureRows() {
@@ -550,9 +554,12 @@ public class CodeEditorRenderingTest {
         editor.setDiagnostics(Array.with(new CodeDiagnostic(0, 0, 0, 4, CodeDiagnosticSeverity.ERROR, "test")));
         recording.batch.setColor(0.25f, 0.5f, 0.75f, 1f);
         float original = recording.batch.getPackedColor();
+        // Callbacks see the editor's own tint (actor colour times parent alpha, opaque white here), the
+        // same colour Scene2D widgets set before drawing; the caller's colour comes back afterwards.
+        float editorTint = Color.WHITE.toFloatBits();
         editor.addRowRenderer(new CodeEditorRowRenderer() {
             @Override public void drawForeground(Batch batch, CodeEditorRowRenderContext row) {
-                assertEquals(original, batch.getPackedColor(), 0f);
+                assertEquals(editorTint, batch.getPackedColor(), 0f);
             }
         });
         draw();
@@ -725,6 +732,89 @@ public class CodeEditorRenderingTest {
         assertTrue(rows.size > 1);
         for (Row row : rows) assertGradientSamples(row);
         assertTrue(recording.glyphs.size >= 26 * 3);
+    }
+
+    @Test public void parentAlphaAndActorColorTintTextMarkersAndImagesThenRestoreTheCallerColor() {
+        InlineImage image = new InlineImage(new TextureRegion(pixel), 20f, 12f, 0f);
+        editor.setInlineImageProvider((line, column, text) -> text.charAt(column) == '*' ? image : null);
+        editor.setWhitespaceMode(CodeWhitespaceMode.ALL);
+        editor.setColor(1f, 0.5f, 1f, 0.8f);
+        captureRows();
+        editor.setText("a *b");
+        recording.batch.setColor(0.25f, 0.5f, 0.75f, 1f);
+        float caller = recording.batch.getPackedColor();
+        drawWithAlpha(0.5f);
+        Color tint = new Color(1f, 0.5f, 1f, 0.4f);
+
+        assertEquals("the caller's batch colour comes back", caller, recording.batch.getPackedColor(), 0f);
+        assertColor(tint, colorOf(recording.imageTint));
+        Color text = new Color(editor.getStyle().fontColor).mul(tint);
+        Array<GlyphDraw> textGlyphs = textGlyphs();
+        assertTrue(textGlyphs.size > 0);
+        for (GlyphDraw glyph : textGlyphs) assertColor(text, glyph.color);
+        Color gutter = new Color(editor.getStyle().gutterFontColor).mul(tint);
+        boolean gutterFaded = false;
+        for (GlyphDraw glyph : recording.glyphs) gutterFaded |= glyph.x < rows.first().x && close(gutter, glyph.color);
+        assertTrue("line numbers fade with the editor", gutterFaded);
+        Color marker = new Color(editor.getStyle().whitespaceColor).mul(tint);
+        boolean found = false;
+        for (Rect rect : recording.rects) found |= close(marker, rect.color);
+        assertTrue("whitespace markers fade with the editor", found);
+    }
+
+    @Test public void opaqueWhiteEditorKeepsExactStyleColors() {
+        editor.setWhitespaceMode(CodeWhitespaceMode.ALL);
+        captureRows();
+        draw("a b");
+        assertEquals(1, marks(editor.getStyle().whitespaceColor, false).size);
+        Array<GlyphDraw> textGlyphs = textGlyphs();
+        assertTrue(textGlyphs.size > 0);
+        for (GlyphDraw glyph : textGlyphs) assertColor(editor.getStyle().fontColor, glyph.color);
+    }
+
+    /** Glyphs drawn in the text area, leaving out line numbers in the gutter. */
+    private Array<GlyphDraw> textGlyphs() {
+        Array<GlyphDraw> result = new Array<>();
+        for (GlyphDraw glyph : recording.glyphs) if (glyph.x >= rows.first().x - 0.01f) result.add(glyph);
+        return result;
+    }
+
+    @Test public void hintPanelAndCompletionPopupFadeWithTheirParents() {
+        com.lzt841.editor.hints.CodeHintPanel panel =
+            new com.lzt841.editor.hints.CodeHintPanel(com.lzt841.editor.hints.CodeHintPanel.styleFrom(editor));
+        panel.setText("hint", 0, 2);
+        panel.setColor(1f, 1f, 1f, 0.5f);
+        panel.draw(recording.batch, 0.5f);
+        assertTrue(recording.glyphs.size > 0);
+        for (GlyphDraw glyph : recording.glyphs) assertEquals(0.25f, glyph.color.a, 0.01f);
+        assertEquals(0.25f, recording.color.a, 0.01f);
+
+        recording.glyphs.clear();
+        recording.batch.setColor(Color.WHITE);
+        com.lzt841.editor.completion.CodeCompletionPopup.CodeCompletionPopupStyle popupStyle =
+            new com.lzt841.editor.completion.CodeCompletionPopup.CodeCompletionPopupStyle();
+        popupStyle.font = editor.getStyle().font;
+        com.lzt841.editor.completion.CodeCompletionPopup popup =
+            new com.lzt841.editor.completion.CodeCompletionPopup(popupStyle);
+        popup.setItems(Array.with(com.lzt841.editor.completion.CodeCompletionItem.of("alpha")), "al");
+        popup.draw(recording.batch, 0.3f);
+        assertTrue(recording.glyphs.size > 0);
+        for (GlyphDraw glyph : recording.glyphs) assertEquals(0.3f, glyph.color.a, 0.01f);
+    }
+
+    private static Color colorOf(float packed) {
+        Color color = new Color();
+        Color.abgr8888ToColor(color, packed);
+        return color;
+    }
+
+    private static boolean close(Color expected, Color actual) {
+        return Math.abs(expected.r - actual.r) < 0.01f && Math.abs(expected.g - actual.g) < 0.01f
+            && Math.abs(expected.b - actual.b) < 0.01f && Math.abs(expected.a - actual.a) < 0.01f;
+    }
+
+    private static void assertColor(Color expected, Color actual) {
+        assertTrue("expected " + expected + " but was " + actual, close(expected, actual));
     }
 
     private void gradientStyle(int flags) {
